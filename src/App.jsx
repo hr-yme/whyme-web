@@ -215,23 +215,26 @@ function matchDept(raw) {
   return DEPARTMENTS.find((d) => normKey(d).replace(/[^a-z0-9]+/g, " ").trim() === norm) || null;
 }
 
-// Encontra o índice de um candidato já existente, mapeando dinamicamente
-// por Nome (normalizado — insensível a acentos/maiúsculas/espaços extra)
-// e, quando o nome não corresponde a nenhum candidato, por Email como
-// segunda chave. Substitui as comparações antigas `c.name.toLowerCase()
-// === name.toLowerCase()`, que falhavam sempre que o nome vinha escrito
-// de forma ligeiramente diferente entre abas (ex.: "João Complicado" vs
-// "Joao Complicado " com espaço a mais) — a causa raiz de aprovações da
-// Coluna Q não chegarem aos candidatos de alguns departamentos.
+// Encontra o índice de um candidato já existente. Chave primária: EMAIL
+// (único e constante — nunca varia entre abas). Só recorre ao Nome como
+// segunda chave quando o email está em branco ou não casa, e mesmo assim
+// só depois de sanitizado (.trim(), .toLowerCase(), remoção de acentos
+// via normalize("NFD")) através de normKey(). Isto substitui as
+// comparações antigas `c.name.toLowerCase() === name.toLowerCase()`, que
+// falhavam sempre que o nome vinha escrito de forma ligeiramente
+// diferente entre abas (ex.: "João Complicado" vs "Joao Complicado " com
+// espaço a mais) — a causa raiz de aprovações da Coluna Q não chegarem
+// aos candidatos de alguns departamentos (Quality Management, Legal &
+// Finance, etc.), ficando presas apenas em Human Resources.
 function matchCandidateIndex(candidates, name, email) {
-  const nName = normKey(name);
-  if (nName) {
-    const i = candidates.findIndex((c) => normKey(c.name) === nName);
-    if (i >= 0) return i;
-  }
   const nEmail = normKey(email);
   if (nEmail) {
     const i = candidates.findIndex((c) => c.email && normKey(c.email) === nEmail);
+    if (i >= 0) return i;
+  }
+  const nName = normKey(name); // sanitizado: trim + lowercase + sem acentos
+  if (nName) {
+    const i = candidates.findIndex((c) => normKey(c.name) === nName);
     if (i >= 0) return i;
   }
   return -1;
@@ -732,9 +735,10 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   }
 
   /* ---- A3. Avaliação CV e Questões Abertas (Fase 1) -> Coluna Q (avança p/ Fase 2 = Entrevista Soft Skills) ---- */
-  // Mapeamento dinâmico por Nome (normalizado) e, em segundo lugar, por
-  // Email — nunca por posição/ordem de linha nem por departamento. Isto
-  // percorre TODAS as linhas da aba sem qualquer interrupção por
+  // Mapeamento dinâmico com EMAIL como chave primária (único e constante)
+  // e Nome sanitizado (trim + lowercase + sem acentos, via normKey) como
+  // segunda chave — nunca por posição/ordem de linha nem por departamento.
+  // Isto percorre TODAS as linhas da aba sem qualquer interrupção por
   // departamento: a Coluna Q é lida da mesma forma para Human Resources,
   // Quality Management, Legal & Finance, Brand Strategy, etc.
   const unmatchedCV = [];
@@ -755,22 +759,22 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     if (idxExisting >= 0) {
       candidates[idxExisting] = { ...candidates[idxExisting], ...patch };
     } else {
-      // Não foi possível casar este nome com nenhum candidato de "Base
-      // Dados Candidatos" — em vez de o atirar silenciosamente para um
-      // departamento arbitrário (o bug original: tudo o que não casasse
-      // ficava mal atribuído), cria-se o registo marcado para
-      // confirmação manual e reporta-se para diagnóstico.
-      upsertCandidate({ ...patch, department: DEPARTMENTS[0], departmentPorConfirmar: true });
-      unmatchedCV.push(name);
+      // Não foi possível casar nem por email nem por nome com nenhum
+      // candidato de "Base Dados Candidatos" — em vez de o atirar
+      // silenciosamente para um departamento arbitrário (o bug original:
+      // tudo o que não casasse ficava mal atribuído, aparentando "só
+      // Human Resources funciona"), cria-se o registo marcado para
+      // confirmação manual e reporta-se o nome/email exatos para diagnóstico.
+      upsertCandidate({ ...patch, email, department: DEPARTMENTS[0], departmentPorConfirmar: true });
+      unmatchedCV.push(email ? `${name} (${email})` : name);
     }
   });
   if (unmatchedCV.length) {
-    const sample = unmatchedCV.slice(0, 5).join(", ");
-    warnings.push(`${unmatchedCV.length} candidato(s) da aba "Avaliação CV e Questões Abertas" não têm um Nome correspondente em "Base Dados Candidatos" (${sample}${unmatchedCV.length > 5 ? "..." : ""}) — foram criados marcados como "por confirmar". Confirma se o nome está escrito de forma idêntica nas duas abas.`);
+    warnings.push(`${unmatchedCV.length} candidato(s) da aba "Avaliação CV e Questões Abertas" não corresponderam a nenhum candidato de "Base Dados Candidatos" por email nem por nome: ${unmatchedCV.join("; ")} — foram criados marcados como "por confirmar". Confirma se o nome/email está escrito de forma idêntica nas duas abas.`);
   }
 
   /* ---- B. Abas por Departamento -> progresso por fase + lógica de rejeição ---- */
-  let unmatchedDept = 0;
+  const unmatchedDept = [];
   DEPARTMENTS.forEach((dept) => {
     const tab = raw.deptTabs?.[dept];
     if (!tab) return;
@@ -779,7 +783,10 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       if (!name) return;
       const email = String(get(row.obj, "email") || "").trim();
       const idx = matchCandidateIndex(candidates, name, email);
-      if (idx < 0) { unmatchedDept++; return; } // candidato tem de constar em "Base Dados Candidatos"
+      if (idx < 0) {
+        unmatchedDept.push(`${email ? `${name} (${email})` : name} — aba "${dept}"`);
+        return; // candidato tem de constar em "Base Dados Candidatos"
+      }
       const cand = candidates[idx];
       const at = (letter) => row.raw[colLetterToIndex(letter)];
 
@@ -821,8 +828,8 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       };
     });
   });
-  if (unmatchedDept > 0) {
-    warnings.push(`${unmatchedDept} linha(s) nas abas de departamento não corresponderam a nenhum candidato de "Base Dados Candidatos" (nome não encontrado) — o respetivo progresso de fase não foi atualizado.`);
+  if (unmatchedDept.length > 0) {
+    warnings.push(`${unmatchedDept.length} linha(s) nas abas de departamento não corresponderam a nenhum candidato de "Base Dados Candidatos" por email nem por nome: ${unmatchedDept.join("; ")} — o respetivo progresso de fase não foi atualizado.`);
   }
 
   return { members, candidates, warnings };
