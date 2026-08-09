@@ -429,16 +429,18 @@ function cellStatus(val) {
 // "Nome", "Email") como o array bruto da linha (colunas por letra, ex.
 // "Coluna L", "Coluna AZ").
 // headerHints: palavras-chave (normalizadas) usadas para localizar a
-// linha de cabeçalho real dentro das primeiras 5 linhas da aba — cobre
-// o caso comum de haver 1-4 linhas de título/logo acima do cabeçalho.
-// Sem isto, se o cabeçalho não estiver na linha 1, nenhuma linha seria
-// reconhecida como candidato (nome/email sempre vazios).
+// linha de cabeçalho real dentro das primeiras 20 linhas da aba — cobre
+// o caso (confirmado no Excel Mestre da YME) de haver várias linhas de
+// título/logótipo decorativo (ex: "// Recrutamento YME //") acima do
+// cabeçalho real (ex: cabeçalho na linha 6 = índice 5). Sem isto, se o
+// cabeçalho não estiver na linha 1, nenhuma linha seria reconhecida
+// como candidato (nome/email sempre vazios).
 function parseApiValues(values, headerHints = []) {
   const grid = values || [];
   const hints = headerHints.map(normKey);
   let headerIdx = 0;
   if (hints.length) {
-    const found = grid.slice(0, 5).findIndex((row) => {
+    const found = grid.slice(0, 20).findIndex((row) => {
       if (!row || !row.length) return false;
       const norm = row.map((c) => normKey(c));
       return hints.some((h) => norm.includes(h));
@@ -547,15 +549,32 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       members.push({ id: uid("sync"), name, role: role || "RH", title: role || "Membro", departments: dept ? [dept] : [], availability: [] });
     }
   };
+  let deptRowsSeen = 0;
+  let deptRowsWithAnyMember = 0;
   (raw.departamentos?.rows || []).forEach((row) => {
+    deptRowsSeen++;
     const dept = matchDept(get(row.obj, "departamento", "department"));
     const diretor = get(row.obj, "diretor", "diretor(a)");
     const supervisor = get(row.obj, "supervisor");
-    const rh = String(get(row.obj, "rh", "membro rh", "membros rh", "membro de rh") || "");
+    // O Excel Mestre da YME guarda os membros de RH em DUAS colunas
+    // distintas ("Membro RH 1" / "Membro RH 2"), em vez de uma única
+    // coluna com lista separada por vírgulas — por isso lemos as duas
+    // colunas de forma independente. Mantemos a coluna única "RH" como
+    // alternativa de compatibilidade (formato antigo/manual).
+    const rh1 = String(get(row.obj, "membro rh 1", "membro de rh 1", "rh 1", "rh1") || "").trim();
+    const rh2 = String(get(row.obj, "membro rh 2", "membro de rh 2", "rh 2", "rh2") || "").trim();
+    const rhCols = [rh1, rh2].filter(Boolean);
+    const rhLegacy = String(get(row.obj, "rh", "membro rh", "membros rh", "membro de rh") || "")
+      .split(/[,;|]/).map((s) => s.trim()).filter(Boolean);
+    const rhNames = rhCols.length ? rhCols : rhLegacy;
     if (diretor) upsertMember(diretor, "Diretor", dept);
     if (supervisor) upsertMember(supervisor, "Supervisor", dept);
-    rh.split(/[,;|]/).map((s) => s.trim()).filter(Boolean).forEach((n) => upsertMember(n, "RH", dept));
+    rhNames.forEach((n) => upsertMember(n, "RH", dept));
+    if (diretor || supervisor || rhNames.length) deptRowsWithAnyMember++;
   });
+  if (raw.departamentos && deptRowsSeen > 0 && deptRowsWithAnyMember === 0) {
+    warnings.push(`A aba "Base Dados Departamentos" tem ${deptRowsSeen} linha(s) de dados (cabeçalho detetado na linha ${(raw.departamentos.headerIdx ?? 0) + 1}) mas nenhuma tem Diretor, Supervisor ou Membro RH reconhecidos. Confirma os textos exatos dos cabeçalhos "Diretor", "Supervisor", "Membro RH 1" e "Membro RH 2".`);
+  }
 
   /* ---- A4/A5/A6. Disponibilidades de RH/Diretores/Supervisores -> membros ---- */
   [raw.dispEntrevistasRH, raw.dispDinamicas, raw.dispEntrevistaFinal].forEach((tab) => {
@@ -619,7 +638,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     upsertCandidate({
       name,
       email: String(get(row.obj, "email", "contacto", "email/contacto") || "").trim(),
-      telefone: String(get(row.obj, "telefone", "telemóvel", "telemovel", "contacto telefónico", "contacto telefonico", "phone", "nº telemóvel", "n.º telemóvel") || "").trim(),
+      telefone: String(get(row.obj, "telefone", "telemóvel", "telemovel", "contacto", "contacto telefónico", "contacto telefonico", "phone", "nº telemóvel", "n.º telemóvel") || "").trim(),
       department: dept1 || DEPARTMENTS[0],
       departmentPorConfirmar: !dept1,
       segundaOpcaoDepartamento: dept2 || null,
@@ -635,7 +654,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   // silêncio — isto é normalmente a causa de "0 candidatos apareceram".
   if (raw.candidatos) {
     if (candidateRowsSeen > 0 && candidateRowsWithName === 0) {
-      warnings.push(`A aba "Base Dados Candidatos" tem ${candidateRowsSeen} linha(s) de dados mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
+      warnings.push(`A aba "Base Dados Candidatos" tem ${candidateRowsSeen} linha(s) de dados (cabeçalho detetado na linha ${(raw.candidatos.headerIdx ?? 0) + 1}) mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
     } else if (candidateRowsWithName > 0 && candidateRowsWithName < candidateRowsSeen) {
       warnings.push(`${candidateRowsSeen - candidateRowsWithName} linha(s) da aba "Base Dados Candidatos" foram ignoradas por não terem o campo Nome preenchido.`);
     }
