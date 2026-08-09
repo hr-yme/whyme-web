@@ -411,9 +411,10 @@ function colLetterToIndex(letter) {
 }
 
 function isPositiveMark(val) {
+  if (val === true) return true;
   const v = String(val ?? "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   if (!v) return false;
-  return ["x", "sim", "true", "1", "aprovado", "selecionado", "apto", "avanca", "yes", "✓", "v"].includes(v);
+  return ["x", "sim", "true", "verdadeiro", "1", "aprovado", "selecionado", "apto", "avanca", "yes", "✓", "v", "☑", "☒"].includes(v);
 }
 // "pending" = célula vazia (ainda sem decisão); "positive"/"negative" = célula preenchida.
 function cellStatus(val) {
@@ -639,6 +640,11 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     const dept2 = matchDept(get(row.obj, "segunda opcao", "segunda opção", "2a opcao", "2ª opção"));
     const estadoRaw = get(row.obj, "estado", "fase atual", "fase", "estado atual", "situacao", "situação");
     const phase0FromEstado = estadoToPhase0(estadoRaw);
+    // Coluna J: "Veio da Talent Pool?" (checkbox TRUE/FALSE/VERDADEIRO/☑).
+    // Regra de negócio (prioridade 1 — Fast-Track): se TRUE, o candidato
+    // salta a análise de CV e a Entrevista Soft Skills (Fase 1) por
+    // completo e entra diretamente elegível para a Fase 2 (Dinâmicas).
+    const veioTalentPool = isPositiveMark(get(row.obj, "veio da talent pool", "veio da talent pool?", "talent pool", "veio de talent pool", "veio da talentpool"));
     // Fallback: linha sem coluna de departamento reconhecida (célula vazia
     // ou valor que não corresponde a nenhum dos 6 departamentos) nunca
     // rebenta a sincronização — fica apenas marcada para confirmação manual.
@@ -652,7 +658,11 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       curso: String(get(row.obj, "curso") || "").trim(),
       anoLetivo: String(get(row.obj, "ano letivo", "ano") || "").trim(),
       erasmus: String(get(row.obj, "erasmus") || "").trim(),
-      ...(phase0FromEstado ? { phase0Status: phase0FromEstado } : {}),
+      veioTalentPool,
+      // Fast-track: Fase 1 fica automaticamente "Aprovado"/isenta nos dois
+      // estados (CV e Soft Skills), avançando direto para a Fase 2.
+      ...(veioTalentPool ? { phase0Status: "Aprovado", phase1Status: "Aprovado" } : {}),
+      ...(!veioTalentPool && phase0FromEstado ? { phase0Status: phase0FromEstado } : {}),
     });
   });
 
@@ -668,11 +678,16 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
     const name = String(get(row.obj, "nome", "nome completo", "name") || "").trim();
     if (!name) return;
+    const idxExisting = candidates.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+    // Prioridade 1 (Fast-Track Talent Pool) já decidiu o estado deste
+    // candidato em A2 — a Coluna Q (fluxo regular) nunca a sobrepõe.
+    if (idxExisting >= 0 && candidates[idxExisting].veioTalentPool) return;
+    // Regra de negócio (prioridade 2 — Fluxo Regular): Coluna Q ("Passou?")
+    // TRUE -> Aprovado / avança Fase 1; FALSE -> Rejeitado.
     const status = cellStatus(row.raw[colLetterToIndex(SYNC_CV_PASS_COLUMN)]);
     if (status === "pending") return;
     const patch = { name, phase0Status: status === "positive" ? "Aprovado" : "Rejeitado" };
-    const idx = candidates.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
-    if (idx >= 0) candidates[idx] = { ...candidates[idx], ...patch };
+    if (idxExisting >= 0) candidates[idxExisting] = { ...candidates[idxExisting], ...patch };
     else upsertCandidate({ ...patch, department: DEPARTMENTS[0] });
   });
 
@@ -699,8 +714,10 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       const anyPositive = softSkills === "positive" || dinamicas === "positive" || final === "positive" || talentPoolMark;
 
       let phase1Status = cand.phase1Status;
-      if (softSkills === "positive") phase1Status = "Aprovado";
-      else if (softSkills === "negative") phase1Status = "Rejeitado";
+      if (!cand.veioTalentPool) {
+        if (softSkills === "positive") phase1Status = "Aprovado";
+        else if (softSkills === "negative") phase1Status = "Rejeitado";
+      }
 
       let phase2Status = cand.phase2Status;
       if (dinamicas === "positive") phase2Status = "Aprovado";
@@ -711,9 +728,10 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       else if (final === "negative") finalResult = talentPoolMark ? "Talent Pool" : "Rejeitado";
 
       // Lógica de rejeição automática: só atua quando há efetivamente alguma
-      // marcação nas colunas de transição (não sobrepõe candidatos ainda por decidir).
+      // marcação nas colunas de transição (não sobrepõe candidatos ainda por
+      // decidir), e nunca reverte o estado isento de um Fast-Track Talent Pool.
       let phase0Status = cand.phase0Status;
-      if (anyColumnFilled && !anyPositive && cand.phase0Status === "Aprovado") {
+      if (!cand.veioTalentPool && anyColumnFilled && !anyPositive && cand.phase0Status === "Aprovado") {
         phase0Status = "Rejeitado";
       }
 
@@ -1573,6 +1591,9 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
               <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
                 <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
                   {c.name}
+                  {c.veioTalentPool && (
+                    <span className="ml-1.5 text-[10px] font-normal align-middle px-1.5 py-0.5 rounded" title="Entrou via Talent Pool — salta CV e Entrevista Soft Skills" style={{ color: COLORS.navy, backgroundColor: hexToRgba(COLORS.pink, 0.18) }}>Talent Pool</span>
+                  )}
                   {c.departmentPorConfirmar && (
                     <span className="ml-1.5 text-[10px] font-normal align-middle" title="Departamento não reconhecido na folha — por confirmar" style={{ color: "#c0227a" }}>(dept. por confirmar)</span>
                   )}
@@ -1595,7 +1616,10 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
                 </td>
                 <td className="px-4 py-3">
                   {c.phase0Status === "Aprovado" ? (
-                    <span className="inline-flex items-center gap-1 text-xs font-medium" style={{ color: COLORS.navy }}><CheckCircle2 size={14} style={{ color: COLORS.pink }} /> Sim</span>
+                    <span className="inline-flex items-center gap-1 text-xs font-medium" style={{ color: COLORS.navy }}>
+                      <CheckCircle2 size={14} style={{ color: COLORS.pink }} />
+                      {c.veioTalentPool ? "Isento (Talent Pool)" : "Sim"}
+                    </span>
                   ) : (
                     <span className="inline-flex items-center gap-1 text-xs" style={{ color: hexToRgba(COLORS.navy, 0.45) }}><XCircle size={14} /> Não</span>
                   )}
@@ -2098,7 +2122,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncUrl, auth.accessToken]);
 
-  const phase1Pool = useMemo(() => candidates.filter((c) => c.phase0Status === "Aprovado" && c.formsSubmitted.fase1), [candidates]);
+  const phase1Pool = useMemo(() => candidates.filter((c) => c.phase0Status === "Aprovado" && c.formsSubmitted.fase1 && !c.veioTalentPool), [candidates]);
   const phase2Pool = useMemo(() => candidates.filter((c) => c.phase1Status === "Aprovado" && c.formsSubmitted.fase2), [candidates]);
   const phase3Pool = useMemo(() => candidates.filter((c) => c.phase2Status === "Aprovado" && c.formsSubmitted.fase3), [candidates]);
 
