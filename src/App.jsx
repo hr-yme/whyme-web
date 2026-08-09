@@ -295,7 +295,7 @@ function useGoogleAuth() {
         }
         tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
           client_id: GOOGLE_CLIENT_ID,
-          scope: GOOGLE_SHEETS_SCOPES,
+          scope: "https://www.googleapis.com/auth/spreadsheets.readonly",
           callback: () => {}, // é substituído a cada pedido em requestToken()
         });
         setAuth((a) => ({ ...a, ready: true }));
