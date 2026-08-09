@@ -74,6 +74,29 @@ const ORG = [
 const DEPARTMENTS = ORG.map((o) => o.dept);
 
 const PHASE_LABEL = { fase1: "Fase 2", fase2: "Fase 3", fase3: "Fase 4" };
+// Estado de disponibilidade do candidato para a fase em curso — controlável
+// manualmente via dropdown em cada separador de fase, ou atualizado
+// automaticamente para "recebida" quando o respetivo Forms é importado.
+const AVAILABILITY_STATES = ["nao_enviada", "pendente", "recebida"];
+const AVAILABILITY_LABEL = { nao_enviada: "Não Enviada", pendente: "Pendente", recebida: "Recebida" };
+const AVAILABILITY_TONE = {
+  nao_enviada: { bg: "#e2e8f0", fg: "#475569" },
+  pendente: { bg: "#fde68a", fg: "#92400e" },
+  recebida: { bg: "#bbf7d0", fg: "#065f46" },
+};
+function AvailabilitySelect({ value, onChange }) {
+  const tone = AVAILABILITY_TONE[value] || AVAILABILITY_TONE.nao_enviada;
+  return (
+    <select
+      value={value || "nao_enviada"}
+      onChange={(e) => onChange(e.target.value)}
+      className="text-xs rounded-md px-2 py-1 border font-medium"
+      style={{ backgroundColor: tone.bg, color: tone.fg, borderColor: "transparent" }}
+    >
+      {AVAILABILITY_STATES.map((s) => <option key={s} value={s} style={{ color: "#1f2937" }}>{AVAILABILITY_LABEL[s]}</option>)}
+    </select>
+  );
+}
 
 /* Cores exatas dos 6 Departamentos, conforme o Excel Mestre oficial da YME. */
 const DEPT_BADGE_CLASSES = {
@@ -602,6 +625,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       id: uid("sync"), phase0Status: "Pendente", phase1Status: "—", phase2Status: "—",
       email: "", telefone: "",
       formsSubmitted: { fase1: false, fase2: false, fase3: false },
+      availabilityStatus: { fase1: "nao_enviada", fase2: "nao_enviada", fase3: "nao_enviada" },
       availability: { fase1: [], fase2: [], fase3: [] },
       ...patch,
     });
@@ -1376,6 +1400,7 @@ function ImportHubPage({
             department: department || next[idx].department,
             email: email || next[idx].email,
             formsSubmitted: { ...next[idx].formsSubmitted, [phaseKey]: true },
+            availabilityStatus: { ...next[idx].availabilityStatus, [phaseKey]: "recebida" },
             availability: { ...next[idx].availability, [phaseKey]: availability.length ? availability : next[idx].availability[phaseKey] },
           };
         } else {
@@ -1385,6 +1410,11 @@ function ImportHubPage({
             phase1Status: phaseKey === "fase1" ? "Pendente" : "—",
             phase2Status: phaseKey === "fase2" ? "Pendente" : "—",
             formsSubmitted: { fase1: phaseKey === "fase1", fase2: phaseKey === "fase2", fase3: phaseKey === "fase3" },
+            availabilityStatus: {
+              fase1: phaseKey === "fase1" ? "recebida" : "nao_enviada",
+              fase2: phaseKey === "fase2" ? "recebida" : "nao_enviada",
+              fase3: phaseKey === "fase3" ? "recebida" : "nao_enviada",
+            },
             availability: {
               fase1: phaseKey === "fase1" ? availability : [],
               fase2: phaseKey === "fase2" ? availability : [],
@@ -1643,7 +1673,8 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
 
 function InterviewPhasePage({
   title, subtitle, phaseKey, availField, formsField, prevStatusField,
-  candidates, members, bookings, setBookings, onGenerate, columns, showCalendar,
+  candidates, setCandidates, members, bookings, setBookings, onGenerate, columns, showCalendar,
+  excludeTalentPool = false,
 }) {
   const [editing, setEditing] = useState(null);
   const [view, setView] = useState("list");
@@ -1653,7 +1684,18 @@ function InterviewPhasePage({
 
   const scheduled = bookings.filter((b) => b.status === "Agendado").length;
   const conflicts = bookings.filter((b) => b.status !== "Agendado").length;
+  // Lista de elegíveis para esta fase: passaram a fase anterior — não
+  // depende de já terem submetido o Forms de disponibilidade (isso é
+  // precisamente o que a coluna "Disponibilidade" abaixo acompanha).
+  // Na Fase 2 (Soft Skills), os candidatos Fast-Track da Talent Pool são
+  // excluídos: eles saltam esta fase e só aparecem a partir da Fase 3.
+  const eligible = candidates.filter((c) => c[prevStatusField] === "Aprovado" && (!excludeTalentPool || !c.veioTalentPool));
   const missingForms = candidates.filter((c) => c[prevStatusField] === "Aprovado" && !c.formsSubmitted[formsField]).length;
+  const availabilityConfirmed = eligible.filter((c) => (c.availabilityStatus?.[formsField] || "nao_enviada") === "recebida").length;
+
+  const setAvailability = (candId, value) => {
+    setCandidates((prev) => prev.map((c) => (c.id === candId ? { ...c, availabilityStatus: { ...c.availabilityStatus, [formsField]: value } } : c)));
+  };
 
   const { page, setPage, totalPages, pageItems } = usePagination(bookings, 12, bookings.length);
 
@@ -1689,11 +1731,52 @@ function InterviewPhasePage({
         </div>
       </div>
 
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: COLORS.mint, color: COLORS.navy }}>
+          <UsersRound size={13} /> {title.split("—")[0].trim()}: {eligible.length} Candidato(s)
+        </span>
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: availabilityConfirmed === eligible.length && eligible.length > 0 ? "#bbf7d0" : COLORS.mint, color: COLORS.navy }}>
+          <FileClock size={13} /> {availabilityConfirmed}/{eligible.length} Disponibilidades Recebidas
+        </span>
+      </div>
+
       <div className="grid grid-cols-4 gap-4 mb-6">
-        <StatCard label="Candidatos elegíveis" value={bookings.length} icon={UsersRound} tone="neutral" />
+        <StatCard label="Candidatos elegíveis" value={eligible.length} icon={UsersRound} tone="neutral" />
         <StatCard label="Entrevistas agendadas" value={scheduled} icon={CheckCircle2} tone="brand" />
         <StatCard label="Sem horário comum" value={conflicts} icon={AlertTriangle} tone="critical" />
         <StatCard label={`À espera do Forms ${PHASE_LABEL[formsField]}`} value={missingForms} icon={FileClock} tone="alert" />
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: "#94a3b8" }}>Candidatos nesta fase e disponibilidade</p>
+      <div className="rounded-xl border overflow-hidden mb-8" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.1) }}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs uppercase tracking-wide" style={{ backgroundColor: COLORS.navy, color: COLORS.white }}>
+              <th className="px-4 py-3 font-medium">Candidato</th>
+              <th className="px-4 py-3 font-medium">Departamento</th>
+              <th className="px-4 py-3 font-medium">Disponibilidade</th>
+            </tr>
+          </thead>
+          <tbody>
+            {eligible.map((c) => (
+              <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
+                <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
+                  {c.name}
+                  {c.veioTalentPool && (
+                    <span className="ml-1.5 text-[10px] font-normal align-middle px-1.5 py-0.5 rounded" style={{ color: COLORS.navy, backgroundColor: hexToRgba(COLORS.pink, 0.18) }}>Talent Pool</span>
+                  )}
+                </td>
+                <td className="px-4 py-3"><DeptBadge dept={c.department} /></td>
+                <td className="px-4 py-3">
+                  <AvailabilitySelect value={c.availabilityStatus?.[formsField]} onChange={(v) => setAvailability(c.id, v)} />
+                </td>
+              </tr>
+            ))}
+            {eligible.length === 0 && (
+              <tr><td colSpan={3} className="px-4 py-8 text-center text-sm" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Ainda não há candidatos aprovados na fase anterior.</td></tr>
+            )}
+          </tbody>
+        </table>
       </div>
 
       {bookings.length === 0 && (
@@ -1833,21 +1916,23 @@ function EditBookingModal({ booking, columns, candidate, members, onClose, onSav
    PAGE: FASE 3 — DINÂMICAS DE GRUPO
 ============================================================================ */
 
-function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
+function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onGenerate }) {
   const candById = (id) => candidates.find((c) => c.id === id);
   const byId = (id) => members.find((m) => m.id === id);
   const missingForms = candidates.filter((c) => c.phase1Status === "Aprovado" && !c.formsSubmitted.fase2).length;
-  // Pool elegível para a Fase 3: candidatos com phase1Status "Aprovado" —
-  // inclui tanto quem passou a Fase 2 (Entrevista Soft Skills) como os
-  // candidatos Fast-Track vindos da Talent Pool (que entram já com
-  // phase1Status "Aprovado", isentos das Fases 1 e 2). É a mesma condição
-  // usada no App para gerar os grupos, por isso esta lista acompanha
-  // sempre a Talent Pool automaticamente, mesmo antes de "Gerar
-  // Agendamentos" ser premido.
-  const eligiblePool = candidates.filter((c) => c.phase1Status === "Aprovado" && c.formsSubmitted.fase2);
+  // Lista de elegíveis para a Fase 3: candidatos com phase1Status
+  // "Aprovado" — inclui tanto quem passou a Fase 2 (Entrevista Soft
+  // Skills) como os candidatos Fast-Track vindos da Talent Pool (que
+  // entram já com phase1Status "Aprovado", isentos das Fases 1 e 2).
+  // Não depende de já terem submetido o Forms — isso é acompanhado pela
+  // coluna "Disponibilidade" abaixo, editável manualmente.
+  const eligible = candidates.filter((c) => c.phase1Status === "Aprovado");
   const talentPoolAtivos = candidates.filter((c) => c.veioTalentPool && c.phase1Status === "Aprovado").length;
-  const groupedIds = new Set(groups.flatMap((g) => g.candidateIds));
-  const ungrouped = eligiblePool.filter((c) => !groupedIds.has(c.id));
+  const availabilityConfirmed = eligible.filter((c) => (c.availabilityStatus?.fase2 || "nao_enviada") === "recebida").length;
+
+  const setAvailability = (candId, value) => {
+    setCandidates((prev) => prev.map((c) => (c.id === candId ? { ...c, availabilityStatus: { ...c.availabilityStatus, fase2: value } } : c)));
+  };
 
   const exportCSV = () => {
     const header = ["Grupo", "Horário", "Candidatos", "Supervisor", "Diretores presentes", "RH presentes", "Avisos"];
@@ -1859,7 +1944,7 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
       g.rhIds.map((id) => byId(id)?.name).join(" | ") || "—",
       g.warnings.join(" | ") || "Sem avisos",
     ]);
-    downloadCSV("fase2-dinamicas-grupo.csv", [header, ...rows]);
+    downloadCSV("fase3-dinamicas-grupo.csv", [header, ...rows]);
   };
 
   const moveCandidate = (candId, fromGroupId, toGroupId) => {
@@ -1903,6 +1988,15 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
         </div>
       </div>
 
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: COLORS.mint, color: COLORS.navy }}>
+          <UsersRound size={13} /> Fase 3: {eligible.length} Candidato(s)
+        </span>
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: availabilityConfirmed === eligible.length && eligible.length > 0 ? "#bbf7d0" : COLORS.mint, color: COLORS.navy }}>
+          <FileClock size={13} /> {availabilityConfirmed}/{eligible.length} Disponibilidades Recebidas
+        </span>
+      </div>
+
       <div className="grid grid-cols-5 gap-4 mb-6">
         <StatCard label="Grupos formados" value={groups.length} icon={LayoutGrid} tone="neutral" />
         <StatCard label="Candidatos alocados" value={groups.reduce((a, g) => a + g.candidateIds.length, 0)} icon={UsersRound} tone="brand" />
@@ -1911,23 +2005,37 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
         <StatCard label="À espera do Forms Fase 3" value={missingForms} icon={FileClock} tone="alert" />
       </div>
 
-      {ungrouped.length > 0 && (
-        <div className="rounded-xl border p-4 mb-6" style={{ backgroundColor: hexToRgba(COLORS.pink, 0.1), borderColor: hexToRgba(COLORS.navy, 0.15) }}>
-          <p className="text-sm font-medium mb-2" style={{ color: COLORS.navy }}>
-            {ungrouped.length} candidato(s) já elegíveis para a Fase 3 (incluindo Talent Pool) mas ainda por agrupar — clica em "Gerar Agendamentos Automaticamente" para os alocar.
-          </p>
-          <div className="flex flex-wrap gap-1.5">
-            {ungrouped.map((c) => (
-              <span key={c.id} className="inline-flex items-center gap-1 text-xs rounded-full px-2.5 py-1" style={{ backgroundColor: COLORS.white, color: COLORS.navy }}>
-                {c.name}
-                {c.veioTalentPool && (
-                  <span className="text-[10px] font-medium px-1 py-0.5 rounded" style={{ backgroundColor: hexToRgba(COLORS.pink, 0.25), color: COLORS.navy }}>Talent Pool</span>
-                )}
-              </span>
+      <p className="text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: "#94a3b8" }}>Candidatos nesta fase e disponibilidade</p>
+      <div className="rounded-xl border overflow-hidden mb-8" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.1) }}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs uppercase tracking-wide" style={{ backgroundColor: COLORS.navy, color: COLORS.white }}>
+              <th className="px-4 py-3 font-medium">Candidato</th>
+              <th className="px-4 py-3 font-medium">Departamento</th>
+              <th className="px-4 py-3 font-medium">Disponibilidade</th>
+            </tr>
+          </thead>
+          <tbody>
+            {eligible.map((c) => (
+              <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
+                <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
+                  {c.name}
+                  {c.veioTalentPool && (
+                    <span className="ml-1.5 text-[10px] font-normal align-middle px-1.5 py-0.5 rounded" style={{ color: COLORS.navy, backgroundColor: hexToRgba(COLORS.pink, 0.18) }}>Talent Pool</span>
+                  )}
+                </td>
+                <td className="px-4 py-3"><DeptBadge dept={c.department} /></td>
+                <td className="px-4 py-3">
+                  <AvailabilitySelect value={c.availabilityStatus?.fase2} onChange={(v) => setAvailability(c.id, v)} />
+                </td>
+              </tr>
             ))}
-          </div>
-        </div>
-      )}
+            {eligible.length === 0 && (
+              <tr><td colSpan={3} className="px-4 py-8 text-center text-sm" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Ainda não há candidatos aprovados na Fase 2 nem vindos da Talent Pool.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {groups.length === 0 && (
         <div className="rounded-xl border border-dashed p-10 text-center text-sm" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.2), color: hexToRgba(COLORS.navy, 0.5) }}>
@@ -2016,6 +2124,7 @@ function AddCandidateModal({ onClose, onSave }) {
       id: uid("cand"), ...form,
       phase0Status: "Pendente", phase1Status: "—", phase2Status: "—",
       formsSubmitted: { fase1: false, fase2: false, fase3: false },
+      availabilityStatus: { fase1: "nao_enviada", fase2: "nao_enviada", fase3: "nao_enviada" },
       availability: { fase1: [], fase2: [], fase3: [] },
     });
   };
@@ -2192,16 +2301,17 @@ export default function App() {
             title="Fase 2 — Entrevista de Soft Skills"
             subtitle="Candidato + Diretor do Departamento + 1 Membro RH — cruzamento de disponibilidades (Forms Fase 2 ∩ Excel Mestre)."
             phaseKey="fase1" availField="fase1" formsField="fase1" prevStatusField="phase0Status"
-            candidates={candidates} members={members}
+            candidates={candidates} setCandidates={setCandidates} members={members}
             bookings={phase1Bookings} setBookings={setPhase1Bookings}
             onGenerate={() => setPhase1Bookings(generateInterviewPhase(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "rhId"]))}
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }]}
             showCalendar={false}
+            excludeTalentPool
           />
         )}
         {page === "fase2" && (
           <Phase2Page
-            candidates={candidates} members={members}
+            candidates={candidates} setCandidates={setCandidates} members={members}
             groups={phase2Groups} setGroups={setPhase2Groups}
             onGenerate={() => setPhase2Groups(generatePhase2(phase2Pool, members))}
           />
@@ -2211,7 +2321,7 @@ export default function App() {
             title="Fase 4 — Entrevista de Hard Skills"
             subtitle="Candidato + Diretor + 1 Membro RH + Supervisor do Departamento — cruzamento exato entre 4 intervenientes (Forms Fase 4 ∩ Excel Mestre)."
             phaseKey="fase3" availField="fase3" formsField="fase3" prevStatusField="phase2Status"
-            candidates={candidates} members={members}
+            candidates={candidates} setCandidates={setCandidates} members={members}
             bookings={phase3Bookings} setBookings={setPhase3Bookings}
             onGenerate={() => setPhase3Bookings(generateInterviewPhase(phase3Pool, members, phase3Bookings, "fase3", ["diretorId", "rhId", "supervisorId"]))}
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }, { key: "supervisorId", label: "Supervisor" }]}
