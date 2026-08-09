@@ -537,6 +537,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     if (idx >= 0) candidates[idx] = { ...candidates[idx], ...patch };
     else candidates.push({
       id: uid("sync"), phase0Status: "Pendente", phase1Status: "—", phase2Status: "—",
+      email: "", telefone: "",
       formsSubmitted: { fase1: false, fase2: false, fase3: false },
       availability: { fase1: [], fase2: [], fase3: [] },
       ...patch,
@@ -547,10 +548,15 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     if (!name) return;
     const dept1 = matchDept(get(row.obj, "primeira opcao", "primeira opção", "1a opcao", "1ª opção", "departamento"));
     const dept2 = matchDept(get(row.obj, "segunda opcao", "segunda opção", "2a opcao", "2ª opção"));
+    // Fallback: linha sem coluna de departamento reconhecida (célula vazia
+    // ou valor que não corresponde a nenhum dos 6 departamentos) nunca
+    // rebenta a sincronização — fica apenas marcada para confirmação manual.
     upsertCandidate({
       name,
       email: String(get(row.obj, "email", "contacto", "email/contacto") || "").trim(),
+      telefone: String(get(row.obj, "telefone", "telemóvel", "telemovel", "contacto telefónico", "contacto telefonico", "phone", "nº telemóvel", "n.º telemóvel") || "").trim(),
       department: dept1 || DEPARTMENTS[0],
+      departmentPorConfirmar: !dept1,
       segundaOpcaoDepartamento: dept2 || null,
       curso: String(get(row.obj, "curso") || "").trim(),
       anoLetivo: String(get(row.obj, "ano letivo", "ano") || "").trim(),
@@ -692,74 +698,16 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
 }
 
 /* ============================================================================
-   MOCK DATA — MEMBROS (fixos) + 100+ CANDIDATOS
+   ESTADO INICIAL — SEM MOCK DATA
+   A aplicação arranca sempre vazia (0 membros, 0 candidatos). O Excel
+   Mestre (Google Sheets) é a ÚNICA fonte da verdade: os dados reais só
+   entram em estado assim que o utilizador autentica com a Google e liga
+   a folha ("Guardar Ligação"), o que despoleta uma sincronização
+   automática (ver runSync/useEffect mais abaixo), ou quando clica em
+   "Sincronizar Agora". As antigas funções buildMockMembers()/
+   buildMockCandidates() foram removidas — nunca mais geram candidatos
+   fictícios no arranque da app.
 ============================================================================ */
-
-function buildMockMembers() {
-  const members = [];
-  const supervisorsSeen = new Map();
-  ORG.forEach((o) => {
-    members.push({ id: uid("dir"), name: o.diretor, role: "Diretor", title: "Diretor(a)", departments: [o.dept], availability: pickAvailability(o.diretor, 0.55) });
-    o.rh.forEach((name) => {
-      members.push({ id: uid("rh"), name, role: "RH", title: "Membro RH", departments: [o.dept], availability: pickAvailability(name, 0.6) });
-    });
-    if (supervisorsSeen.has(o.supervisor)) {
-      supervisorsSeen.get(o.supervisor).departments.push(o.dept);
-    } else {
-      const m = { id: uid("sup"), name: o.supervisor, role: "Supervisor", title: o.supervisorTitle, departments: [o.dept], availability: pickAvailability(o.supervisor, 0.45) };
-      supervisorsSeen.set(o.supervisor, m);
-      members.push(m);
-    }
-  });
-  return members;
-}
-
-const FIRST_NAMES = ["Ana", "Beatriz", "Carolina", "Diana", "Eduarda", "Filipa", "Gabriela", "Helena", "Inês", "Joana", "Leonor", "Madalena", "Mariana", "Matilde", "Rita", "Sara", "Sofia", "Vera", "Alexandre", "Bernardo", "Carlos", "Diogo", "Eduardo", "Filipe", "Gonçalo", "Hugo", "Ivo", "João", "Leonardo", "Miguel", "Nuno", "Pedro", "Ricardo", "Rodrigo", "Samuel", "Simão", "Tiago", "Tomás", "Vasco", "Xavier"];
-const LAST_NAMES = ["Silva", "Santos", "Ferreira", "Pereira", "Oliveira", "Costa", "Rodrigues", "Martins", "Sousa", "Fernandes", "Gonçalves", "Gomes", "Lopes", "Marques", "Alves", "Almeida", "Ribeiro", "Carvalho", "Teixeira", "Moreira", "Correia", "Mendes", "Nunes", "Soares", "Vieira", "Monteiro", "Cardoso", "Rocha", "Neves", "Coelho", "Cunha", "Pinto", "Ramos", "Reis", "Simões", "Antunes", "Matos", "Fonseca", "Machado", "Araújo"];
-
-function generateNamePool(n) {
-  const rng = mulberry32(hashStr("yme-candidatos-2026"));
-  const used = new Set();
-  const out = [];
-  while (out.length < n) {
-    const fn = FIRST_NAMES[Math.floor(rng() * FIRST_NAMES.length)];
-    const ln = LAST_NAMES[Math.floor(rng() * LAST_NAMES.length)];
-    const full = `${fn} ${ln}`;
-    if (used.has(full)) continue;
-    used.add(full);
-    out.push(full);
-  }
-  return out;
-}
-
-function buildMockCandidates(total = 108) {
-  const names = generateNamePool(total);
-  return names.map((name, i) => {
-    const department = DEPARTMENTS[i % DEPARTMENTS.length];
-    const phase0Status = i % 13 === 0 ? "Rejeitado" : i % 8 === 0 ? "Pendente" : "Aprovado";
-
-    const f1 = phase0Status === "Aprovado" && i % 11 !== 0;
-    const phase1Status = phase0Status !== "Aprovado" ? "—" : !f1 ? "—" : i % 17 === 0 ? "Rejeitado" : i % 9 === 0 ? "Pendente" : "Aprovado";
-
-    const f2 = phase1Status === "Aprovado" && i % 10 !== 0;
-    const phase2Status = phase1Status !== "Aprovado" ? "—" : !f2 ? "—" : i % 19 === 0 ? "Rejeitado" : i % 12 === 0 ? "Pendente" : "Aprovado";
-
-    const f3 = phase2Status === "Aprovado" && i % 9 !== 0;
-
-    return {
-      id: uid("cand"), name, department,
-      email: `${slugify(name)}@candidatos.yme.pt`,
-      cvLink: `https://forms.yme.pt/questionario/${slugify(name.split(" ")[0])}`,
-      phase0Status, phase1Status, phase2Status,
-      formsSubmitted: { fase1: f1, fase2: f2, fase3: f3 },
-      availability: {
-        fase1: f1 ? pickAvailability(name + "-f1", 0.5) : [],
-        fase2: f2 ? pickAvailability(name + "-f2", 0.5) : [],
-        fase3: f3 ? pickAvailability(name + "-f3", 0.5) : [],
-      },
-    };
-  });
-}
 
 /* ============================================================================
    SCHEDULING ALGORITHMS  (lógica inalterada)
@@ -1495,6 +1443,18 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
         <span className="text-xs ml-auto" style={{ color: "#94a3b8" }}>{filtered.length} resultado(s)</span>
       </div>
 
+      {candidates.length === 0 && (
+        <div className="flex items-center gap-3 rounded-xl border px-4 py-3 mb-4" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.15) }}>
+          <FileClock size={16} style={{ color: COLORS.navy }} className="shrink-0" />
+          <p className="text-sm" style={{ color: COLORS.navy }}>
+            Ainda sem candidatos. Liga o Excel Mestre da YME (Google Sheets) no Hub de Importação para sincronizar os dados reais — não existem dados fictícios pré-carregados.
+          </p>
+          <button onClick={goToImport} className="yme-btn-primary text-xs font-medium rounded-lg px-3 py-1.5 whitespace-nowrap ml-auto">
+            Ir para Hub de Importação
+          </button>
+        </div>
+      )}
+
       <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.1) }}>
         <table className="w-full text-sm">
           <thead>
@@ -1502,6 +1462,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
               <th className="px-4 py-3 font-medium">Candidato</th>
               <th className="px-4 py-3 font-medium">Departamento</th>
               <th className="px-4 py-3 font-medium">Email</th>
+              <th className="px-4 py-3 font-medium">Telefone</th>
               <th className="px-4 py-3 font-medium">CV / Questionário</th>
               <th className="px-4 py-3 font-medium">Estado</th>
               <th className="px-4 py-3 font-medium">Avança Fase 1</th>
@@ -1510,11 +1471,21 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
           <tbody>
             {pageItems.map((c) => (
               <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
-                <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>{c.name}</td>
+                <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
+                  {c.name}
+                  {c.departmentPorConfirmar && (
+                    <span className="ml-1.5 text-[10px] font-normal align-middle" title="Departamento não reconhecido na folha — por confirmar" style={{ color: "#c0227a" }}>(dept. por confirmar)</span>
+                  )}
+                </td>
                 <td className="px-4 py-3"><DeptBadge dept={c.department} /></td>
-                <td className="px-4 py-3" style={{ color: hexToRgba(COLORS.navy, 0.6) }}>{c.email}</td>
+                <td className="px-4 py-3" style={{ color: hexToRgba(COLORS.navy, 0.6) }}>{c.email || "—"}</td>
+                <td className="px-4 py-3" style={{ color: hexToRgba(COLORS.navy, 0.6) }}>{c.telefone || "—"}</td>
                 <td className="px-4 py-3">
-                  <a href={c.cvLink} target="_blank" rel="noreferrer" className="yme-link text-xs">Ver questionário ↗</a>
+                  {c.cvLink ? (
+                    <a href={c.cvLink} target="_blank" rel="noreferrer" className="yme-link text-xs">Ver questionário ↗</a>
+                  ) : (
+                    <span className="text-xs" style={{ color: hexToRgba(COLORS.navy, 0.4) }}>—</span>
+                  )}
                 </td>
                 <td className="px-4 py-3">
                   <select value={c.phase0Status} onChange={(e) => setStatus(c.id, e.target.value)}
@@ -1532,7 +1503,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
               </tr>
             ))}
             {pageItems.length === 0 && (
-              <tr><td colSpan={6} className="px-4 py-10 text-center text-sm" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Sem candidatos para os filtros selecionados.</td></tr>
+              <tr><td colSpan={7} className="px-4 py-10 text-center text-sm" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Sem candidatos para os filtros selecionados.</td></tr>
             )}
           </tbody>
         </table>
@@ -1881,7 +1852,7 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
 ============================================================================ */
 
 function AddCandidateModal({ onClose, onSave }) {
-  const [form, setForm] = useState({ name: "", department: DEPARTMENTS[0], email: "", cvLink: "" });
+  const [form, setForm] = useState({ name: "", department: DEPARTMENTS[0], email: "", telefone: "", cvLink: "" });
   const save = () => {
     if (!form.name.trim()) return;
     onSave({
@@ -1901,6 +1872,7 @@ function AddCandidateModal({ onClose, onSave }) {
           </select>
         </Field>
         <Field label="Email"><input className={inputCls} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+        <Field label="Telefone"><input className={inputCls} value={form.telefone} onChange={(e) => setForm({ ...form, telefone: e.target.value })} /></Field>
         <Field label="Link do CV / Questionário"><input className={inputCls} value={form.cvLink} onChange={(e) => setForm({ ...form, cvLink: e.target.value })} /></Field>
       </div>
       <p className="text-xs mb-3" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>A disponibilidade deste candidato para cada fase é preenchida através do respetivo Forms, no Hub de Importação.</p>
@@ -1921,13 +1893,17 @@ export default function App() {
   const [page, setPage] = useState("dashboard");
   const [showAddCandidate, setShowAddCandidate] = useState(false);
 
-  const [members, setMembers] = useState(() => buildMockMembers());
-  const [candidates, setCandidates] = useState(() => buildMockCandidates(108));
+  // Sem mock data: a app arranca sempre vazia. members/candidates só
+  // ganham conteúdo real através da sincronização com o Excel Mestre
+  // (Google Sheets) — ver runSync/useEffect mais abaixo — ou, como
+  // alternativa manual/backup, via upload de ficheiro no Hub de Importação.
+  const [members, setMembers] = useState(() => []);
+  const [candidates, setCandidates] = useState(() => []);
   const [importStatus, setImportStatus] = useState({
-    excel: { loaded: true, filename: "Excel_Mestre_YME_mock.xlsx", count: 17 },
-    fase1: { loaded: true, filename: "Forms_Fase1_mock.csv", count: 0 },
-    fase2: { loaded: true, filename: "Forms_Fase2_mock.csv", count: 0 },
-    fase3: { loaded: true, filename: "Forms_Fase3_mock.csv", count: 0 },
+    excel: { loaded: false, filename: "", count: 0 },
+    fase1: { loaded: false, filename: "", count: 0 },
+    fase2: { loaded: false, filename: "", count: 0 },
+    fase3: { loaded: false, filename: "", count: 0 },
   });
 
   useEffect(() => {
