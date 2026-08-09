@@ -168,17 +168,28 @@ function readWorkbook(file) {
     reader.readAsArrayBuffer(file);
   });
 }
+// Normaliza texto para comparação de cabeçalhos/valores: remove acentos,
+// baixa para minúsculas, apara espaços e colapsa espaços internos múltiplos.
+// Essencial para que pequenas variações no Excel Mestre (maiúsculas,
+// acentuação, espaços a mais) nunca façam uma coluna "desaparecer".
+function normKey(s) {
+  return String(s ?? "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .trim().toLowerCase().replace(/\s+/g, " ");
+}
 function get(row, ...keys) {
   for (const k of keys) {
+    const nk = normKey(k);
     for (const rk of Object.keys(row)) {
-      if (rk.trim().toLowerCase() === k.toLowerCase()) return row[rk];
+      if (normKey(rk) === nk) return row[rk];
     }
   }
   return "";
 }
 function matchDept(raw) {
-  const norm = String(raw || "").trim().toLowerCase();
-  return DEPARTMENTS.find((d) => d.toLowerCase() === norm) || null;
+  const norm = normKey(raw).replace(/[^a-z0-9]+/g, " ").trim();
+  if (!norm) return null;
+  return DEPARTMENTS.find((d) => normKey(d).replace(/[^a-z0-9]+/g, " ").trim() === norm) || null;
 }
 
 /* ============================================================================
@@ -213,6 +224,22 @@ const SYNC_DEPT_COLUMNS = {
 };
 // Coluna Q da Avaliação de CV: candidato passou para a Fase 2 (Entrevista Soft Skills/RH).
 const SYNC_CV_PASS_COLUMN = "Q";
+
+// "Palavras-chave" de cabeçalho usadas para localizar automaticamente a
+// linha de cabeçalho real de cada aba (aceita que haja 1-4 linhas de
+// título/logo acima do cabeçalho, situação comum em Excels Mestre com
+// formatação). Sem isto, se o cabeçalho não estiver exatamente na
+// primeira linha da aba, TODAS as linhas seriam lidas como dados e
+// nenhum candidato seria reconhecido (nome/email a null em todas).
+const SYNC_HEADER_HINTS = {
+  departamentos: ["departamento", "diretor"],
+  candidatos: ["nome", "nome completo", "email"],
+  avaliacaoCV: ["nome", "nome completo"],
+  dispEntrevistasRH: ["nome"],
+  dispDinamicas: ["nome"],
+  dispEntrevistaFinal: ["nome"],
+};
+const SYNC_DEPT_HEADER_HINTS = ["nome", "nome completo"];
 
 /* ----------------------------------------------------------------------
    Autenticação Google (OAuth 2.0 / Google Identity Services) + leitura
@@ -401,18 +428,33 @@ function cellStatus(val) {
 // guarda tanto o objeto indexado pelo cabeçalho (colunas por nome, ex.
 // "Nome", "Email") como o array bruto da linha (colunas por letra, ex.
 // "Coluna L", "Coluna AZ").
-function parseApiValues(values) {
+// headerHints: palavras-chave (normalizadas) usadas para localizar a
+// linha de cabeçalho real dentro das primeiras 5 linhas da aba — cobre
+// o caso comum de haver 1-4 linhas de título/logo acima do cabeçalho.
+// Sem isto, se o cabeçalho não estiver na linha 1, nenhuma linha seria
+// reconhecida como candidato (nome/email sempre vazios).
+function parseApiValues(values, headerHints = []) {
   const grid = values || [];
-  const header = (grid[0] || []).map((h) => String(h ?? ""));
+  const hints = headerHints.map(normKey);
+  let headerIdx = 0;
+  if (hints.length) {
+    const found = grid.slice(0, 5).findIndex((row) => {
+      if (!row || !row.length) return false;
+      const norm = row.map((c) => normKey(c));
+      return hints.some((h) => norm.includes(h));
+    });
+    if (found >= 0) headerIdx = found;
+  }
+  const header = (grid[headerIdx] || []).map((h) => String(h ?? ""));
   const rows = grid
-    .slice(1)
+    .slice(headerIdx + 1)
     .filter((r) => r.some((c) => String(c ?? "").trim() !== ""))
     .map((raw) => {
       const obj = {};
       header.forEach((h, i) => { if (h) obj[h] = raw[i] ?? ""; });
       return { obj, raw };
     });
-  return { header, rows };
+  return { header, rows, headerIdx };
 }
 
 // Lê uma aba da folha privada através da Google Sheets API v4
@@ -420,7 +462,7 @@ function parseApiValues(values) {
 // utilizador. encodeURIComponent no nome da aba é essencial: nomes como
 // "Base Dados Departamentos" têm espaços e, sem isto, o range fica
 // inválido/mal interpretado pela API.
-async function fetchSheetTabApi(accessToken, sheetId, sheetName) {
+async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = []) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetName)}`;
   let res;
   try {
@@ -444,7 +486,7 @@ async function fetchSheetTabApi(accessToken, sheetId, sheetName) {
     throw new Error("read_error");
   }
 
-  return parseApiValues(data.values);
+  return parseApiValues(data.values, headerHints);
 }
 
 // Converte os códigos de erro internos da API (token_expired,
@@ -490,6 +532,7 @@ function extractAvailabilityFromRow(header, row) {
 // Aplica os dados brutos das abas do Excel Mestre ao estado de members/candidates
 // da aplicação, seguindo o mapeamento estrito de abas e colunas da YME.
 function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
+  const warnings = [];
   /* ---- A1. Base Dados Departamentos -> membros (Diretor/Supervisor/RH) ---- */
   let members = prevMembers.map((m) => ({ ...m }));
   const upsertMember = (name, role, dept) => {
@@ -543,11 +586,33 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       ...patch,
     });
   };
+  // Converte o texto livre da coluna "Estado"/"Fase Atual" (quando existe
+  // na própria aba "Base Dados Candidatos") num phase0Status inicial.
+  // É só um valor de partida: a Coluna Q da aba "Avaliação CV e Questões
+  // Abertas" (processada a seguir, A3) continua a ter a última palavra
+  // sempre que estiver preenchida.
+  function estadoToPhase0(raw) {
+    const n = normKey(raw);
+    if (!n) return null;
+    if (["aprovado", "aprovada", "avanca", "apto", "selecionado", "admitido"].some((x) => n.includes(x))) return "Aprovado";
+    if (["rejeitado", "reprovado", "eliminado", "excluido", "nao avanca", "chumbado"].some((x) => n.includes(x))) return "Rejeitado";
+    if (["pendente", "em avaliacao", "por avaliar", "em analise", "a aguardar"].some((x) => n.includes(x))) return "Pendente";
+    return null;
+  }
+
+  let candidateRowsSeen = 0;
+  let candidateRowsWithName = 0;
   (raw.candidatos?.rows || []).forEach((row) => {
-    const name = String(get(row.obj, "nome completo", "nome", "name") || "").trim();
+    candidateRowsSeen++;
+    const name = String(get(
+      row.obj, "nome completo", "nome", "name", "nome do candidato", "candidato", "full name"
+    ) || "").trim();
     if (!name) return;
-    const dept1 = matchDept(get(row.obj, "primeira opcao", "primeira opção", "1a opcao", "1ª opção", "departamento"));
+    candidateRowsWithName++;
+    const dept1 = matchDept(get(row.obj, "primeira opcao", "primeira opção", "1a opcao", "1ª opção", "departamento", "departamento/cargo", "cargo", "cargo pretendido"));
     const dept2 = matchDept(get(row.obj, "segunda opcao", "segunda opção", "2a opcao", "2ª opção"));
+    const estadoRaw = get(row.obj, "estado", "fase atual", "fase", "estado atual", "situacao", "situação");
+    const phase0FromEstado = estadoToPhase0(estadoRaw);
     // Fallback: linha sem coluna de departamento reconhecida (célula vazia
     // ou valor que não corresponde a nenhum dos 6 departamentos) nunca
     // rebenta a sincronização — fica apenas marcada para confirmação manual.
@@ -561,8 +626,20 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       curso: String(get(row.obj, "curso") || "").trim(),
       anoLetivo: String(get(row.obj, "ano letivo", "ano") || "").trim(),
       erasmus: String(get(row.obj, "erasmus") || "").trim(),
+      ...(phase0FromEstado ? { phase0Status: phase0FromEstado } : {}),
     });
   });
+
+  // Diagnóstico: se a aba foi lida mas nenhuma (ou só algumas) linha(s)
+  // teve uma coluna de Nome reconhecida, avisa em vez de falhar em
+  // silêncio — isto é normalmente a causa de "0 candidatos apareceram".
+  if (raw.candidatos) {
+    if (candidateRowsSeen > 0 && candidateRowsWithName === 0) {
+      warnings.push(`A aba "Base Dados Candidatos" tem ${candidateRowsSeen} linha(s) de dados mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
+    } else if (candidateRowsWithName > 0 && candidateRowsWithName < candidateRowsSeen) {
+      warnings.push(`${candidateRowsSeen - candidateRowsWithName} linha(s) da aba "Base Dados Candidatos" foram ignoradas por não terem o campo Nome preenchido.`);
+    }
+  }
 
   /* ---- A3. Avaliação CV e Questões Abertas -> Coluna Q (avança p/ Fase 2 = Entrevista RH) ---- */
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
@@ -624,7 +701,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     });
   });
 
-  return { members, candidates };
+  return { members, candidates, warnings };
 }
 
 // Sentinela lançada quando alguma aba falhou por token de acesso expirado/
@@ -650,9 +727,9 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
   }
 
   let tokenExpired = false;
-  const readTab = async (key, sheetName) => {
+  const readTab = async (key, sheetName, headerHints = []) => {
     try {
-      const data = await fetchSheetTabApi(accessToken, sheetId, sheetName);
+      const data = await fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints);
       return [key, data];
     } catch (err) {
       if (err.message === "token_expired") tokenExpired = true;
@@ -663,8 +740,8 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
   let generalResults, deptResults;
   try {
     [generalResults, deptResults] = await Promise.all([
-      Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) => readTab(key, sheetName))),
-      Promise.all(DEPARTMENTS.map((dept) => readTab(dept, dept))),
+      Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) => readTab(key, sheetName, SYNC_HEADER_HINTS[key]))),
+      Promise.all(DEPARTMENTS.map((dept) => readTab(dept, `'${dept}'`, SYNC_DEPT_HEADER_HINTS))),
     ]);
   } catch (fatalErr) {
     // Salvaguarda: qualquer falha inesperada (ex. fetch() indisponível no
@@ -693,8 +770,8 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
     );
   }
 
-  const { members, candidates } = applySyncedSheetsToState(raw, prevMembers, prevCandidates);
-  return { members, candidates, errors };
+  const { members, candidates, warnings } = applySyncedSheetsToState(raw, prevMembers, prevCandidates);
+  return { members, candidates, errors: [...errors, ...warnings] };
 }
 
 /* ============================================================================
@@ -1954,7 +2031,7 @@ export default function App() {
       const uniqueErrors = Array.from(new Set(errors));
       setSyncState({
         syncing: false,
-        error: uniqueErrors.length ? `${uniqueErrors.length} aba(s) com problemas: ${uniqueErrors.slice(0, 2).join(" ")}` : null,
+        error: uniqueErrors.length ? `${uniqueErrors.length} aviso(s) de sincronização: ${uniqueErrors.slice(0, 2).join(" ")}` : null,
         lastSync: new Date(),
         lastCount: nextCandidates.length,
       });
