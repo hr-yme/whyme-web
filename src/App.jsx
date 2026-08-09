@@ -73,7 +73,7 @@ const ORG = [
 ];
 const DEPARTMENTS = ORG.map((o) => o.dept);
 
-const PHASE_LABEL = { fase1: "Fase 1", fase2: "Fase 2", fase3: "Fase 3" };
+const PHASE_LABEL = { fase1: "Fase 2", fase2: "Fase 3", fase3: "Fase 4" };
 
 /* Cores exatas dos 6 Departamentos, conforme o Excel Mestre oficial da YME. */
 const DEPT_BADGE_CLASSES = {
@@ -216,13 +216,13 @@ const SYNC_SHEET_NAMES = {
 
 // B. Colunas de posição fixa (A=coluna 1) consultadas em cada aba de departamento.
 const SYNC_DEPT_COLUMNS = {
-  softSkills: "L",   // Passou Entrevista Soft Skills/RH -> avança Fase 2 (Dinâmicas)
-  dinamicas: "AA",   // Passou Dinâmicas de Grupo -> avança Fase 3 (Desafio Final)
+  softSkills: "L",   // Passou Entrevista Soft Skills/RH -> avança Fase 3 (Dinâmicas)
+  dinamicas: "AA",   // Passou Dinâmicas de Grupo -> avança Fase 4 (Hard Skills)
   final: "AZ",       // Passou Desafio Final/Hard Skills -> SELECIONADO / ENTROU NA YME
   talentPoolA: "AB", // Selecionado para Talent Pool (variante de coluna 1)
   talentPoolB: "BA", // Selecionado para Talent Pool (variante de coluna 2)
 };
-// Coluna Q da Avaliação de CV: candidato passou para a Fase 2 (Entrevista Soft Skills/RH).
+// Coluna Q da Avaliação de CV (Fase 1): candidato passou para a Fase 2 (Entrevista Soft Skills/RH).
 const SYNC_CV_PASS_COLUMN = "Q";
 
 // "Palavras-chave" de cabeçalho usadas para localizar automaticamente a
@@ -642,8 +642,8 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     const phase0FromEstado = estadoToPhase0(estadoRaw);
     // Coluna J: "Veio da Talent Pool?" (checkbox TRUE/FALSE/VERDADEIRO/☑).
     // Regra de negócio (prioridade 1 — Fast-Track): se TRUE, o candidato
-    // salta a análise de CV e a Entrevista Soft Skills (Fase 1) por
-    // completo e entra diretamente elegível para a Fase 2 (Dinâmicas).
+    // salta a Fase 1 (Avaliação de CV) e a Fase 2 (Entrevista Soft Skills)
+    // por completo e entra diretamente elegível para a Fase 3 (Dinâmicas).
     const veioTalentPool = isPositiveMark(get(row.obj, "veio da talent pool", "veio da talent pool?", "talent pool", "veio de talent pool", "veio da talentpool"));
     // Fallback: linha sem coluna de departamento reconhecida (célula vazia
     // ou valor que não corresponde a nenhum dos 6 departamentos) nunca
@@ -659,8 +659,8 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       anoLetivo: String(get(row.obj, "ano letivo", "ano") || "").trim(),
       erasmus: String(get(row.obj, "erasmus") || "").trim(),
       veioTalentPool,
-      // Fast-track: Fase 1 fica automaticamente "Aprovado"/isenta nos dois
-      // estados (CV e Soft Skills), avançando direto para a Fase 2.
+      // Fast-track: Fases 1 e 2 ficam automaticamente "Aprovado"/isentas
+      // (CV e Soft Skills), avançando direto para a Fase 3 (Dinâmicas).
       ...(veioTalentPool ? { phase0Status: "Aprovado", phase1Status: "Aprovado" } : {}),
       ...(!veioTalentPool && phase0FromEstado ? { phase0Status: phase0FromEstado } : {}),
     });
@@ -674,7 +674,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     warnings.push(`A aba "Base Dados Candidatos" tem ${raw.candidatos.rows.length} linha(s) de dados (cabeçalho detetado na linha ${(raw.candidatos.headerIdx ?? 0) + 1}) mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
   }
 
-  /* ---- A3. Avaliação CV e Questões Abertas -> Coluna Q (avança p/ Fase 2 = Entrevista RH) ---- */
+  /* ---- A3. Avaliação CV e Questões Abertas (Fase 1) -> Coluna Q (avança p/ Fase 2 = Entrevista Soft Skills) ---- */
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
     const name = String(get(row.obj, "nome", "nome completo", "name") || "").trim();
     if (!name) return;
@@ -683,7 +683,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     // candidato em A2 — a Coluna Q (fluxo regular) nunca a sobrepõe.
     if (idxExisting >= 0 && candidates[idxExisting].veioTalentPool) return;
     // Regra de negócio (prioridade 2 — Fluxo Regular): Coluna Q ("Passou?")
-    // TRUE -> Aprovado / avança Fase 1; FALSE -> Rejeitado.
+    // TRUE -> Aprovado na Fase 1 / avança Fase 2; FALSE -> Rejeitado.
     const status = cellStatus(row.raw[colLetterToIndex(SYNC_CV_PASS_COLUMN)]);
     if (status === "pending") return;
     const patch = { name, phase0Status: status === "positive" ? "Aprovado" : "Rejeitado" };
@@ -1147,11 +1147,11 @@ function LoginScreen({ onSuccess }) {
 
 function TopNav({ page, setPage, onLogout, counts }) {
   const items = [
-    { id: "dashboard", label: "DASHBOARD", badge: counts.fase0 },
+    { id: "dashboard", label: "DASHBOARD · FASE 1 · AVALIAÇÃO CV", badge: counts.fase0 },
     { id: "import", label: "IMPORTAÇÃO DE DADOS" },
-    { id: "fase1", label: "FASE 1 · SOFT SKILLS", badge: counts.fase1 },
-    { id: "fase2", label: "FASE 2 · DINÂMICAS", badge: counts.fase2 },
-    { id: "fase3", label: "FASE 3 · HARD SKILLS", badge: counts.fase3 },
+    { id: "fase1", label: "FASE 2 · SOFT SKILLS", badge: counts.fase1 },
+    { id: "fase2", label: "FASE 3 · DINÂMICAS", badge: counts.fase2 },
+    { id: "fase3", label: "FASE 4 · HARD SKILLS", badge: counts.fase3 },
   ];
   return (
     <header className="sticky top-0 z-40" style={{ backgroundColor: COLORS.navy, borderBottom: `1px solid ${hexToRgba(COLORS.mint, 0.12)}` }}>
@@ -1454,15 +1454,15 @@ function ImportHubPage({
 
       <p className="text-xs font-semibold uppercase tracking-widest mb-2 mt-6" style={{ color: "#94a3b8" }}>Google Forms de Candidatos por Fase</p>
       <div className="grid grid-cols-3 gap-4 mb-8">
-        <UploadCard icon={UsersRound} title="Forms — Fase 1" status={importStatus.fase1}
+        <UploadCard icon={UsersRound} title="Forms — Fase 2" status={importStatus.fase1}
           description="Candidatos e disponibilidades submetidas para as entrevistas de Soft Skills."
           hint='Colunas: Nome, Departamento, Email, Disponibilidade (slots separados por "|").'
           onFile={handleFormsPhase("fase1")} />
-        <UploadCard icon={LayoutGrid} title="Forms — Fase 2" status={importStatus.fase2}
+        <UploadCard icon={LayoutGrid} title="Forms — Fase 3" status={importStatus.fase2}
           description="Candidatos e disponibilidades submetidas para as Dinâmicas de Grupo."
           hint='Colunas: Nome, Departamento, Email, Disponibilidade (slots separados por "|").'
           onFile={handleFormsPhase("fase2")} />
-        <UploadCard icon={CalendarClock} title="Forms — Fase 3" status={importStatus.fase3}
+        <UploadCard icon={CalendarClock} title="Forms — Fase 4" status={importStatus.fase3}
           description="Candidatos e disponibilidades submetidas para as entrevistas de Hard Skills."
           hint='Colunas: Nome, Departamento, Email, Disponibilidade (slots separados por "|").'
           onFile={handleFormsPhase("fase3")} />
@@ -1525,7 +1525,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
     <div className="p-8">
       <div className="flex items-start justify-between mb-6">
         <div>
-          <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Dashboard & Fase 0 — Questionário e CV</h1>
+          <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Dashboard & Fase 1 — Questionário e CV</h1>
           <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Visão geral de {candidates.length} candidatos inscritos, distribuídos pelos 6 departamentos.</p>
         </div>
         <div className="flex items-center gap-2">
@@ -1540,7 +1540,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
 
       <div className="grid grid-cols-4 gap-4 mb-6">
         <StatCard label="Total de candidatos" value={counts.total} icon={UsersRound} tone="neutral" />
-        <StatCard label="Aprovados p/ Fase 1" value={counts.aprovados} icon={CheckCircle2} tone="brand" />
+        <StatCard label="Aprovados p/ Fase 2" value={counts.aprovados} icon={CheckCircle2} tone="brand" />
         <StatCard label="Pendentes" value={counts.pendentes} icon={Clock3} tone="alert" />
         <StatCard label="Rejeitados" value={counts.rejeitados} icon={XCircle} tone="critical" />
       </div>
@@ -1583,7 +1583,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
               <th className="px-4 py-3 font-medium">Telefone</th>
               <th className="px-4 py-3 font-medium">CV / Questionário</th>
               <th className="px-4 py-3 font-medium">Estado</th>
-              <th className="px-4 py-3 font-medium">Avança Fase 1</th>
+              <th className="px-4 py-3 font-medium">Avança Fase 2</th>
             </tr>
           </thead>
           <tbody>
@@ -1638,7 +1638,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
 }
 
 /* ============================================================================
-   PAGE: FASE 1 & FASE 3 (entrevistas 1:1)
+   PAGE: FASE 2 & FASE 4 (entrevistas 1:1)
 ============================================================================ */
 
 function InterviewPhasePage({
@@ -1830,13 +1830,24 @@ function EditBookingModal({ booking, columns, candidate, members, onClose, onSav
 }
 
 /* ============================================================================
-   PAGE: FASE 2 — DINÂMICAS DE GRUPO
+   PAGE: FASE 3 — DINÂMICAS DE GRUPO
 ============================================================================ */
 
 function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
   const candById = (id) => candidates.find((c) => c.id === id);
   const byId = (id) => members.find((m) => m.id === id);
   const missingForms = candidates.filter((c) => c.phase1Status === "Aprovado" && !c.formsSubmitted.fase2).length;
+  // Pool elegível para a Fase 3: candidatos com phase1Status "Aprovado" —
+  // inclui tanto quem passou a Fase 2 (Entrevista Soft Skills) como os
+  // candidatos Fast-Track vindos da Talent Pool (que entram já com
+  // phase1Status "Aprovado", isentos das Fases 1 e 2). É a mesma condição
+  // usada no App para gerar os grupos, por isso esta lista acompanha
+  // sempre a Talent Pool automaticamente, mesmo antes de "Gerar
+  // Agendamentos" ser premido.
+  const eligiblePool = candidates.filter((c) => c.phase1Status === "Aprovado" && c.formsSubmitted.fase2);
+  const talentPoolAtivos = candidates.filter((c) => c.veioTalentPool && c.phase1Status === "Aprovado").length;
+  const groupedIds = new Set(groups.flatMap((g) => g.candidateIds));
+  const ungrouped = eligiblePool.filter((c) => !groupedIds.has(c.id));
 
   const exportCSV = () => {
     const header = ["Grupo", "Horário", "Candidatos", "Supervisor", "Diretores presentes", "RH presentes", "Avisos"];
@@ -1879,7 +1890,7 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
     <div className="p-8">
       <div className="flex items-start justify-between mb-6">
         <div>
-          <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Fase 2 — Dinâmicas de Grupo</h1>
+          <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Fase 3 — Dinâmicas de Grupo</h1>
           <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de ~6 candidatos, máx. 2 por departamento, com Supervisor, Diretores e 2-3 RH.</p>
         </div>
         <div className="flex items-center gap-2">
@@ -1892,16 +1903,35 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
         </div>
       </div>
 
-      <div className="grid grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-5 gap-4 mb-6">
         <StatCard label="Grupos formados" value={groups.length} icon={LayoutGrid} tone="neutral" />
         <StatCard label="Candidatos alocados" value={groups.reduce((a, g) => a + g.candidateIds.length, 0)} icon={UsersRound} tone="brand" />
+        <StatCard label="Vindos da Talent Pool" value={talentPoolAtivos} icon={CheckCircle2} tone="brand" />
         <StatCard label="Avisos de restrição" value={totalWarnings} icon={AlertTriangle} tone={totalWarnings ? "critical" : "alert"} />
-        <StatCard label="À espera do Forms Fase 2" value={missingForms} icon={FileClock} tone="alert" />
+        <StatCard label="À espera do Forms Fase 3" value={missingForms} icon={FileClock} tone="alert" />
       </div>
+
+      {ungrouped.length > 0 && (
+        <div className="rounded-xl border p-4 mb-6" style={{ backgroundColor: hexToRgba(COLORS.pink, 0.1), borderColor: hexToRgba(COLORS.navy, 0.15) }}>
+          <p className="text-sm font-medium mb-2" style={{ color: COLORS.navy }}>
+            {ungrouped.length} candidato(s) já elegíveis para a Fase 3 (incluindo Talent Pool) mas ainda por agrupar — clica em "Gerar Agendamentos Automaticamente" para os alocar.
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {ungrouped.map((c) => (
+              <span key={c.id} className="inline-flex items-center gap-1 text-xs rounded-full px-2.5 py-1" style={{ backgroundColor: COLORS.white, color: COLORS.navy }}>
+                {c.name}
+                {c.veioTalentPool && (
+                  <span className="text-[10px] font-medium px-1 py-0.5 rounded" style={{ backgroundColor: hexToRgba(COLORS.pink, 0.25), color: COLORS.navy }}>Talent Pool</span>
+                )}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {groups.length === 0 && (
         <div className="rounded-xl border border-dashed p-10 text-center text-sm" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.2), color: hexToRgba(COLORS.navy, 0.5) }}>
-          Ainda não há candidatos aprovados na Fase 1 que tenham submetido o Forms da Fase 2.
+          Ainda não há candidatos aprovados na Fase 2 que tenham submetido o Forms da Fase 3.
         </div>
       )}
 
@@ -1925,6 +1955,9 @@ function Phase2Page({ candidates, members, groups, setGroups, onGenerate }) {
                     <div className="flex items-center gap-2">
                       <span style={{ color: COLORS.navy }}>{c.name}</span>
                       <DeptBadge dept={c.department} />
+                      {c.veioTalentPool && (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ backgroundColor: hexToRgba(COLORS.pink, 0.18), color: COLORS.navy }}>Talent Pool</span>
+                      )}
                     </div>
                     <select
                       className="text-[11px] rounded px-1 py-0.5 border"
@@ -2156,8 +2189,8 @@ export default function App() {
         )}
         {page === "fase1" && (
           <InterviewPhasePage
-            title="Fase 1 — Entrevista de Soft Skills"
-            subtitle="Candidato + Diretor do Departamento + 1 Membro RH — cruzamento de disponibilidades (Forms Fase 1 ∩ Excel Mestre)."
+            title="Fase 2 — Entrevista de Soft Skills"
+            subtitle="Candidato + Diretor do Departamento + 1 Membro RH — cruzamento de disponibilidades (Forms Fase 2 ∩ Excel Mestre)."
             phaseKey="fase1" availField="fase1" formsField="fase1" prevStatusField="phase0Status"
             candidates={candidates} members={members}
             bookings={phase1Bookings} setBookings={setPhase1Bookings}
@@ -2175,8 +2208,8 @@ export default function App() {
         )}
         {page === "fase3" && (
           <InterviewPhasePage
-            title="Fase 3 — Entrevista de Hard Skills"
-            subtitle="Candidato + Diretor + 1 Membro RH + Supervisor do Departamento — cruzamento exato entre 4 intervenientes (Forms Fase 3 ∩ Excel Mestre)."
+            title="Fase 4 — Entrevista de Hard Skills"
+            subtitle="Candidato + Diretor + 1 Membro RH + Supervisor do Departamento — cruzamento exato entre 4 intervenientes (Forms Fase 4 ∩ Excel Mestre)."
             phaseKey="fase3" availField="fase3" formsField="fase3" prevStatusField="phase2Status"
             candidates={candidates} members={members}
             bookings={phase3Bookings} setBookings={setPhase3Bookings}
