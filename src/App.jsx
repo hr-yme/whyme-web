@@ -215,6 +215,39 @@ function matchDept(raw) {
   return DEPARTMENTS.find((d) => normKey(d).replace(/[^a-z0-9]+/g, " ").trim() === norm) || null;
 }
 
+// Encontra o índice de um candidato já existente, mapeando dinamicamente
+// por Nome (normalizado — insensível a acentos/maiúsculas/espaços extra)
+// e, quando o nome não corresponde a nenhum candidato, por Email como
+// segunda chave. Substitui as comparações antigas `c.name.toLowerCase()
+// === name.toLowerCase()`, que falhavam sempre que o nome vinha escrito
+// de forma ligeiramente diferente entre abas (ex.: "João Complicado" vs
+// "Joao Complicado " com espaço a mais) — a causa raiz de aprovações da
+// Coluna Q não chegarem aos candidatos de alguns departamentos.
+function matchCandidateIndex(candidates, name, email) {
+  const nName = normKey(name);
+  if (nName) {
+    const i = candidates.findIndex((c) => normKey(c.name) === nName);
+    if (i >= 0) return i;
+  }
+  const nEmail = normKey(email);
+  if (nEmail) {
+    const i = candidates.findIndex((c) => c.email && normKey(c.email) === nEmail);
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
+// Deriva em que fase um candidato foi eliminado, olhando para o primeiro
+// estado "Rejeitado" na sequência Fase 1 -> Fase 2 -> Fase 3 -> Fase 4
+// (um candidato só pode ser eliminado uma vez, no primeiro corte que falhar).
+function getEliminationPhase(c) {
+  if (c.phase0Status === "Rejeitado") return "fase1";
+  if (c.phase1Status === "Rejeitado") return "fase2";
+  if (c.phase2Status === "Rejeitado") return "fase3";
+  if (c.finalResult === "Rejeitado") return "fase4";
+  return null;
+}
+
 /* ============================================================================
    SINCRONIZAÇÃO EM TEMPO REAL — EXCEL MESTRE (GOOGLE SHEETS)
    Lê diretamente da folha de cálculo mestre da YME, aba a aba, pelo nome
@@ -619,7 +652,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   /* ---- A2. Base Dados Candidatos -> dados base de cada candidato ---- */
   let candidates = prevCandidates.map((c) => ({ ...c }));
   const upsertCandidate = (patch) => {
-    const idx = candidates.findIndex((c) => c.name.toLowerCase() === patch.name.toLowerCase());
+    const idx = matchCandidateIndex(candidates, patch.name, patch.email);
     if (idx >= 0) candidates[idx] = { ...candidates[idx], ...patch };
     else candidates.push({
       id: uid("sync"), phase0Status: "Pendente", phase1Status: "—", phase2Status: "—",
@@ -699,31 +732,54 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   }
 
   /* ---- A3. Avaliação CV e Questões Abertas (Fase 1) -> Coluna Q (avança p/ Fase 2 = Entrevista Soft Skills) ---- */
+  // Mapeamento dinâmico por Nome (normalizado) e, em segundo lugar, por
+  // Email — nunca por posição/ordem de linha nem por departamento. Isto
+  // percorre TODAS as linhas da aba sem qualquer interrupção por
+  // departamento: a Coluna Q é lida da mesma forma para Human Resources,
+  // Quality Management, Legal & Finance, Brand Strategy, etc.
+  const unmatchedCV = [];
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
     const name = String(get(row.obj, "nome", "nome completo", "name") || "").trim();
     if (!name) return;
-    const idxExisting = candidates.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+    const email = String(get(row.obj, "email") || "").trim();
+    const idxExisting = matchCandidateIndex(candidates, name, email);
     // Prioridade 1 (Fast-Track Talent Pool) já decidiu o estado deste
     // candidato em A2 — a Coluna Q (fluxo regular) nunca a sobrepõe.
     if (idxExisting >= 0 && candidates[idxExisting].veioTalentPool) return;
     // Regra de negócio (prioridade 2 — Fluxo Regular): Coluna Q ("Passou?")
-    // TRUE -> Aprovado na Fase 1 / avança Fase 2; FALSE -> Rejeitado.
+    // TRUE/VERDADEIRO/☑ -> Aprovado na Fase 1 / avança Fase 2, seja qual
+    // for o departamento do candidato; FALSE -> Rejeitado.
     const status = cellStatus(row.raw[colLetterToIndex(SYNC_CV_PASS_COLUMN)]);
     if (status === "pending") return;
     const patch = { name, phase0Status: status === "positive" ? "Aprovado" : "Rejeitado" };
-    if (idxExisting >= 0) candidates[idxExisting] = { ...candidates[idxExisting], ...patch };
-    else upsertCandidate({ ...patch, department: DEPARTMENTS[0] });
+    if (idxExisting >= 0) {
+      candidates[idxExisting] = { ...candidates[idxExisting], ...patch };
+    } else {
+      // Não foi possível casar este nome com nenhum candidato de "Base
+      // Dados Candidatos" — em vez de o atirar silenciosamente para um
+      // departamento arbitrário (o bug original: tudo o que não casasse
+      // ficava mal atribuído), cria-se o registo marcado para
+      // confirmação manual e reporta-se para diagnóstico.
+      upsertCandidate({ ...patch, department: DEPARTMENTS[0], departmentPorConfirmar: true });
+      unmatchedCV.push(name);
+    }
   });
+  if (unmatchedCV.length) {
+    const sample = unmatchedCV.slice(0, 5).join(", ");
+    warnings.push(`${unmatchedCV.length} candidato(s) da aba "Avaliação CV e Questões Abertas" não têm um Nome correspondente em "Base Dados Candidatos" (${sample}${unmatchedCV.length > 5 ? "..." : ""}) — foram criados marcados como "por confirmar". Confirma se o nome está escrito de forma idêntica nas duas abas.`);
+  }
 
   /* ---- B. Abas por Departamento -> progresso por fase + lógica de rejeição ---- */
+  let unmatchedDept = 0;
   DEPARTMENTS.forEach((dept) => {
     const tab = raw.deptTabs?.[dept];
     if (!tab) return;
     tab.rows.forEach((row) => {
       const name = String(get(row.obj, "nome", "nome completo", "name") || "").trim();
       if (!name) return;
-      const idx = candidates.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
-      if (idx < 0) return; // candidato tem de constar em "Base Dados Candidatos"
+      const email = String(get(row.obj, "email") || "").trim();
+      const idx = matchCandidateIndex(candidates, name, email);
+      if (idx < 0) { unmatchedDept++; return; } // candidato tem de constar em "Base Dados Candidatos"
       const cand = candidates[idx];
       const at = (letter) => row.raw[colLetterToIndex(letter)];
 
@@ -765,6 +821,9 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       };
     });
   });
+  if (unmatchedDept > 0) {
+    warnings.push(`${unmatchedDept} linha(s) nas abas de departamento não corresponderam a nenhum candidato de "Base Dados Candidatos" (nome não encontrado) — o respetivo progresso de fase não foi atualizado.`);
+  }
 
   return { members, candidates, warnings };
 }
@@ -1392,7 +1451,7 @@ function ImportHubPage({
         const department = matchDept(get(row, "departamento", "department"));
         const email = String(get(row, "email")).trim();
         const availability = String(get(row, "disponibilidade", "horarios", "slots")).split("|").map((s) => s.trim()).filter((s) => SLOTS.includes(s));
-        const idx = next.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+        const idx = matchCandidateIndex(next, name, email);
         count++;
         if (idx >= 0) {
           next[idx] = {
@@ -1533,20 +1592,28 @@ function ImportHubPage({
 function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }) {
   const [deptFilter, setDeptFilter] = useState("Todos");
   const [statusFilter, setStatusFilter] = useState("Todos");
+  const [eliminationFilter, setEliminationFilter] = useState("Todos");
+  const [origemFilter, setOrigemFilter] = useState("Todos");
   const [search, setSearch] = useState("");
 
   const filtered = candidates.filter((c) =>
     (deptFilter === "Todos" || c.department === deptFilter) &&
     (statusFilter === "Todos" || c.phase0Status === statusFilter) &&
+    (eliminationFilter === "Todos" || getEliminationPhase(c) === eliminationFilter) &&
+    (origemFilter === "Todos" || (origemFilter === "Talent Pool" ? !!c.veioTalentPool : !c.veioTalentPool)) &&
     c.name.toLowerCase().includes(search.toLowerCase())
   );
-  const { page, setPage, totalPages, pageItems } = usePagination(filtered, 12, `${deptFilter}-${statusFilter}-${search}`);
+  const { page, setPage, totalPages, pageItems } = usePagination(filtered, 12, `${deptFilter}-${statusFilter}-${eliminationFilter}-${origemFilter}-${search}`);
 
+  const filtersActive = deptFilter !== "Todos" || statusFilter !== "Todos" || eliminationFilter !== "Todos" || origemFilter !== "Todos" || search !== "";
+  // Os contadores de topo refletem sempre o conjunto atualmente filtrado
+  // (candidates completo quando não há filtros ativos, subconjunto
+  // filtrado assim que qualquer filtro é aplicado).
   const counts = {
-    total: candidates.length,
-    aprovados: candidates.filter((c) => c.phase0Status === "Aprovado").length,
-    pendentes: candidates.filter((c) => c.phase0Status === "Pendente").length,
-    rejeitados: candidates.filter((c) => c.phase0Status === "Rejeitado").length,
+    total: filtered.length,
+    aprovados: filtered.filter((c) => c.phase0Status === "Aprovado").length,
+    pendentes: filtered.filter((c) => c.phase0Status === "Pendente").length,
+    rejeitados: filtered.filter((c) => c.phase0Status === "Rejeitado").length,
   };
 
   const setStatus = (id, status) => setCandidates((prev) => prev.map((c) => (c.id === id ? { ...c, phase0Status: status } : c)));
@@ -1569,25 +1636,48 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
       </div>
 
       <div className="grid grid-cols-4 gap-4 mb-6">
-        <StatCard label="Total de candidatos" value={counts.total} icon={UsersRound} tone="neutral" />
+        <StatCard label={filtersActive ? "Candidatos (filtrado)" : "Total de candidatos"} value={counts.total} icon={UsersRound} tone="neutral" />
         <StatCard label="Aprovados p/ Fase 2" value={counts.aprovados} icon={CheckCircle2} tone="brand" />
         <StatCard label="Pendentes" value={counts.pendentes} icon={Clock3} tone="alert" />
         <StatCard label="Rejeitados" value={counts.rejeitados} icon={XCircle} tone="critical" />
       </div>
 
-      <div className="flex flex-wrap items-center gap-3 mb-4">
+      <div className="flex flex-wrap items-center gap-3 mb-2">
         <div className="relative">
           <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2" style={{ color: hexToRgba(COLORS.navy, 0.45) }} />
           <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Procurar candidato..."
             className="yme-input pl-8 pr-3 py-2 text-sm rounded-lg w-56" />
         </div>
         <select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)} className="yme-input text-sm rounded-lg px-2.5 py-2">
-          <option>Todos</option>
-          {DEPARTMENTS.map((d) => <option key={d}>{d}</option>)}
+          <option value="Todos">Todos os departamentos</option>
+          {DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="yme-input text-sm rounded-lg px-2.5 py-2">
-          {["Todos", "Aprovado", "Pendente", "Rejeitado"].map((s) => <option key={s}>{s}</option>)}
+          <option value="Todos">Todos os estados</option>
+          <option value="Aprovado">Passaram à Fase Atual</option>
+          <option value="Pendente">Pendentes de Avaliação</option>
+          <option value="Rejeitado">Eliminados / Rejeitados</option>
         </select>
+        <select value={eliminationFilter} onChange={(e) => setEliminationFilter(e.target.value)} className="yme-input text-sm rounded-lg px-2.5 py-2">
+          <option value="Todos">Eliminado em — qualquer fase</option>
+          <option value="fase1">Eliminado na Fase 1 (Triagem CV)</option>
+          <option value="fase2">Eliminado na Fase 2 (Soft Skills)</option>
+          <option value="fase3">Eliminado na Fase 3 (Dinâmicas)</option>
+          <option value="fase4">Eliminado na Fase 4 (Hard Skills)</option>
+        </select>
+        <select value={origemFilter} onChange={(e) => setOrigemFilter(e.target.value)} className="yme-input text-sm rounded-lg px-2.5 py-2">
+          <option value="Todos">Todas as origens</option>
+          <option value="Talent Pool">Talent Pool</option>
+          <option value="Regular">Processo Regular</option>
+        </select>
+        {filtersActive && (
+          <button
+            onClick={() => { setDeptFilter("Todos"); setStatusFilter("Todos"); setEliminationFilter("Todos"); setOrigemFilter("Todos"); setSearch(""); }}
+            className="text-xs font-medium underline" style={{ color: hexToRgba(COLORS.white, 0.7) }}
+          >
+            Limpar filtros
+          </button>
+        )}
         <span className="text-xs ml-auto" style={{ color: "#94a3b8" }}>{filtered.length} resultado(s)</span>
       </div>
 
