@@ -619,15 +619,22 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     return null;
   }
 
-  let candidateRowsSeen = 0;
-  let candidateRowsWithName = 0;
-  (raw.candidatos?.rows || []).forEach((row) => {
-    candidateRowsSeen++;
+  // Filtragem silenciosa: linhas sem Nome preenchido são consideradas
+  // "espaço em branco reservado para futuros candidatos" (comum no Excel
+  // Mestre da YME) e são simplesmente ignoradas — sem qualquer aviso na
+  // UI. A app cresce automaticamente com o Excel: hoje 124 candidatos,
+  // amanhã 200+, sem tocar em código nem poluir o ecrã com alertas.
+  const candidatosValidos = (raw.candidatos?.rows || []).filter((row) => {
     const name = String(get(
       row.obj, "nome completo", "nome", "name", "nome do candidato", "candidato", "full name"
     ) || "").trim();
-    if (!name) return;
-    candidateRowsWithName++;
+    return name.length > 0;
+  });
+
+  candidatosValidos.forEach((row) => {
+    const name = String(get(
+      row.obj, "nome completo", "nome", "name", "nome do candidato", "candidato", "full name"
+    ) || "").trim();
     const dept1 = matchDept(get(row.obj, "primeira opcao", "primeira opção", "1a opcao", "1ª opção", "departamento", "departamento/cargo", "cargo", "cargo pretendido"));
     const dept2 = matchDept(get(row.obj, "segunda opcao", "segunda opção", "2a opcao", "2ª opção"));
     const estadoRaw = get(row.obj, "estado", "fase atual", "fase", "estado atual", "situacao", "situação");
@@ -649,15 +656,12 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     });
   });
 
-  // Diagnóstico: se a aba foi lida mas nenhuma (ou só algumas) linha(s)
-  // teve uma coluna de Nome reconhecida, avisa em vez de falhar em
-  // silêncio — isto é normalmente a causa de "0 candidatos apareceram".
-  if (raw.candidatos) {
-    if (candidateRowsSeen > 0 && candidateRowsWithName === 0) {
-      warnings.push(`A aba "Base Dados Candidatos" tem ${candidateRowsSeen} linha(s) de dados (cabeçalho detetado na linha ${(raw.candidatos.headerIdx ?? 0) + 1}) mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
-    } else if (candidateRowsWithName > 0 && candidateRowsWithName < candidateRowsSeen) {
-      warnings.push(`${candidateRowsSeen - candidateRowsWithName} linha(s) da aba "Base Dados Candidatos" foram ignoradas por não terem o campo Nome preenchido.`);
-    }
+  // Diagnóstico: só avisa quando a aba foi lida mas ABSOLUTAMENTE nenhuma
+  // linha tinha Nome preenchido — sinal de que o cabeçalho não foi
+  // encontrado (problema real de configuração), nunca pelo simples facto
+  // de existirem linhas em branco reservadas para candidatos futuros.
+  if (raw.candidatos && raw.candidatos.rows.length > 0 && candidatosValidos.length === 0) {
+    warnings.push(`A aba "Base Dados Candidatos" tem ${raw.candidatos.rows.length} linha(s) de dados (cabeçalho detetado na linha ${(raw.candidatos.headerIdx ?? 0) + 1}) mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
   }
 
   /* ---- A3. Avaliação CV e Questões Abertas -> Coluna Q (avança p/ Fase 2 = Entrevista RH) ---- */
