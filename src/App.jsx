@@ -193,14 +193,14 @@ function matchDept(raw) {
 const SYNC_URL_STORAGE_KEY = "yme_master_sheet_url";
 const SYNC_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 em 2 minutos
 
-// A. Abas gerais de base de dados e disponibilidades (nomes exatos das abas).
+// A. Abas gerais de base de dados e disponibilidades (nomes exatos das abas com aspas simples para a API do Google).
 const SYNC_SHEET_NAMES = {
-  departamentos: "Base Dados Departamentos",
-  candidatos: "Base Dados Candidatos",
-  avaliacaoCV: "Avaliação CV e Questões Abertas",
-  dispEntrevistasRH: "Disponibilidade Entrevistas RH",
-  dispDinamicas: "Disponibilidade Dinâmicas",
-  dispEntrevistaFinal: "Disponibilidade Entrevista Final",
+  departamentos: "'Base Dados Departamentos'",
+  candidatos: "'Base Dados Candidatos'",
+  avaliacaoCV: "'Avaliação CV e Questões Abertas'",
+  dispEntrevistasRH: "'Disponibilidade Entrevistas RH'",
+  dispDinamicas: "'Disponibilidade Dinâmicas'",
+  dispEntrevistaFinal: "'Disponibilidade Entrevista Final'",
 };
 
 // B. Colunas de posição fixa (A=coluna 1) consultadas em cada aba de departamento.
