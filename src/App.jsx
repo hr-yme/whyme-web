@@ -236,9 +236,7 @@ const SYNC_CV_PASS_COLUMN = "Q";
 // VITE_GOOGLE_CLIENT_ID, faz essa leitura fora deste ficheiro (por
 // exemplo, injetando o valor num ficheiro de configuração separado que
 // só é processado pelo Vite) e passa o resultado para cá.
-const GOOGLE_CLIENT_ID =
-  (typeof process !== "undefined" && process.env?.REACT_APP_GOOGLE_CLIENT_ID) ||
-  "SUBSTITUIR_PELO_CLIENT_ID_OAUTH_DA_YME.apps.googleusercontent.com";
+const GOOGLE_CLIENT_ID = "1073691932169-dl8eu8rlsknece09vv6d53hacgeo2h5r.apps.googleusercontent.com";
 
 
 
