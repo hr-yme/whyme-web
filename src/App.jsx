@@ -294,6 +294,11 @@ const SYNC_DEPT_COLUMNS = {
 };
 // Coluna Q da Avaliação de CV (Fase 1): candidato passou para a Fase 2 (Entrevista Soft Skills/RH).
 const SYNC_CV_PASS_COLUMN = "Q";
+// Coluna R da Avaliação de CV (Fase 1): candidato NÃO passou (Rejeitado já na Fase 1).
+const SYNC_CV_FAIL_COLUMN = "R";
+// Coluna B (Departamento) e C (Nome) da aba "Avaliação CV e Questões Abertas".
+const SYNC_CV_DEPT_COLUMN = "B";
+const SYNC_CV_NAME_COLUMN = "C";
 
 // "Palavras-chave" de cabeçalho usadas para localizar automaticamente a
 // linha de cabeçalho real de cada aba (aceita que haja 1-4 linhas de
@@ -310,6 +315,14 @@ const SYNC_HEADER_HINTS = {
   dispEntrevistaFinal: ["nome"],
 };
 const SYNC_DEPT_HEADER_HINTS = ["nome", "nome completo"];
+
+// Índice de cabeçalho FIXO (0-based) para abas cuja estrutura real foi
+// confirmada manualmente e não deve depender de deteção automática por
+// palavras-chave — evita falsos negativos caso o texto exato do
+// cabeçalho não bata certo com nenhuma das SYNC_HEADER_HINTS. Estrutura
+// confirmada da aba "Avaliação CV e Questões Abertas": cabeçalho na
+// LINHA 13 (índice 12), dados a começar estritamente na LINHA 14.
+const SYNC_FIXED_HEADER_IDX = { avaliacaoCV: 12 };
 
 /* ----------------------------------------------------------------------
    Autenticação Google (OAuth 2.0 / Google Identity Services) + leitura
@@ -506,17 +519,23 @@ function cellStatus(val) {
 // cabeçalho real (ex: cabeçalho na linha 6 = índice 5). Sem isto, se o
 // cabeçalho não estiver na linha 1, nenhuma linha seria reconhecida
 // como candidato (nome/email sempre vazios).
-function parseApiValues(values, headerHints = []) {
+function parseApiValues(values, headerHints = [], fixedHeaderIdx = null) {
   const grid = values || [];
-  const hints = headerHints.map(normKey);
   let headerIdx = 0;
-  if (hints.length) {
-    const found = grid.slice(0, 20).findIndex((row) => {
-      if (!row || !row.length) return false;
-      const norm = row.map((c) => normKey(c));
-      return hints.some((h) => norm.includes(h));
-    });
-    if (found >= 0) headerIdx = found;
+  if (fixedHeaderIdx !== null && fixedHeaderIdx !== undefined) {
+    // Estrutura desta aba já foi confirmada manualmente — usa o índice
+    // exato em vez de tentar adivinhar pela deteção de palavras-chave.
+    headerIdx = fixedHeaderIdx;
+  } else {
+    const hints = headerHints.map(normKey);
+    if (hints.length) {
+      const found = grid.slice(0, 20).findIndex((row) => {
+        if (!row || !row.length) return false;
+        const norm = row.map((c) => normKey(c));
+        return hints.some((h) => norm.includes(h));
+      });
+      if (found >= 0) headerIdx = found;
+    }
   }
   const header = (grid[headerIdx] || []).map((h) => String(h ?? ""));
   const rows = grid
@@ -535,7 +554,7 @@ function parseApiValues(values, headerHints = []) {
 // utilizador. encodeURIComponent no nome da aba é essencial: nomes como
 // "Base Dados Departamentos" têm espaços e, sem isto, o range fica
 // inválido/mal interpretado pela API.
-async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = []) {
+async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = [], fixedHeaderIdx = null) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetName)}`;
   let res;
   try {
@@ -559,7 +578,7 @@ async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = [
     throw new Error("read_error");
   }
 
-  return parseApiValues(data.values, headerHints);
+  return parseApiValues(data.values, headerHints, fixedHeaderIdx);
 }
 
 // Converte os códigos de erro internos da API (token_expired,
@@ -745,45 +764,64 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     warnings.push(`A aba "Base Dados Candidatos" tem ${raw.candidatos.rows.length} linha(s) de dados (cabeçalho detetado na linha ${(raw.candidatos.headerIdx ?? 0) + 1}) mas nenhuma tem uma coluna de Nome reconhecida (procurei por "Nome", "Nome Completo", "Nome do Candidato"...). Confirma o texto exato do cabeçalho dessa coluna na folha.`);
   }
 
-  /* ---- A3. Avaliação CV e Questões Abertas (Fase 1) -> Coluna Q (avança p/ Fase 2 = Entrevista Soft Skills) ---- */
-  // Mapeamento dinâmico com EMAIL como chave primária (único e constante)
-  // e Nome sanitizado (trim + lowercase + sem acentos, via normKey) como
-  // segunda chave — nunca por posição/ordem de linha nem por departamento.
-  // Isto percorre TODAS as linhas da aba sem qualquer interrupção por
-  // departamento: a Coluna Q é lida da mesma forma para Human Resources,
-  // Quality Management, Legal & Finance, Brand Strategy, etc.
+  /* ---- A3. Avaliação CV e Questões Abertas (Fase 1) -> Colunas Q/R (avança p/ Fase 2 = Entrevista Soft Skills) ----
+     Estrutura confirmada desta aba (não tem coluna de Email): cabeçalho
+     na linha 13, dados a partir da linha 14 (já garantido por
+     SYNC_FIXED_HEADER_IDX.avaliacaoCV), Coluna B = Departamento,
+     Coluna C = Nome, Coluna Q = "Passou?", Coluna R = "Não Passou".
+     Lê-se SEMPRE por posição de coluna (nunca por texto de cabeçalho) e
+     o matching com "Base Dados Candidatos" é feito só por Nome
+     sanitizado (normKey: trim + lowercase + sem acentos + espaços
+     colapsados) — não há Email nesta aba. Isto percorre TODAS as linhas
+     sem qualquer interrupção por departamento: a lógica é idêntica para
+     Human Resources, Quality Management, Legal & Finance, Brand
+     Strategy, etc. */
   const unmatchedCV = [];
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
-    const rawName = get(row.obj, "nome", "nome completo", "name");
-    const rawEmail = get(row.obj, "email");
-    const name = isErrorOrEmptyValue(rawName) ? "" : String(rawName).trim();
-    if (!name) return;
-    const email = isErrorOrEmptyValue(rawEmail) ? "" : String(rawEmail).trim();
-    const idxExisting = matchCandidateIndex(candidates, name, email);
+    const rawName = row.raw[colLetterToIndex(SYNC_CV_NAME_COLUMN)];
+    if (isErrorOrEmptyValue(rawName)) return; // linha vazia ou erro de fórmula (#N/A, etc.) -> ignora silenciosamente
+    const name = String(rawName).trim();
+    const rawDept = row.raw[colLetterToIndex(SYNC_CV_DEPT_COLUMN)];
+    const dept = isErrorOrEmptyValue(rawDept) ? null : matchDept(rawDept);
+    const idxExisting = matchCandidateIndex(candidates, name, "");
     // Prioridade 1 (Fast-Track Talent Pool) já decidiu o estado deste
-    // candidato em A2 — a Coluna Q (fluxo regular) nunca a sobrepõe.
+    // candidato em A2 — as Colunas Q/R (fluxo regular) nunca a sobrepõem.
     if (idxExisting >= 0 && candidates[idxExisting].veioTalentPool) return;
     // Regra de negócio (prioridade 2 — Fluxo Regular): Coluna Q ("Passou?")
-    // TRUE/VERDADEIRO/☑ -> Aprovado na Fase 1 / avança Fase 2, seja qual
-    // for o departamento do candidato; FALSE -> Rejeitado.
-    const status = cellStatus(row.raw[colLetterToIndex(SYNC_CV_PASS_COLUMN)]);
-    if (status === "pending") return;
-    const patch = { name, phase0Status: status === "positive" ? "Aprovado" : "Rejeitado" };
+    // marcada -> Aprovado na Fase 1 / avança Fase 2; Coluna R ("Não
+    // Passou") marcada -> Rejeitado; nenhuma marcada -> mantém-se
+    // Pendente (não se sobrepõe nada). Válido para qualquer departamento.
+    const passou = isPositiveMark(row.raw[colLetterToIndex(SYNC_CV_PASS_COLUMN)]);
+    const naoPassou = isPositiveMark(row.raw[colLetterToIndex(SYNC_CV_FAIL_COLUMN)]);
+    if (!passou && !naoPassou) return; // nenhuma coluna marcada -> permanece Pendente
+    const patch = { name, phase0Status: passou ? "Aprovado" : "Rejeitado" };
     if (idxExisting >= 0) {
-      candidates[idxExisting] = { ...candidates[idxExisting], ...patch };
+      candidates[idxExisting] = {
+        ...candidates[idxExisting],
+        ...patch,
+        // Se conseguimos ler um departamento válido nesta linha, usa-o
+        // (mais fiável do que o que já estava, que pode vir de um
+        // registo antigo/errado em "Base Dados Candidatos").
+        ...(dept ? { department: dept } : {}),
+      };
     } else {
-      // Não foi possível casar nem por email nem por nome com nenhum
-      // candidato de "Base Dados Candidatos" — em vez de o atirar
-      // silenciosamente para um departamento arbitrário (o bug original:
-      // tudo o que não casasse ficava mal atribuído, aparentando "só
-      // Human Resources funciona"), cria-se o registo marcado para
-      // confirmação manual e reporta-se o nome/email exatos para diagnóstico.
-      upsertCandidate({ ...patch, email, department: DEPARTMENTS[0], departmentPorConfirmar: true });
-      unmatchedCV.push(email ? `${name} (${email})` : name);
+      // Não foi possível casar por nome com nenhum candidato de "Base
+      // Dados Candidatos" — em vez de o atirar silenciosamente para um
+      // departamento arbitrário (o bug original: tudo o que não casasse
+      // ficava sempre em Human Resources), usa-se o departamento real
+      // lido da Coluna B desta própria aba sempre que possível; só cai
+      // no departamento por omissão, marcado "por confirmar", quando a
+      // Coluna B também não permite identificar o departamento.
+      upsertCandidate({
+        ...patch,
+        department: dept || DEPARTMENTS[0],
+        departmentPorConfirmar: !dept,
+      });
+      unmatchedCV.push(name);
     }
   });
   if (unmatchedCV.length) {
-    warnings.push(`${unmatchedCV.length} candidato(s) da aba "Avaliação CV e Questões Abertas" não corresponderam a nenhum candidato de "Base Dados Candidatos" por email nem por nome: ${unmatchedCV.join("; ")} — foram criados marcados como "por confirmar". Confirma se o nome/email está escrito de forma idêntica nas duas abas.`);
+    warnings.push(`${unmatchedCV.length} candidato(s) da aba "Avaliação CV e Questões Abertas" não corresponderam a nenhum candidato de "Base Dados Candidatos" por nome: ${unmatchedCV.join("; ")} — foram criados marcados como "por confirmar". Confirma se o nome está escrito de forma idêntica nas duas abas.`);
   }
 
   /* ---- B. Abas por Departamento -> progresso por fase + lógica de rejeição ---- */
@@ -878,9 +916,9 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
   }
 
   let tokenExpired = false;
-  const readTab = async (key, sheetName, headerHints = []) => {
+  const readTab = async (key, sheetName, headerHints = [], fixedHeaderIdx = null) => {
     try {
-      const data = await fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints);
+      const data = await fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints, fixedHeaderIdx);
       return [key, data];
     } catch (err) {
       if (err.message === "token_expired") tokenExpired = true;
@@ -891,7 +929,7 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
   let generalResults, deptResults;
   try {
     [generalResults, deptResults] = await Promise.all([
-      Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) => readTab(key, sheetName, SYNC_HEADER_HINTS[key]))),
+      Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) => readTab(key, sheetName, SYNC_HEADER_HINTS[key], SYNC_FIXED_HEADER_IDX[key]))),
       Promise.all(DEPARTMENTS.map((dept) => readTab(dept, `'${dept}'`, SYNC_DEPT_HEADER_HINTS))),
     ]);
   } catch (fatalErr) {
