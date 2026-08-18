@@ -296,9 +296,10 @@ const SYNC_DEPT_COLUMNS = {
 const SYNC_CV_PASS_COLUMN = "Q";
 // Coluna R da Avaliação de CV (Fase 1): candidato NÃO passou (Rejeitado já na Fase 1).
 const SYNC_CV_FAIL_COLUMN = "R";
-// Coluna B (Departamento) e C (Nome) da aba "Avaliação CV e Questões Abertas".
-const SYNC_CV_DEPT_COLUMN = "B";
-const SYNC_CV_NAME_COLUMN = "C";
+// Coluna A (Departamento) e B (Nome) da aba "Avaliação CV e Questões
+// Abertas" — Coluna C é "Ano do Curso" e nunca deve ser lida como nome.
+const SYNC_CV_DEPT_COLUMN = "A";
+const SYNC_CV_NAME_COLUMN = "B";
 
 // "Palavras-chave" de cabeçalho usadas para localizar automaticamente a
 // linha de cabeçalho real de cada aba (aceita que haja 1-4 linhas de
@@ -767,8 +768,9 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   /* ---- A3. Avaliação CV e Questões Abertas (Fase 1) -> Colunas Q/R (avança p/ Fase 2 = Entrevista Soft Skills) ----
      Estrutura confirmada desta aba (não tem coluna de Email): cabeçalho
      na linha 13, dados a partir da linha 14 (já garantido por
-     SYNC_FIXED_HEADER_IDX.avaliacaoCV), Coluna B = Departamento,
-     Coluna C = Nome, Coluna Q = "Passou?", Coluna R = "Não Passou".
+     SYNC_FIXED_HEADER_IDX.avaliacaoCV), Coluna A = Departamento,
+     Coluna B = Nome do Candidato, Coluna C = Ano do Curso (NUNCA usada
+     como nome), Coluna Q = "Passou?", Coluna R = "Não Passou".
      Lê-se SEMPRE por posição de coluna (nunca por texto de cabeçalho) e
      o matching com "Base Dados Candidatos" é feito só por Nome
      sanitizado (normKey: trim + lowercase + sem acentos + espaços
@@ -776,11 +778,17 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
      sem qualquer interrupção por departamento: a lógica é idêntica para
      Human Resources, Quality Management, Legal & Finance, Brand
      Strategy, etc. */
+  const CV_INVALID_NAME_MARKERS = ["licenciatura", "mestrado", "doutoramento", "pós-graduação", "pos-graduacao"];
   const unmatchedCV = [];
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
     const rawName = row.raw[colLetterToIndex(SYNC_CV_NAME_COLUMN)];
     if (isErrorOrEmptyValue(rawName)) return; // linha vazia ou erro de fórmula (#N/A, etc.) -> ignora silenciosamente
     const name = String(rawName).trim();
+    // Salvaguarda extra: se por algum motivo a célula da Coluna B trouxer
+    // um grau académico (ex. valor da Coluna C "Ano do Curso" desalinhado
+    // por uma linha em branco/mesclada na folha), a linha é ignorada em
+    // vez de criar um candidato falso chamado "Licenciatura", etc.
+    if (CV_INVALID_NAME_MARKERS.some((marker) => normKey(name).includes(marker))) return;
     const rawDept = row.raw[colLetterToIndex(SYNC_CV_DEPT_COLUMN)];
     const dept = isErrorOrEmptyValue(rawDept) ? null : matchDept(rawDept);
     const idxExisting = matchCandidateIndex(candidates, name, "");
@@ -809,9 +817,9 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       // Dados Candidatos" — em vez de o atirar silenciosamente para um
       // departamento arbitrário (o bug original: tudo o que não casasse
       // ficava sempre em Human Resources), usa-se o departamento real
-      // lido da Coluna B desta própria aba sempre que possível; só cai
+      // lido da Coluna A desta própria aba sempre que possível; só cai
       // no departamento por omissão, marcado "por confirmar", quando a
-      // Coluna B também não permite identificar o departamento.
+      // Coluna A também não permite identificar o departamento.
       upsertCandidate({
         ...patch,
         department: dept || DEPARTMENTS[0],
