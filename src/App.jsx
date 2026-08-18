@@ -2381,9 +2381,23 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncUrl, auth.accessToken]);
 
-  const phase1Pool = useMemo(() => candidates.filter((c) => c.phase0Status === "Aprovado" && c.formsSubmitted.fase1 && !c.veioTalentPool), [candidates]);
-  const phase2Pool = useMemo(() => candidates.filter((c) => c.phase1Status === "Aprovado" && c.formsSubmitted.fase2), [candidates]);
-  const phase3Pool = useMemo(() => candidates.filter((c) => c.phase2Status === "Aprovado" && c.formsSubmitted.fase3), [candidates]);
+  // As pools abaixo definem quem CONTA/aparece em cada separador de fase.
+  // Regra única e sem exceções por departamento: basta o estado da fase
+  // anterior ser "Aprovado" (+ não vir isento via Talent Pool, na Fase 2).
+  // IMPORTANTE: já não depende de `formsSubmitted` — isso era o bug: o
+  // Forms de disponibilidade é importado à parte (upload manual "Forms —
+  // Fase X") e o matching por nome/email desse ficheiro só estava a
+  // resolver para candidatos de Human Resources, pelo que os restantes
+  // departamentos (aprovados nas colunas Q/R da folha, e corretamente
+  // contados no Dashboard) ficavam de fora da pool aqui usada para gerar
+  // o separador FASE 2 · SOFT SKILLS — daí os "17 Aprovados" no Dashboard
+  // vs. apenas "8 candidatos, só de HR" no separador. A ausência de Forms
+  // preenchido não é motivo de exclusão: generateInterviewPhase já trata
+  // esse caso de forma explícita, marcando a entrevista como "Sem Horário
+  // Comum" em vez de omitir o candidato.
+  const phase1Pool = useMemo(() => candidates.filter((c) => c.phase0Status === "Aprovado" && !c.veioTalentPool), [candidates]);
+  const phase2Pool = useMemo(() => candidates.filter((c) => c.phase1Status === "Aprovado"), [candidates]);
+  const phase3Pool = useMemo(() => candidates.filter((c) => c.phase2Status === "Aprovado"), [candidates]);
 
   const [phase1Bookings, setPhase1Bookings] = useState(() => generateInterviewPhase(phase1Pool, members, [], "fase1", ["diretorId", "rhId"]));
   const [phase2Groups, setPhase2Groups] = useState(() => generatePhase2(phase2Pool, members));
