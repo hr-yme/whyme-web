@@ -209,6 +209,17 @@ function get(row, ...keys) {
   }
   return "";
 }
+// Valores de erro típicos de fórmulas do Excel/Sheets (ex.: candidato ainda
+// não chegou a essa fase -> a fórmula devolve #N/A) ou de células vazias.
+// Estes NÃO são nomes/emails válidos e devem ser tratados como "slot ainda
+// por preencher", nunca como um candidato desconhecido a reportar.
+const SHEET_ERROR_VALUES = new Set(["#N/A", "#VALUE!", "#REF!", "#NAME?", "#NULL!", "#DIV/0!", "#ERROR!"]);
+function isErrorOrEmptyValue(v) {
+  if (v === null || v === undefined) return true;
+  const s = String(v).trim();
+  if (s === "") return true;
+  return SHEET_ERROR_VALUES.has(s.toUpperCase());
+}
 function matchDept(raw) {
   const norm = normKey(raw).replace(/[^a-z0-9]+/g, " ").trim();
   if (!norm) return null;
@@ -743,9 +754,11 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   // Quality Management, Legal & Finance, Brand Strategy, etc.
   const unmatchedCV = [];
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
-    const name = String(get(row.obj, "nome", "nome completo", "name") || "").trim();
+    const rawName = get(row.obj, "nome", "nome completo", "name");
+    const rawEmail = get(row.obj, "email");
+    const name = isErrorOrEmptyValue(rawName) ? "" : String(rawName).trim();
     if (!name) return;
-    const email = String(get(row.obj, "email") || "").trim();
+    const email = isErrorOrEmptyValue(rawEmail) ? "" : String(rawEmail).trim();
     const idxExisting = matchCandidateIndex(candidates, name, email);
     // Prioridade 1 (Fast-Track Talent Pool) já decidiu o estado deste
     // candidato em A2 — a Coluna Q (fluxo regular) nunca a sobrepõe.
@@ -779,9 +792,16 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     const tab = raw.deptTabs?.[dept];
     if (!tab) return;
     tab.rows.forEach((row) => {
-      const name = String(get(row.obj, "nome", "nome completo", "name") || "").trim();
+      const rawName = get(row.obj, "nome", "nome completo", "name");
+      const rawEmail = get(row.obj, "email");
+      // Fórmulas dinamizadas do Sheets devolvem #N/A (ou #VALUE!/#REF!) para
+      // candidatos que ainda não chegaram a esta fase — não são candidatos
+      // desconhecidos, são simplesmente slots por preencher. Ignora-se a
+      // linha silenciosamente, sem gerar aviso nem tentar fazer match.
+      if (isErrorOrEmptyValue(rawName) && isErrorOrEmptyValue(rawEmail)) return;
+      const name = isErrorOrEmptyValue(rawName) ? "" : String(rawName).trim();
       if (!name) return;
-      const email = String(get(row.obj, "email") || "").trim();
+      const email = isErrorOrEmptyValue(rawEmail) ? "" : String(rawEmail).trim();
       const idx = matchCandidateIndex(candidates, name, email);
       if (idx < 0) {
         unmatchedDept.push(`${email ? `${name} (${email})` : name} — aba "${dept}"`);
