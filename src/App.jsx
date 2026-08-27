@@ -745,23 +745,45 @@ function parseApiValues(values, headerHints = [], fixedHeaderIdx = null) {
     }
   }
   let header = (grid[headerIdx] || []).map((h) => String(h ?? ""));
-  // CABEÇALHO EM DUAS LINHAS (dia + hora) — ver mergeTwoRowHeader. Se a
-  // linha imediatamente ACIMA da linha de cabeçalho encontrada parece uma
-  // linha de rótulos de dia (ex. "Dia 10 - Quarta"), e a própria linha de
-  // cabeçalho ainda não tem nenhum dia reconhecível por si só (ou seja, só
-  // tem horas soltas tipo "9-9:30"), combina as duas antes de continuar.
-  // Isto é o que faltava para o Excel Mestre da YME: sem isto, cada coluna
-  // ficava só com a hora, sem dia nenhum, e nunca era reconhecida como
-  // disponibilidade — daí Diretores/RH aparecerem sempre sem horários.
-  if (headerIdx > 0) {
-    const headerAlreadyHasDay = header.some((h) => h && normalizeDayOnlyHeader(h) !== null);
-    if (!headerAlreadyHasDay) {
-      const aboveRow = grid[headerIdx - 1];
-      if (looksLikeDayLabelRow(aboveRow)) header = mergeTwoRowHeader(aboveRow, header);
+  let dataStartIdx = headerIdx + 1;
+  // CABEÇALHO EM DUAS LINHAS (dia + hora) — ver mergeTwoRowHeader. Ler só
+  // UMA linha (a que headerHints encontrou, ex. por conter "Nome") dava
+  // cabeçalhos sem dia nenhum sempre que o dia estivesse na linha vizinha
+  // ("Dia 10 - Quarta" numa linha, "9-9:30" noutra) — daí Diretores/RH
+  // aparecerem sempre "sem horários no Excel Mestre" apesar das células
+  // estarem preenchidas. Tenta, por esta ordem, até encontrar o par:
+  //  1) dia ACIMA da linha de cabeçalho encontrada (layout mais comum:
+  //     "Nome" está na mesma linha que as horas, o dia fica na linha de
+  //     cima, em células fundidas);
+  //  2) a PRÓPRIA linha de cabeçalho já É a linha de dias (ex.: "Nome"
+  //     está colado aos rótulos de dia) e as horas vêm na linha seguinte;
+  //  3) fallback totalmente independente de headerHints/"Nome": procura em
+  //     toda a folha o primeiro par de linhas consecutivas dia+hora — cobre
+  //     o caso de "Nome" não aparecer em nenhuma das duas linhas de
+  //     cabeçalho (só nas linhas de dados a seguir).
+  // NOTA: testa sempre as 3 hipóteses (não há pré-condição "só tenta se o
+  // cabeçalho ainda não tiver dia nenhum") — essa pré-condição bloqueava
+  // exatamente o caso 2: quando "Nome" está colado à linha de DIAS, essa
+  // linha já "tem dia" por si só, mas continua sem NENHUMA hora, por isso a
+  // fusão é sempre necessária mesmo assim. A segurança contra falsos
+  // positivos (não confundir uma linha de dados normal com a linha de
+  // horas) vem da exigência de DENSIDADE em looksLikeHourLabelRow, não de
+  // adivinhar se o cabeçalho "já parece suficiente".
+  if (headerIdx > 0 && looksLikeDayLabelRow(grid[headerIdx - 1]) && looksLikeHourLabelRow(header)) {
+    header = mergeTwoRowHeader(grid[headerIdx - 1], header);
+    dataStartIdx = headerIdx + 1;
+  } else if (looksLikeDayLabelRow(header) && looksLikeHourLabelRow(grid[headerIdx + 1] || [])) {
+    header = mergeTwoRowHeader(header, grid[headerIdx + 1]);
+    dataStartIdx = headerIdx + 2;
+  } else {
+    const pair = findDayHourHeaderRows(grid);
+    if (pair) {
+      header = mergeTwoRowHeader(grid[pair.dayIdx], grid[pair.hourIdx]);
+      dataStartIdx = pair.hourIdx + 1;
     }
   }
   const rows = grid
-    .slice(headerIdx + 1)
+    .slice(dataStartIdx)
     .filter((r) => r.some((c) => String(c ?? "").trim() !== ""))
     .map((raw) => {
       const obj = {};
@@ -1129,6 +1151,42 @@ function mergeTwoRowHeader(dayRow, hourRow) {
     if (!resolvedDay) return hourText ? `${dayLabel} ${hourText}`.trim() : dayLabel;
     return hourText ? `${resolvedDay} ${hourText}` : resolvedDay;
   });
+}
+
+// Deteta se uma linha da grelha se parece com uma linha de RÓTULOS DE HORA
+// — exige não só pelo menos 3 células reconhecidas como um INTERVALO de
+// horas genuíno (2 valores, início < fim, em modo solto — aceita "9-9:30"
+// sem separador nenhum), mas também que essas células sejam a GRANDE
+// MAIORIA das células não vazias da linha (≥70%). A densidade + o mínimo
+// de 3 é o que distingue uma verdadeira linha de cabeçalho de horas (onde
+// praticamente todas as colunas são um intervalo, tipicamente uma grelha
+// de várias dezenas de blocos de 30 min) de uma linha de DADOS normal que,
+// por acaso, tenha 1-2 células parecidas com horas (ex. um candidato que
+// respondeu com um intervalo de texto livre em 2 colunas) misturadas com
+// nome/email/etc.
+function looksLikeHourLabelRow(row) {
+  const cells = (row || []).map((v) => String(v ?? "").trim()).filter(Boolean);
+  if (cells.length < 3) return false;
+  const rangeCount = cells.filter((s) => {
+    const { inicio, fim } = parseTimeToMinutes(s, { allowBareHour: true });
+    return inicio !== null && fim !== null && fim > inicio;
+  }).length;
+  return rangeCount >= 3 && rangeCount / cells.length >= 0.7;
+}
+
+// Procura, em toda a folha (até `searchLimit` linhas), o primeiro par de
+// linhas CONSECUTIVAS dia+hora — usado como último recurso quando nem a
+// linha de cabeçalho encontrada por headerHints, nem a linha imediatamente
+// acima dela, formam esse par (ex.: o texto "Nome" não aparece em nenhuma
+// das duas linhas de cabeçalho, só nas linhas de dados a seguir).
+function findDayHourHeaderRows(grid, searchLimit = 20) {
+  const limit = Math.min((grid || []).length - 1, searchLimit);
+  for (let i = 0; i < limit; i++) {
+    if (looksLikeDayLabelRow(grid[i]) && looksLikeHourLabelRow(grid[i + 1])) {
+      return { dayIdx: i, hourIdx: i + 1 };
+    }
+  }
+  return null;
 }
 
 
@@ -1930,15 +1988,29 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
   const bookings = [...kept];
   pool.forEach((c) => {
     if (kept.some((b) => b.candidateId === c.id)) return;
-    const diretor = members.find((m) => m.role === "Diretor" && memberHasDept(m, c.department));
+    // Diretor por departamento — com FALLBACK GLOBAL: se não houver
+    // Diretor explicitamente associado a este departamento no Excel
+    // Mestre (mesmo já com a tolerância de deptMatches), usa qualquer
+    // Diretor disponível na organização como validador, em vez de deixar
+    // `diretor` por preencher e bloquear TODOS os candidatos desse
+    // departamento. `diretorIsFallback` fica registado para o diagnóstico
+    // poder distinguir os dois casos.
+    const diretorStrict = members.find((m) => m.role === "Diretor" && memberHasDept(m, c.department));
+    const diretor = diretorStrict || members.find((m) => m.role === "Diretor") || null;
+    const diretorIsFallback = !diretorStrict && !!diretor;
     const supervisor = staffKeys.includes("supervisorId") ? members.find((m) => m.role === "Supervisor" && memberHasDept(m, c.department)) : null;
 
     // PASSO 1 — ATRIBUIÇÃO DIRETA POR DEPARTAMENTO, independente do
     // horário: primeiro decide-se QUEM é o RH responsável (rhForDepartment
     // + round-robin), só depois é que se tenta cruzar horários. A coluna
     // RH usa sempre `assignedRH`, mesmo que o cruzamento abaixo não
-    // encontre nenhum slot comum.
-    const rhList = rhForDepartment(members, c.department);
+    // encontre nenhum slot comum. Mesmo FALLBACK GLOBAL que o Diretor: se
+    // não houver nenhum RH explicitamente associado a este departamento,
+    // usa a equipa de RH inteira da organização como candidatos válidos,
+    // em vez de bloquear o agendamento por completo.
+    let rhList = rhForDepartment(members, c.department);
+    const rhIsFallback = !rhList.length;
+    if (rhIsFallback) rhList = members.filter((m) => m.role === "RH");
     const assignedRH = nextRoundRobinRH(c.department, rhList);
 
     let found = null;
@@ -1950,8 +2022,9 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       // PASSO 3 — FALLBACK DE DISPONIBILIDADE: tenta primeiro o RH
       // atribuído pelo round-robin (`assignedRH`); só se ele não tiver
       // este slot livre (ou estiver ocupado com outro candidato) é que se
-      // testam os restantes membros de RH do mesmo departamento, por
-      // ordem, antes de desistir deste slot e passar ao seguinte.
+      // testam os restantes membros de RH do mesmo departamento (ou de
+      // toda a organização, se `rhIsFallback`), por ordem, antes de
+      // desistir deste slot e passar ao seguinte.
       const rhCandidates = [assignedRH, ...rhList.filter((r) => r.id !== assignedRH?.id)].filter(Boolean);
       const rh = rhCandidates.find((r) => hasSlot(minutesOf(r), slot) && !busy[r.id]?.has(slot));
       if (rh) { found = { slot, diretor, rh, supervisor }; break; }
@@ -1963,31 +2036,39 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       staffKeys.forEach((k) => { const mid = record[k]; if (mid) { busy[mid] = busy[mid] || new Set(); busy[mid].add(found.slot); } });
       bookings.push(record);
     } else {
-      // "Sem alocação" só deve aparecer quando o departamento realmente não
-      // tem NENHUM RH (rhList vazia -> assignedRH null). Havendo RH, a
-      // coluna mostra sempre `assignedRH` — só o Horário fica por
-      // preencher e o Estado mantém "Sem Horário Comum".
+      // "Sem alocação" só deve aparecer quando NÃO EXISTE sequer 1 RH em
+      // toda a organização (rhList vazia -> assignedRH null, o que só
+      // acontece se `members` não tiver NENHUM role="RH"). Havendo
+      // qualquer RH (do departamento ou do fallback global), a coluna
+      // mostra sempre `assignedRH` — só o Horário fica por preencher e o
+      // Estado mantém "Sem Horário Comum".
       const record = { id: uid("bk"), candidateId: c.id, slot: null, diretorId: diretor?.id || null, rhId: assignedRH?.id || null, status: "Sem Horário Comum", manual: false };
       if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
       // DIAGNÓSTICO (requisito 3): em vez de só "Sem Horário Comum" sem
       // mais nenhuma pista, guarda no próprio registo qual foi exatamente
       // o motivo — mostrado como tooltip no Estado (ver StatusBadge). A
       // ordem dos testes segue a cadeia de dependências reais do
-      // cruzamento: primeiro se sequer existe Diretor/RH para o
-      // departamento, depois se algum deles tem disponibilidade nenhuma
-      // registada, e só por fim (o caso mais comum) se não há
-      // interseção de horários entre quem já existe.
+      // cruzamento: primeiro se sequer existe Diretor/RH em TODA a
+      // organização, depois se algum deles tem disponibilidade nenhuma
+      // registada, e só por fim (o caso mais comum) se não há interseção
+      // de horários entre quem já existe — incluindo aviso quando foi
+      // preciso recorrer ao fallback global (departamento sem Diretor/RH
+      // próprio no Excel Mestre).
       let reason;
       if (!diretor) {
-        reason = `Nenhum(a) Diretor(a) associado ao departamento "${c.department}" no Excel Mestre.`;
+        reason = `Nenhum(a) Diretor(a) registado no Excel Mestre (nenhum membro com role "Diretor").`;
       } else if (!minutesOf(diretor).size) {
-        reason = `Diretor(a) ${diretor.name} sem horários registados no Excel Mestre.`;
+        reason = diretorIsFallback
+          ? `Nenhum(a) Diretor(a) associado ao departamento "${c.department}" — usou-se ${diretor.name} (Diretor de outro departamento) como fallback, mas também sem horários registados no Excel Mestre.`
+          : `Diretor(a) ${diretor.name} sem horários registados no Excel Mestre.`;
       } else if (!rhList.length) {
-        reason = `Nenhum Membro de RH associado ao departamento "${c.department}" no Excel Mestre.`;
+        reason = `Nenhum Membro de RH registado no Excel Mestre (nenhum membro com role "RH").`;
       } else if (!rhList.some((r) => minutesOf(r).size)) {
-        reason = `Equipa de RH de "${c.department}" sem horários registados no Excel Mestre.`;
+        reason = rhIsFallback
+          ? `Nenhum Membro de RH associado ao departamento "${c.department}" — usou-se a equipa de RH de outros departamentos como fallback, mas também sem horários registados no Excel Mestre.`
+          : `Equipa de RH de "${c.department}" sem horários registados no Excel Mestre.`;
       } else {
-        reason = `Sem interseção entre os horários de ${c.name} e a equipa (Diretor(a)/RH) de "${c.department}".`;
+        reason = `Sem interseção entre os horários de ${c.name} e a equipa (Diretor(a)/RH) ${diretorIsFallback || rhIsFallback ? "(via fallback global)" : `de "${c.department}"`}.`;
       }
       record.reason = reason;
       bookings.push(record);
@@ -2491,6 +2572,15 @@ function ImportHubPage({
           }
         });
       });
+      // DIAGNÓSTICO (requisito 3 do pedido): lista no consola (F12) todos
+      // os avaliadores (Diretor/Supervisor/RH) e a disponibilidade que
+      // ficou associada a cada um, logo depois de processar este ficheiro
+      // — para confirmar visualmente se Gustavo Dias, Mariana Lopes, Joana
+      // Pereira, etc. ficaram com horários extraídos do Excel Mestre.
+      const evaluatorsList = next
+        .filter((m) => ["Diretor", "Supervisor", "RH"].includes(m.role))
+        .map((m) => ({ nome: m.name, role: m.role, departamentos: m.departments, horarios: m.availability }));
+      console.log("Avaliadores Mapeados:", evaluatorsList);
       return next;
     });
     setImportStatus((prev) => ({ ...prev, excel: { loaded: true, filename: file.name, count } }));
@@ -3494,6 +3584,13 @@ export default function App() {
         await syncMasterSheet({ accessToken, sheetUrl: url, prevMembers: membersRef.current, prevCandidates: candidatesRef.current });
       setMembers(nextMembers);
       setCandidates(nextCandidates);
+      // DIAGNÓSTICO (requisito 3 do pedido): mesma lista no consola (F12)
+      // que no upload manual de Excel — para confirmar, também no caminho
+      // de sincronização automática com o Google Sheets, se Gustavo Dias,
+      // Mariana Lopes, Joana Pereira, etc. ficaram com horários extraídos.
+      console.log("Avaliadores Mapeados:", nextMembers
+        .filter((m) => ["Diretor", "Supervisor", "RH"].includes(m.role))
+        .map((m) => ({ nome: m.name, role: m.role, departamentos: m.departments, horarios: m.availability })));
       setImportStatus((prev) => ({
         ...prev,
         excel: { loaded: true, filename: "Sincronização em tempo real (Google Sheets, ficheiro privado)", count: nextCandidates.length },
