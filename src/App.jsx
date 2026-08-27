@@ -70,19 +70,34 @@ const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = ["09:00", "10:30", "14:00", "15:30", "17:00"];
 const SLOTS = DAYS.flatMap((d) => TIMES.map((t) => `${d} ${t}`));
 
-// Duração assumida de cada slot oficial de entrevista, em minutos. Usada
-// para decidir se um INTERVALO de disponibilidade em texto livre (ex.:
-// "09:00 - 12:00", bastante comum em respostas de Forms que pedem "das X às
-// Y" em vez de checkboxes por slot exato) cobre por completo um dos 5
-// horários oficiais da grelha, e não apenas para comparar strings iguais.
+// Duração PADRÃO (fallback) de um slot de entrevista, em minutos — usada
+// quando não há fase específica em jogo (ex. disponibilidade de
+// Diretor/Supervisor/RH lida do Excel Mestre, que continua a ser um único
+// "x/sim" por horário oficial, sem sub-divisão em blocos de 30 min).
+// CORREÇÃO: os candidatos, no Forms, NÃO marcam os 5 horários oficiais
+// diretamente — marcam uma grelha de checkboxes por BLOCO de 30 min (ex.
+// "9h-9h30", "9h30-10h", "11h30-12h", ...). Um único bloco marcado só cobre
+// a duração da Fase 2 (Soft Skills, 30 min); a Fase 4 (Hard Skills) precisa
+// de 2 blocos SEGUIDOS (60 min) e a Fase 3 (Dinâmicas de Grupo) de 3 blocos
+// SEGUIDOS (90 min) — ver PHASE_DURATION_MIN, passado a extractAvailability-
+// FromRow()/parseAvailabilityCell() para o upload de cada Forms de fase.
 const SLOT_DURATION_MIN = 30;
-// Mapa slot canónico -> { day, startMin, endMin }, calculado uma única vez.
+// Duração exigida (minutos) para considerar um candidato disponível num
+// horário oficial, por fase de entrevista (phaseKey interno -> minutos):
+// fase1 = Fase 2 (Soft Skills, 30 min), fase2 = Fase 3 (Dinâmicas de Grupo,
+// 90 min), fase3 = Fase 4 (Hard Skills, 60 min).
+const PHASE_DURATION_MIN = { fase1: 30, fase2: 90, fase3: 60 };
+// Mapa slot canónico -> { day, startMin }, calculado uma única vez. O
+// "endMin" de cada slot já NÃO é fixo aqui — passou a ser calculado no
+// momento (startMin + duração exigida pela fase em causa), porque essa
+// duração agora varia consoante a fase (ver PHASE_DURATION_MIN e
+// expandRangesToSlots).
 const SLOT_INFO = {};
 SLOTS.forEach((slot) => {
   const [day, time] = slot.split(" ");
   const [hh, mm] = time.split(":").map(Number);
   const startMin = hh * 60 + mm;
-  SLOT_INFO[slot] = { day, startMin, endMin: startMin + SLOT_DURATION_MIN };
+  SLOT_INFO[slot] = { day, startMin };
 });
 
 // Estrutura organizacional fixa da YME
@@ -340,6 +355,21 @@ function buildUnrecognizedRowsWarning(rows) {
   const extra = rows.length > MAX_WARNING_ROWS ? ` (+ ${rows.length - MAX_WARNING_ROWS} linha(s) adicional(is))` : "";
   const plural = rows.length > 1;
   return `Linha${plural ? "s" : ""} ${rowNumbers} (${names})${extra} sem horários selecionados — confirma o formato dessas células (coluna por slot, "Dia Hora" numa coluna por dia, ou texto livre "Seg 09:00 | Ter 10:30").`;
+}
+
+// Constrói o aviso INFORMATIVO (não é erro) pedido para candidatos
+// legitimamente sem disponibilidade nesta fase: célula em branco,
+// "Nenhum dos horários"/"N/A"/etc., OU blocos de 30 min reconhecidos mas
+// que — mesmo fundidos — não chegam à duração exigida por esta fase (ex.:
+// só marcou 1 bloco de 30 min numa fase que precisa de 60/90). Nestes
+// casos o candidato É importado normalmente, com 0 slots — este aviso
+// serve só para o RH perceber, de relance, que não foi um erro de leitura.
+function buildNoAvailabilityInfo(names) {
+  if (!names.length) return null;
+  const shown = names.slice(0, MAX_WARNING_ROWS);
+  const extra = names.length > MAX_WARNING_ROWS ? ` (+ ${names.length - MAX_WARNING_ROWS} candidato(s) adicional(is))` : "";
+  const plural = names.length > 1;
+  return `Candidato${plural ? "s" : ""} ${joinWithE(shown)} importado${plural ? "s" : ""} (sem disponibilidade assinalada)${extra}.`;
 }
 
 // Valores de erro típicos de fórmulas do Excel/Sheets (ex.: candidato ainda
@@ -1091,38 +1121,95 @@ function parseAvailabilityRanges(raw, dayHint) {
   return [{ day, startMin: inicio, endMin: fim !== null ? fim : inicio + SLOT_DURATION_MIN }];
 }
 
-// Converte intervalo(s) {day, startMin, endMin} nos slots oficiais da
-// grelha (SLOTS) que ficam TOTALMENTE contidos nesse intervalo — ou seja,
-// alguém que respondeu "disponível das 09:00 às 12:00" fica corretamente
-// marcado como disponível para os slots oficiais "Seg 09:00" E "Seg 10:30"
-// (30 min cada, ambos dentro de 09:00-12:00), mesmo nunca tendo escrito
-// literalmente "09:00" nem "10:30" como pontos exatos. Isto é o que faltava
-// para o cruzamento de 4 vias encontrar sobreposições reais: antes exigia-se
-// que o horário declarado batesse cerácter a carácter com um dos 5 slots.
-function expandRangesToSlots(ranges) {
+// Junta intervalos {day, startMin, endMin} CONTÍGUOS ou sobrepostos do
+// mesmo dia num único intervalo maior — é isto que permite reconhecer que
+// vários blocos de 30 min SEPARADOS, selecionados pelo candidato no Forms
+// (ex. os tokens "11h30-12h" e "12h-12h30", cada um o seu próprio item na
+// célula), cobrem juntos 1 hora contínua, mesmo vindo de tokens
+// independentes que — sozinhos — só dariam para a duração da Fase 2 (Soft
+// Skills, 30 min). Sem esta fusão, um candidato que selecionasse
+// exatamente os blocos certos para Hard Skills/Dinâmicas nunca seria
+// reconhecido como disponível para essas fases (era este o motivo exato
+// das linhas 41/42 falharem).
+function mergeRanges(ranges) {
+  const byDay = {};
+  ranges.forEach(({ day, startMin, endMin }) => {
+    (byDay[day] || (byDay[day] = [])).push({ startMin, endMin });
+  });
+  const merged = [];
+  Object.keys(byDay).forEach((day) => {
+    const list = byDay[day].slice().sort((a, b) => a.startMin - b.startMin);
+    let current = null;
+    list.forEach((r) => {
+      if (!current) { current = { ...r }; return; }
+      if (r.startMin <= current.endMin) {
+        // adjacente ou sobreposto — funde no intervalo corrente
+        current.endMin = Math.max(current.endMin, r.endMin);
+      } else {
+        merged.push({ day, ...current });
+        current = { ...r };
+      }
+    });
+    if (current) merged.push({ day, ...current });
+  });
+  return merged;
+}
+
+// Converte intervalo(s) {day, startMin, endMin} (já fundidos — ver
+// mergeRanges) nos slots oficiais da grelha (SLOTS) que ficam TOTALMENTE
+// cobertos, exigindo `durationMin` minutos a partir do início oficial do
+// slot — ou seja, alguém que respondeu "disponível das 09:00 às 12:00"
+// fica corretamente marcado como disponível para os slots oficiais
+// "Seg 09:00" E "Seg 10:30" quando durationMin=30 (ambos cabem em
+// 09:00-12:00), mesmo nunca tendo escrito literalmente "09:00" nem "10:30"
+// como pontos exatos. `durationMin` por omissão é SLOT_DURATION_MIN (30),
+// mas o upload de Forms por fase passa a duração exigida por essa fase
+// (ver PHASE_DURATION_MIN) — um candidato só conta como disponível para a
+// Fase 4 (Hard Skills, 60 min) se tiver 60 min seguidos a partir do início
+// do slot oficial, não apenas 30.
+function expandRangesToSlots(ranges, durationMin = SLOT_DURATION_MIN) {
   const result = new Set();
   ranges.forEach(({ day, startMin, endMin }) => {
     SLOTS.forEach((slot) => {
       const info = SLOT_INFO[slot];
-      if (info.day === day && startMin <= info.startMin && info.endMin <= endMin) result.add(slot);
+      const requiredEnd = info.startMin + durationMin;
+      if (info.day === day && startMin <= info.startMin && requiredEnd <= endMin) result.add(slot);
     });
   });
   return Array.from(result);
 }
 
-// Divide o conteúdo de UMA célula em itens (| ; , ou quebra de linha) e
-// converte cada item — ponto único OU intervalo — em slots oficiais,
-// unificando tudo num só array. Usado tanto para colunas-dia isoladas como
-// para o campo de texto livre "Disponibilidade". `dayHint`, quando passado
-// (caso das colunas-dia), fixa o dia para todos os itens da célula; caso
-// contrário cada item tem de indicar o seu próprio dia (campo de texto livre
-// com vários dias na mesma célula).
-function parseAvailabilityCell(cellText, dayHint) {
-  const slots = new Set();
+// Divide o conteúdo de UMA célula em itens (| ; , ou quebra de linha),
+// interpreta cada item como um intervalo {day, startMin, endMin} — SEM
+// ainda os converter em slots — funde os intervalos contíguos/sobrepostos
+// do mesmo dia (mergeRanges) e só DEPOIS os converte nos slots oficiais que
+// ficam totalmente cobertos, usando `durationMin` (ver expandRangesToSlots).
+// Usado tanto para colunas-dia isoladas como para o campo de texto livre
+// "Disponibilidade". `dayHint`, quando passado (caso das colunas-dia), fixa
+// o dia para todos os itens da célula; caso contrário cada item tem de
+// indicar o seu próprio dia (campo de texto livre com vários dias na mesma
+// célula).
+//
+// Devolve { slots, parsedAnything }: `parsedAnything` diz se PELO MENOS UM
+// item da célula foi reconhecido como um dia+hora válido — mesmo que,
+// depois de fundido, não chegue à duração exigida pela fase. Isto permite
+// ao chamador (extractAvailabilityFromRow) distinguir "o candidato marcou
+// blocos reais, só não chegam para esta fase mais longa" (não é erro) de
+// "não percebi nada deste texto" (erro de formato genuíno) — ver requisito
+// 3: "Nenhum dos horários" e afins nunca chegam aqui (já são filtrados
+// antes por isNoAvailabilityResponse), por isso um resultado vazio aqui
+// nunca é, por si só, motivo para tratar a linha como inválida.
+function parseAvailabilityCell(cellText, dayHint, durationMin = SLOT_DURATION_MIN) {
+  const ranges = [];
+  let parsedAnything = false;
   String(cellText || "").split(/[|;,\n]/).forEach((token) => {
-    expandRangesToSlots(parseAvailabilityRanges(token, dayHint)).forEach((s) => slots.add(s));
+    const found = parseAvailabilityRanges(token, dayHint);
+    if (found.length) {
+      parsedAnything = true;
+      ranges.push(...found);
+    }
   });
-  return Array.from(slots);
+  return { slots: expandRangesToSlots(mergeRanges(ranges), durationMin), parsedAnything };
 }
 
 // Extrai disponibilidade de uma linha, aceitando 3 formatos comuns no Excel
@@ -1161,7 +1248,7 @@ function parseAvailabilityCell(cellText, dayHint) {
 //     não bateu com nenhum formato suportado -> aí sim é um problema real
 //     de formato, e `hasUnrecognizedContent` fica true, para o chamador
 //     poder avisar exatamente quais as linhas afetadas.
-function extractAvailabilityFromRow(header, rowObj) {
+function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_MIN) {
   // Pré-passo: regista no mapa DAY_NUMBER_TO_WEEKDAY qualquer par
   // "dia da semana + data" encontrado nos cabeçalhos ANTES de extrair
   // disponibilidade — assim, mesmo que esta chamada seja sobre a aba do
@@ -1186,14 +1273,21 @@ function extractAvailabilityFromRow(header, rowObj) {
       return;
     }
     // (b) cabeçalho contém o nome do dia (com ou sem sufixo de secção); a
-    // célula tem o(s) horário(s)/intervalo(s) em texto livre
+    // célula tem o(s) horário(s)/intervalo(s) em texto livre — incluindo a
+    // grelha de blocos de 30 min do Forms, já fundida e comparada com a
+    // duração exigida por `durationMin` (ver parseAvailabilityCell).
     const dayOnly = normalizeDayOnlyHeader(h);
     if (dayOnly) {
       const cell = cleanCellText(rowObj[h]);
-      if (isNoAvailabilityResponse(cell)) return; // em branco ou "N/A"/"Nenhum" — aceite, sem disponibilidade nesse dia
-      const found = parseAvailabilityCell(cell, dayOnly);
+      if (isNoAvailabilityResponse(cell)) return; // em branco, "N/A"/"Nenhum"/"Nenhum dos horários" — aceite, sem disponibilidade nesse dia
+      const { slots: found, parsedAnything } = parseAvailabilityCell(cell, dayOnly, durationMin);
       found.forEach((s) => slots.add(s));
-      if (!found.length) hasUnrecognizedContent = true; // havia texto, não era "sem disponibilidade", e não deu para interpretar
+      // Só é erro de formato se NADA na célula foi entendido como dia+hora.
+      // Se foi entendido mas os blocos (fundidos) não chegam à duração
+      // exigida por esta fase (ex.: só marcou 1 bloco de 30 min mas a fase
+      // precisa de 60/90), isso é uma disponibilidade legítima de ZERO
+      // slots PARA ESTA FASE — não um erro de parsing.
+      if (!parsedAnything) hasUnrecognizedContent = true;
       return;
     }
     // (d) FALLBACK — o cabeçalho não indica nem dia nem hora (pergunta de
@@ -1211,14 +1305,14 @@ function extractAvailabilityFromRow(header, rowObj) {
     // explícito, tratado a seguir, é que conta para esse aviso.
     const cell = cleanCellText(rowObj[h]);
     if (cell && !isNoAvailabilityResponse(cell)) {
-      parseAvailabilityCell(cell).forEach((s) => slots.add(s));
+      parseAvailabilityCell(cell, undefined, durationMin).slots.forEach((s) => slots.add(s));
     }
   });
   const free = cleanCellText(get(rowObj, "disponibilidade", "horarios", "horários", "slots"));
   if (!isNoAvailabilityResponse(free)) {
-    const found = parseAvailabilityCell(free);
+    const { slots: found, parsedAnything } = parseAvailabilityCell(free, undefined, durationMin);
     found.forEach((s) => slots.add(s));
-    if (!found.length) hasUnrecognizedContent = true;
+    if (!parsedAnything) hasUnrecognizedContent = true;
   }
   return {
     slots: Array.from(slots).sort((a, b) => SLOTS.indexOf(a) - SLOTS.indexOf(b)),
@@ -2037,6 +2131,7 @@ function UploadCard({ icon: Icon, title, description, hint, status, onFile, acce
 
       {error && <p className="text-[11px] mb-2" style={{ color: "#c0227a" }}>{error}</p>}
       {!error && status.warning && <p className="text-[11px] mb-2" style={{ color: "#c0227a" }}>{status.warning}</p>}
+      {!error && status.info && <p className="text-[11px] mb-2" style={{ color: hexToRgba(COLORS.navy, 0.6) }}>{status.info}</p>}
 
       <label className="yme-btn-outline-light flex items-center justify-center gap-1.5 text-xs font-medium rounded-lg px-3 py-2 cursor-pointer">
         <UploadCloud size={13} /> {status.loaded ? "Substituir ficheiro" : "Carregar ficheiro"}
@@ -2190,6 +2285,12 @@ function ImportHubPage({
     // isNoAvailabilityResponse/hasUnrecognizedContent). `rowNumber` conta a
     // partir de 2 porque a linha 1 da folha é o cabeçalho.
     const unrecognizedRows = [];
+    // Requisito 3: candidatos aceites normalmente mas com 0 slots nesta
+    // fase — célula em branco, "Nenhum dos horários" e afins, OU blocos de
+    // 30 min reconhecidos que não chegam à duração exigida pela fase. Não é
+    // erro, só informação para o RH ("Candidato X importado (sem
+    // disponibilidade assinalada)").
+    const noAvailabilityNames = [];
     setCandidates((prev) => {
       const next = [...prev];
       rows.forEach((row, i) => {
@@ -2212,9 +2313,13 @@ function ImportHubPage({
         // (ver normalizeSlotString/normalizeDayOnlyHeader) e distingue
         // "sem disponibilidade" de "formato não reconhecido" (ver
         // hasUnrecognizedContent, requisito 1 e 3 do pedido).
-        const { slots: availability, hasUnrecognizedContent } = extractAvailabilityFromRow(Object.keys(row), row);
+        const { slots: availability, hasUnrecognizedContent } = extractAvailabilityFromRow(
+          Object.keys(row), row, PHASE_DURATION_MIN[phaseKey] ?? SLOT_DURATION_MIN
+        );
         if (!availability.length && hasUnrecognizedContent) {
           unrecognizedRows.push({ rowNumber, name });
+        } else if (!availability.length) {
+          noAvailabilityNames.push(name);
         }
         const idx = matchCandidateIndex(next, name, email);
         count++;
@@ -2267,9 +2372,11 @@ function ImportHubPage({
         // exatamente quais linhas/candidatos ficaram sem nenhum horário
         // reconhecido — e só entram aqui os casos de formato realmente não
         // suportado, nunca os candidatos que legitimamente não submeteram
-        // disponibilidade (em branco ou "Não tenho disponibilidade"/"N/A"/
-        // "Nenhum", que são aceites em silêncio com []).
+        // disponibilidade (em branco, "Não tenho disponibilidade"/"N/A"/
+        // "Nenhum dos horários", ou blocos de 30 min que não chegam à
+        // duração desta fase — esses geram o aviso informativo `info`).
         warning: buildUnrecognizedRowsWarning(unrecognizedRows),
+        info: buildNoAvailabilityInfo(noAvailabilityNames),
       },
     }));
   };
