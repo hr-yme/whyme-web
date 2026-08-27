@@ -714,11 +714,15 @@ function translateSheetApiError(code, sheetName) {
 // Aceita: "10h30 - 11h00", "10:30-11:00", "10:30", "10h30", "10.30",
 // "10:30 às 11:00", "10:30–11:00" (travessão), "9h-9h30", "9h- 9h30",
 // "9h00 - 9h30", "11h30 -12h00", "11h30 -12h", "17h-17h30",
-// "2:00 PM", "10:30 AM", "2 PM", "14:00", "14h30", "14.30", etc.
+// "2:00 PM", "10:30 AM", "2 PM", "14:00", "14h30", "14.30", etc., e ainda,
+// em modo solto (allowBareHour:true — ver TIME_TOKEN_RE_LOOSE), horas sem
+// minutos e sem separador nenhum: "9h", "17h", "9", "17", "9-17", "9 às 17",
+// "09-10:30".
 // Exemplo pedido: parseTimeToMinutes("10h30 - 11h00") -> { inicio: 630, fim: 660 }
 //                 parseTimeToMinutes("10:30 - 11:00") -> { inicio: 630, fim: 660 }
 //                 parseTimeToMinutes("2:00 PM")        -> { inicio: 840, fim: null }  (== 14:00)
 //                 parseTimeToMinutes("10:30 AM")       -> { inicio: 630, fim: null }  (== 10:30)
+//                 parseTimeToMinutes("9-17", { allowBareHour: true }) -> { inicio: 540, fim: 1020 }
 
 // Regex universal de horas — a ÚNICA usada em todo o ficheiro para
 // reconhecer texto de horas, partilhada por parseTimeToMinutes() (para
@@ -731,10 +735,35 @@ function translateSheetApiError(code, sheetName) {
 //     (minutos aqui são OPCIONAIS: "9h"/"12h" valem "9h00"/"12h00")
 const TIME_TOKEN_RE = /(?<h12>\d{1,2})(?:\s*[:.h]\s*(?<m12>\d{2}))?\s*(?<ampm>[ap]\.?\s?m\.?)\b|(?<h24>\d{1,2})\s*[:h.]\s*(?<m24>\d{2})?/gi;
 
-function parseTimeToMinutes(str) {
+// Variante "solta" de TIME_TOKEN_RE: acrescenta um 3º ramo que aceita um
+// número de 1-2 dígitos SOZINHO — sem `:`, `h` nem `.` a seguir — como hora
+// inteira (minutos = 00). É o que faltava para "9-17", "9 às 17" ou "09-10:30"
+// (o "09" aí não tem separador nenhum a seguir): a versão estrita exigia
+// sempre um separador só para reconhecer a HORA, e por isso rejeitava estes
+// casos por completo (`parseTimeToMinutes` devolvia inicio:null, daí o
+// "nenhum horário é compatível" nestes formatos).
+//
+// Só é usada para interpretar VALORES de disponibilidade já isolados (texto
+// livre de uma célula, ou o token depois de retirado o dia) — NUNCA para
+// reconhecer cabeçalhos de coluna. Cabeçalhos do Forms costumam trazer a
+// DATA por extenso ("Quarta-feira, dia 10 de junho") e vários desses
+// números de dia (9, 10, 14, 15, 17) coincidem com as horas oficiais da
+// grelha (09:00, 10:30, 14:00, 15:30, 17:00) — se o ramo solto fosse usado
+// também aí, "dia 9 de junho" seria lido como a hora "09:00", o cabeçalho
+// passaria a ser tratado como slot exato e a coluna inteira desse dia
+// deixaria de ser lida como texto livre (perda de disponibilidade real, um
+// bug pior que o atual). Por isso `normalizeSlotString`/`normalizeTimeToken`
+// continuam, por omissão, a usar a versão ESTRITA (TIME_TOKEN_RE); só
+// `parseAvailabilityRanges` (valores, não cabeçalhos) ativa o modo solto.
+// Exclui ainda números colados a "/" em qualquer um dos lados, para não
+// apanhar datas dd/mm escritas por engano dentro do próprio valor.
+const TIME_TOKEN_RE_LOOSE = /(?<h12>\d{1,2})(?:\s*[:.h]\s*(?<m12>\d{2}))?\s*(?<ampm>[ap]\.?\s?m\.?)\b|(?<h24>\d{1,2})\s*[:h.]\s*(?<m24>\d{2})?|(?<![\d/])(?<h24b>\d{1,2})(?!\d)(?!\s*\/)/gi;
+
+function parseTimeToMinutes(str, { allowBareHour = false } = {}) {
   const s = String(str || "");
+  const re = allowBareHour ? TIME_TOKEN_RE_LOOSE : TIME_TOKEN_RE;
   const matches = [];
-  for (const m of s.matchAll(TIME_TOKEN_RE)) {
+  for (const m of s.matchAll(re)) {
     if (m.groups.ampm !== undefined) {
       // 12h -> 24h: 12 AM = 00h; 12 PM = 12h; 1-11 AM ficam iguais;
       // 1-11 PM somam 12h. "2:00 PM" == "14:00", "10:30 AM" == "10:30".
@@ -743,6 +772,9 @@ function parseTimeToMinutes(str) {
       matches.push(hour * 60 + Number(m.groups.m12 || 0));
     } else if (m.groups.h24 !== undefined) {
       matches.push(Number(m.groups.h24) * 60 + Number(m.groups.m24 || 0));
+    } else if (m.groups.h24b !== undefined) {
+      // Hora solta sem separador nenhum ("9", "17") — minutos assumidos 00.
+      matches.push(Number(m.groups.h24b) * 60);
     }
   }
   if (!matches.length) return { inicio: null, fim: null };
@@ -770,8 +802,13 @@ function normalizeDayToken(raw) {
 // TIMES — agora um wrapper fino sobre parseTimeToMinutes(), para que exista
 // UMA SÓ função a interpretar dígitos de hora em todo o ficheiro. Devolve
 // null se não encontrar nenhuma hora reconhecível.
-function normalizeTimeToken(raw) {
-  const { inicio } = parseTimeToMinutes(raw);
+// `allowBareHour` por omissão fica a false: esta função é chamada por
+// normalizeSlotString() sobre CABEÇALHOS de coluna, onde números soltos
+// costumam ser datas ("dia 10 de junho") e não horas — ver nota grande em
+// TIME_TOKEN_RE_LOOSE acima. Passa allowBareHour:true apenas quando `raw`
+// for a seguro de ser só texto de horário (nunca um cabeçalho com data).
+function normalizeTimeToken(raw, { allowBareHour = false } = {}) {
+  const { inicio } = parseTimeToMinutes(raw, { allowBareHour });
   if (inicio === null) return null;
   const hh = String(Math.floor(inicio / 60)).padStart(2, "0");
   const mm = String(inicio % 60).padStart(2, "0");
@@ -903,7 +940,12 @@ function parseAvailabilityRanges(raw, dayHint) {
   const dayText = firstDigit > 0 ? s.slice(0, firstDigit) : s;
   const day = dayHint || normalizeDayToken(dayText);
   if (!day) return [];
-  const { inicio, fim } = parseTimeToMinutes(s);
+  // allowBareHour:true — aqui `s` é sempre um VALOR de disponibilidade
+  // (célula, ou item já separado por | ; , dentro dela), nunca um
+  // cabeçalho de coluna, por isso é seguro aceitar horas soltas sem
+  // separador ("9", "17", "9-17", "09-10:30"), que é o que faltava para
+  // vários formatos do Excel Mestre e dos Forms (ver TIME_TOKEN_RE_LOOSE).
+  const { inicio, fim } = parseTimeToMinutes(s, { allowBareHour: true });
   if (inicio === null) return [];
   return [{ day, startMin: inicio, endMin: fim !== null ? fim : inicio + SLOT_DURATION_MIN }];
 }
