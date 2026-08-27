@@ -744,7 +744,22 @@ function parseApiValues(values, headerHints = [], fixedHeaderIdx = null) {
       if (found >= 0) headerIdx = found;
     }
   }
-  const header = (grid[headerIdx] || []).map((h) => String(h ?? ""));
+  let header = (grid[headerIdx] || []).map((h) => String(h ?? ""));
+  // CABEÇALHO EM DUAS LINHAS (dia + hora) — ver mergeTwoRowHeader. Se a
+  // linha imediatamente ACIMA da linha de cabeçalho encontrada parece uma
+  // linha de rótulos de dia (ex. "Dia 10 - Quarta"), e a própria linha de
+  // cabeçalho ainda não tem nenhum dia reconhecível por si só (ou seja, só
+  // tem horas soltas tipo "9-9:30"), combina as duas antes de continuar.
+  // Isto é o que faltava para o Excel Mestre da YME: sem isto, cada coluna
+  // ficava só com a hora, sem dia nenhum, e nunca era reconhecida como
+  // disponibilidade — daí Diretores/RH aparecerem sempre sem horários.
+  if (headerIdx > 0) {
+    const headerAlreadyHasDay = header.some((h) => h && normalizeDayOnlyHeader(h) !== null);
+    if (!headerAlreadyHasDay) {
+      const aboveRow = grid[headerIdx - 1];
+      if (looksLikeDayLabelRow(aboveRow)) header = mergeTwoRowHeader(aboveRow, header);
+    }
+  }
   const rows = grid
     .slice(headerIdx + 1)
     .filter((r) => r.some((c) => String(c ?? "").trim() !== ""))
@@ -1012,6 +1027,15 @@ const DAY_WORD_PATTERNS = [
   { re: /quarta[-\s]?feira/i, day: "Qua" },
   { re: /quinta[-\s]?feira/i, day: "Qui" },
   { re: /sexta[-\s]?feira/i, day: "Sex" },
+  // Nomes completos SEM o sufixo "-feira" — cobre o Excel Mestre, onde a
+  // linha de cabeçalho de dia costuma vir como "Dia 10 - Quarta", "Dia 11 -
+  // Quinta", etc. (nunca "Quarta-feira"). \b...\b evita apanhar estas
+  // palavras dentro de outras mais compridas.
+  { re: /\bsegunda\b/i, day: "Seg" },
+  { re: /\bter[cç]a\b/i, day: "Ter" },
+  { re: /\bquarta\b/i, day: "Qua" },
+  { re: /\bquinta\b/i, day: "Qui" },
+  { re: /\bsexta\b/i, day: "Sex" },
   { re: /\bmonday\b/i, day: "Seg" },
   { re: /\btuesday\b/i, day: "Ter" },
   { re: /\bwednesday\b/i, day: "Qua" },
@@ -1049,6 +1073,65 @@ function normalizeDayOnlyHeader(raw) {
 }
 
 // ----------------------------------------------------------------------
+// CABEÇALHO EM DUAS LINHAS (Excel Mestre: dia numa linha, hora na
+// seguinte) — ex. linha "Dia 10 - Quarta" / "Dia 11 - Quinta" por cima da
+// linha "9-9:30" / "9:30-10" / "10-10:30" / ... CORREÇÃO: ler só a linha
+// das horas (a única que `parseApiValues` via considerar até agora) dava
+// cabeçalhos SEM nenhum dia ("9-9:30"), que normalizeDayOnlyHeader nunca
+// reconhece — daí Diretores/RH aparecerem sempre "sem horários no Excel
+// Mestre" apesar de as células estarem preenchidas. As 3 funções abaixo
+// combinam as duas linhas numa só, ANTES dessa combinação chegar a
+// extractAvailabilityFromRow.
+// ----------------------------------------------------------------------
+
+// Deteta se uma linha da grelha se parece com uma linha de RÓTULOS DE DIA
+// — basta 1 célula reconhecível por normalizeDayOnlyHeader (com "-feira",
+// nome completo PT/EN, ou "Dia N"/"Dia N - <dia>").
+function looksLikeDayLabelRow(row) {
+  return (row || []).some((v) => {
+    const s = String(v ?? "").trim();
+    return s && normalizeDayOnlyHeader(s) !== null;
+  });
+}
+
+// Propaga (forward-fill) o último valor não vazio de uma linha para as
+// células vazias seguintes — necessário porque, no Excel/Sheets, o rótulo
+// do dia normalmente só aparece na PRIMEIRA das várias colunas de meia
+// hora desse dia (célula fundida/"merged cell" na folha original); as
+// colunas seguintes do mesmo dia chegam vazias da API/leitura.
+function forwardFillRow(row) {
+  const filled = [];
+  let last = "";
+  (row || []).forEach((v) => {
+    const s = String(v ?? "").trim();
+    if (s) last = s;
+    filled.push(last);
+  });
+  return filled;
+}
+
+// Combina uma linha de DIAS (ex. "Dia 10 - Quarta", já com forward-fill)
+// com uma linha de HORAS (ex. "9-9:30") num único array de cabeçalhos —
+// um por coluna. IMPORTANTE: o dia é primeiro RESOLVIDO para a sua forma
+// curta canónica ("Qua") via normalizeDayOnlyHeader, em vez de manter o
+// texto original ("Dia 10 - Quarta") colado à hora — isto evita que o "10"
+// de "Dia 10" seja mais tarde confundido com uma hora solta quando o
+// cabeçalho combinado for reprocessado (ex. "Dia 10 - Quarta 9-9:30"
+// poderia, em teoria, ler "10" como hora; "Qua 9-9:30" não tem esse
+// problema, porque já não sobra nenhum dígito do dia do mês).
+function mergeTwoRowHeader(dayRow, hourRow) {
+  const days = forwardFillRow(dayRow);
+  return hourRow.map((h, i) => {
+    const hourText = String(h ?? "").trim();
+    const dayLabel = days[i] || "";
+    if (!dayLabel) return hourText;
+    const resolvedDay = normalizeDayOnlyHeader(dayLabel);
+    if (!resolvedDay) return hourText ? `${dayLabel} ${hourText}`.trim() : dayLabel;
+    return hourText ? `${resolvedDay} ${hourText}` : resolvedDay;
+  });
+}
+
+
 // MAPEAMENTO DE DIAS POR NÚMERO DO MÊS
 // ----------------------------------------------------------------------
 // O Forms dos candidatos identifica cada dia por NOME + DATA no mesmo
@@ -1261,6 +1344,11 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
 
   const slots = new Set();
   let hasUnrecognizedContent = false;
+  // Intervalos {day,startMin,endMin} vindos de colunas "dia+intervalo no
+  // cabeçalho, célula é só Disponível/Indisponível" (ver caso (a2) abaixo)
+  // — acumulados à parte para serem fundidos numa só passagem no fim,
+  // exatamente como os blocos de 30 min do Forms.
+  const dayRangeRanges = [];
   header.forEach((h) => {
     // (a) cabeçalho é um slot exato ("Seg 09:00") marcado x/sim/true/1/☑/
     //     disponível/check/a própria hora
@@ -1272,11 +1360,28 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
       // reconhecer, por isso nunca marca hasUnrecognizedContent.
       return;
     }
+    // (a2) cabeçalho combina DIA + INTERVALO de horas (ex. "Qua 9-9:30",
+    // resultado de mergeTwoRowHeader combinando "Dia 10 - Quarta" + "9-
+    // 9:30"), e a célula é um marcador booleano "Disponível"/"Indisponível"
+    // — não texto livre com a hora (é essa a diferença para o caso (b)
+    // abaixo). Só entra aqui se o cabeçalho tiver um dia E um INTERVALO
+    // genuíno (2 horas, início < fim) — um único número solto (ex. o "10"
+    // de "dia 10 de junho") nunca ativa este caso, continua a cair no (b).
+    const day = normalizeDayOnlyHeader(h);
+    const range = day ? parseTimeToMinutes(h, { allowBareHour: true }) : null;
+    if (day && range && range.inicio !== null && range.fim !== null && range.fim > range.inicio) {
+      if (isAvailabilityPositiveMark(rowObj[h])) {
+        dayRangeRanges.push({ day, startMin: range.inicio, endMin: range.fim });
+      }
+      // "Indisponível"/vazio/etc. aqui é só "não disponível NESTE bloco de
+      // meia-hora" — normal, nunca é erro de formato.
+      return;
+    }
     // (b) cabeçalho contém o nome do dia (com ou sem sufixo de secção); a
     // célula tem o(s) horário(s)/intervalo(s) em texto livre — incluindo a
     // grelha de blocos de 30 min do Forms, já fundida e comparada com a
     // duração exigida por `durationMin` (ver parseAvailabilityCell).
-    const dayOnly = normalizeDayOnlyHeader(h);
+    const dayOnly = day;
     if (dayOnly) {
       const cell = cleanCellText(rowObj[h]);
       if (isNoAvailabilityResponse(cell)) return; // em branco, "N/A"/"Nenhum"/"Nenhum dos horários" — aceite, sem disponibilidade nesse dia
@@ -1308,6 +1413,12 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
       parseAvailabilityCell(cell, undefined, durationMin).slots.forEach((s) => slots.add(s));
     }
   });
+  // Funde e expande os intervalos "dia+intervalo no cabeçalho" recolhidos
+  // no caso (a2) — mesma lógica de agregação usada para os blocos de 30
+  // min do Forms (mergeRanges + expandRangesToSlots), mas com a duração
+  // PADRÃO (SLOT_DURATION_MIN): esta é disponibilidade de Diretor/RH, não
+  // ligada a nenhuma fase específica, por isso não usa `durationMin`.
+  expandRangesToSlots(mergeRanges(dayRangeRanges), SLOT_DURATION_MIN).forEach((s) => slots.add(s));
   const free = cleanCellText(get(rowObj, "disponibilidade", "horarios", "horários", "slots"));
   if (!isNoAvailabilityResponse(free)) {
     const { slots: found, parsedAnything } = parseAvailabilityCell(free, undefined, durationMin);
@@ -2342,8 +2453,17 @@ function ImportHubPage({
     setMembers((prev) => {
       const next = [...prev];
       wb.SheetNames.forEach((sheetName) => {
-        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
-        rows.forEach((row) => {
+        // Lê a folha em modo GRELHA BRUTA (array de arrays, não já um
+        // objeto por linha) e passa pelo mesmo parseApiValues() usado na
+        // sincronização com o Google Sheets — CORREÇÃO: é isto que permite
+        // detetar e combinar um cabeçalho em DUAS linhas (dia numa linha,
+        // ex. "Dia 10 - Quarta", hora na seguinte, ex. "9-9:30"), que o
+        // antigo `XLSX.utils.sheet_to_json(ws, {defval:""})` (modo objeto,
+        // só considera 1 linha de cabeçalho) nunca conseguia reconhecer —
+        // cada coluna ficava só com a hora solta, sem dia nenhum associado.
+        const rawGrid = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: "" });
+        const { rows } = parseApiValues(rawGrid, ["nome", "name"]);
+        rows.forEach(({ obj: row }) => {
           const name = cleanCellText(get(row, "nome", "name"));
           if (!name) return;
           let role = cleanCellText(get(row, "role", "cargo"));
