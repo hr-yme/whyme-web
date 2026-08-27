@@ -787,11 +787,17 @@ function parseTimeToMinutes(str, { allowBareHour = false } = {}) {
 
 // Deteta um "token" de dia da semana para uma das 5 chaves canónicas de
 // DAYS ("Seg".."Sex"), aceitando abreviações, nomes completos, com/sem
-// acentos, com/sem "-feira", maiúsculas/minúsculas, pontuação, etc.
-// Funciona por PREFIXO de 3 letras depois de normalizado (normKey já remove
-// acentos/maiúsculas), o que cobre "Seg", "seg.", "Segunda", "segunda-feira",
-// "SEGUNDA FEIRA", etc. — todos colapsam no mesmo prefixo "seg".
-const DAY_PREFIXES = { seg: "Seg", ter: "Ter", qua: "Qua", qui: "Qui", sex: "Sex" };
+// acentos, com/sem "-feira", maiúsculas/minúsculas, pontuação, etc. —
+// e também os nomes em INGLÊS ("Mon"/"Monday" .. "Fri"/"Friday"), porque
+// alguns exports do Forms/Sheets vêm com o idioma da conta Google em
+// inglês. Funciona por PREFIXO de 3 letras depois de normalizado (normKey
+// já remove acentos/maiúsculas), o que cobre "Seg", "seg.", "Segunda",
+// "segunda-feira", "SEGUNDA FEIRA", "Mon", "Monday", etc. — todos colapsam
+// no mesmo prefixo de 3 letras ("seg"/"mon").
+const DAY_PREFIXES = {
+  seg: "Seg", ter: "Ter", qua: "Qua", qui: "Qui", sex: "Sex",
+  mon: "Seg", tue: "Ter", wed: "Qua", thu: "Qui", fri: "Sex",
+};
 function normalizeDayToken(raw) {
   const n = normKey(raw).replace(/[^a-z]/g, "");
   if (!n) return null;
@@ -815,16 +821,52 @@ function normalizeTimeToken(raw, { allowBareHour = false } = {}) {
   return `${hh}:${mm}`;
 }
 
+// Mapa hora oficial (string de TIMES) -> minutos desde a meia-noite,
+// construído uma única vez, para poder calcular qual a hora oficial MAIS
+// PRÓXIMA de uma hora extraída de texto livre (ver nearestOfficialTime).
+const OFFICIAL_TIME_MINUTES = TIMES.map((t) => {
+  const [hh, mm] = t.split(":").map(Number);
+  return hh * 60 + mm;
+});
+// Tolerância (minutos) para aceitar um cabeçalho de coluna cuja hora não
+// bate CERTINHA com nenhum dos 5 horários oficiais, mas anda perto o
+// suficiente para ser inequivocamente o mesmo slot (pequenas variações de
+// escrita, arredondamentos do Forms, etc.).
+// CORREÇÃO: o bug reportado ("X de Y linhas sem nenhum horário
+// reconhecido") vinha de aqui se exigir IGUALDADE EXATA de string com um
+// dos 5 horários oficiais — qualquer desvio, por mínimo que fosse, fazia a
+// coluna inteira ser ignorada. Agora usa-se a hora oficial mais próxima,
+// dentro desta margem.
+const SLOT_MATCH_TOLERANCE_MIN = 45;
+
+// Devolve o horário oficial (uma das strings de TIMES) mais próximo de
+// `minutes` (minutos desde a meia-noite), ou null se mesmo o mais próximo
+// ficar a mais de SLOT_MATCH_TOLERANCE_MIN minutos de distância — nesse
+// caso não é seguro assumir que se trata do mesmo slot oficial.
+function nearestOfficialTime(minutes) {
+  if (minutes === null || minutes === undefined) return null;
+  let best = null;
+  let bestDiff = Infinity;
+  TIMES.forEach((t, i) => {
+    const diff = Math.abs(OFFICIAL_TIME_MINUTES[i] - minutes);
+    if (diff < bestDiff) { bestDiff = diff; best = t; }
+  });
+  return bestDiff <= SLOT_MATCH_TOLERANCE_MIN ? best : null;
+}
+
 // Normaliza uma string livre de "Dia + Hora" (célula de cabeçalho de
 // grelha, ou um item de uma lista separada por | ; ,) para um dos slots
 // canónicos de SLOTS ("Seg 09:00", etc.), ou null se não for possível
-// reconhecer com confiança um dia E uma das 5 horas oficiais da grelha
-// (TIMES). Usada para o caso "ponto exato" (cabeçalho = o próprio slot).
+// reconhecer com confiança um dia E uma hora suficientemente próxima de um
+// dos 5 horários oficiais da grelha (TIMES, com tolerância — ver
+// nearestOfficialTime). Usada para o caso "ponto exato" (cabeçalho = o
+// próprio slot).
 function normalizeSlotString(raw) {
   const s = String(raw || "").trim();
   if (!s) return null;
-  const time = normalizeTimeToken(s);
-  if (!time || !TIMES.includes(time)) return null;
+  const { inicio } = parseTimeToMinutes(s);
+  const time = nearestOfficialTime(inicio);
+  if (!time) return null;
   const timeIdx = s.search(TIME_TOKEN_RE);
   const dayPart = timeIdx > 0 ? s.slice(0, timeIdx) : s;
   const day = normalizeDayToken(dayPart);
@@ -843,29 +885,40 @@ function normalizeSlotString(raw) {
 // EXATAMENTE "Quarta"/"Quarta-feira" (nada mais), pelo que NENHUMA destas
 // colunas (nem a primeira, nem as seguintes) era reconhecida como coluna de
 // disponibilidade — todas eram ignoradas, daí os 0 agendamentos. Agora
-// procura-se o nome do dia (com "-feira") em QUALQUER parte do texto do
-// cabeçalho, o que reconhece a coluna seja qual for o sufixo/data anexado.
-const DAY_FEIRA_PATTERNS = [
+// procura-se o nome do dia (com "-feira", ou o nome completo em inglês) em
+// QUALQUER parte do texto do cabeçalho, o que reconhece a coluna seja qual
+// for o sufixo/data anexado E o idioma da conta Google usada no Forms.
+const DAY_WORD_PATTERNS = [
   { re: /segunda[-\s]?feira/i, day: "Seg" },
   { re: /ter[cç]a[-\s]?feira/i, day: "Ter" },
   { re: /quarta[-\s]?feira/i, day: "Qua" },
   { re: /quinta[-\s]?feira/i, day: "Qui" },
   { re: /sexta[-\s]?feira/i, day: "Sex" },
+  { re: /\bmonday\b/i, day: "Seg" },
+  { re: /\btuesday\b/i, day: "Ter" },
+  { re: /\bwednesday\b/i, day: "Qua" },
+  { re: /\bthursday\b/i, day: "Qui" },
+  { re: /\bfriday\b/i, day: "Sex" },
 ];
-// Whitelist EXATA (fallback, sem "-feira") para cabeçalhos que são só a
-// abreviação/nome do dia e mais nada (ex. "Seg", "Quarta"). Continua a
-// exigir igualdade exata para nunca confundir "Sexo"/"Segmento" com
-// "Sex"/"Seg" só por partilharem prefixo.
+// Whitelist EXATA (fallback, sem "-feira"/nome completo) para cabeçalhos
+// que são só a abreviação/nome do dia e mais nada (ex. "Seg", "Quarta",
+// "Mon", "Tuesday"). Continua a exigir igualdade exata para nunca confundir
+// "Sexo"/"Segmento" com "Sex"/"Seg" só por partilharem prefixo.
 const DAY_ONLY_WORDS = {
   seg: "Seg", segunda: "Seg", segundafeira: "Seg",
   ter: "Ter", terca: "Ter", tercafeira: "Ter",
   qua: "Qua", quarta: "Qua", quartafeira: "Qua",
   qui: "Qui", quinta: "Qui", quintafeira: "Qui",
   sex: "Sex", sexta: "Sex", sextafeira: "Sex",
+  mon: "Seg", monday: "Seg",
+  tue: "Ter", tues: "Ter", tuesday: "Ter",
+  wed: "Qua", weds: "Qua", wednesday: "Qua",
+  thu: "Qui", thur: "Qui", thurs: "Qui", thursday: "Qui",
+  fri: "Sex", friday: "Sex",
 };
 function normalizeDayOnlyHeader(raw) {
   const s = String(raw || "");
-  for (const { re, day } of DAY_FEIRA_PATTERNS) {
+  for (const { re, day } of DAY_WORD_PATTERNS) {
     if (re.test(s)) return day;
   }
   const n = normKey(s).replace(/[^a-z]/g, "");
@@ -920,7 +973,7 @@ function extractDayNumber(raw) {
 function registerDayNumberMapping(text) {
   const s = String(text || "");
   let weekday = null;
-  for (const { re, day } of DAY_FEIRA_PATTERNS) {
+  for (const { re, day } of DAY_WORD_PATTERNS) {
     if (re.test(s)) { weekday = day; break; }
   }
   if (!weekday) return;
@@ -1028,7 +1081,20 @@ function extractAvailabilityFromRow(header, rowObj) {
     if (dayOnly) {
       const cell = String(rowObj[h] || "").trim();
       if (cell) parseAvailabilityCell(cell, dayOnly).forEach((s) => slots.add(s));
+      return;
     }
+    // (d) FALLBACK — o cabeçalho não indica nem dia nem hora (pergunta de
+    // texto livre do Forms cujo título não segue nenhum padrão reconhecido,
+    // ex. "Quais os teus horários disponíveis?"): em vez de descartar a
+    // coluna, tenta interpretar o CONTEÚDO da célula como uma lista de
+    // slots "Dia Hora" separados por | ; , ou quebra de linha (ex.: "Seg
+    // 09:00 | Ter 10:30"), sem depender do nome da coluna — cada item é
+    // resolvido pelo próprio parseAvailabilityRanges (via
+    // parseAvailabilityCell sem dayHint), que só produz slot se o item
+    // começar por um dia reconhecível, pelo que colunas verdadeiramente
+    // não relacionadas (nome, email, etc.) não geram falsos positivos.
+    const cell = String(rowObj[h] || "").trim();
+    if (cell) parseAvailabilityCell(cell).forEach((s) => slots.add(s));
   });
   const free = String(get(rowObj, "disponibilidade", "horarios", "horários", "slots") || "");
   parseAvailabilityCell(free).forEach((s) => slots.add(s));
