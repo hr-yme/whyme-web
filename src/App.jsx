@@ -57,10 +57,33 @@ const GLOBAL_CSS = `
 ============================================================================ */
 
 const ACCESS_KEY = "YME2026";
+// Etiqueta de build/versão do código — muda sempre que este ficheiro é
+// atualizado (visível no canto do cabeçalho, ver TopNav). Serve para
+// confirmar a olho, sem depender de memória/promessas, se a app está
+// mesmo a correr a versão mais recente do código depois de um deploy —
+// que foi a causa real da última ronda de "os bugs persistem": as
+// correções já estavam no ficheiro entregue, mas a app em ecrã ainda
+// estava a correr uma versão anterior.
+const APP_BUILD = "build-2026-08-19-rh-diag";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = ["09:00", "10:30", "14:00", "15:30", "17:00"];
 const SLOTS = DAYS.flatMap((d) => TIMES.map((t) => `${d} ${t}`));
+
+// Duração assumida de cada slot oficial de entrevista, em minutos. Usada
+// para decidir se um INTERVALO de disponibilidade em texto livre (ex.:
+// "09:00 - 12:00", bastante comum em respostas de Forms que pedem "das X às
+// Y" em vez de checkboxes por slot exato) cobre por completo um dos 5
+// horários oficiais da grelha, e não apenas para comparar strings iguais.
+const SLOT_DURATION_MIN = 30;
+// Mapa slot canónico -> { day, startMin, endMin }, calculado uma única vez.
+const SLOT_INFO = {};
+SLOTS.forEach((slot) => {
+  const [day, time] = slot.split(" ");
+  const [hh, mm] = time.split(":").map(Number);
+  const startMin = hh * 60 + mm;
+  SLOT_INFO[slot] = { day, startMin, endMin: startMin + SLOT_DURATION_MIN };
+});
 
 // Estrutura organizacional fixa da YME
 const ORG = [
@@ -72,6 +95,47 @@ const ORG = [
   { dept: "Sales & Commercial", diretor: "Tomás Costa", supervisor: "Inês Costa", supervisorTitle: "CMO", rh: ["Catarina Lamego"] },
 ];
 const DEPARTMENTS = ORG.map((o) => o.dept);
+
+// Constrói os membros base (Diretor/Supervisor/RH) diretamente da estrutura
+// organizacional fixa (ORG) — GARANTE que a associação Departamento ->
+// Diretor/Supervisor/RH está sempre presente, mesmo antes de qualquer
+// sincronização com o Excel Mestre ou se essa sincronização falhar a
+// encontrar algum nome.
+//
+// CORREÇÃO PARA "Sem alocação": antes, a lista de membros só existia depois
+// de uma sincronização bem-sucedida (a app arranca sempre com 0 membros —
+// ver comentário mais abaixo). Isto significa que QUALQUER problema de
+// sincronização (folha ainda não ligada, sessão a precisar de novo login,
+// nome de RH escrito de forma diferente na aba, aba ainda não lida) deixava
+// a coluna RH permanentemente "Sem alocação" para departamentos inteiros —
+// não porque faltasse RH no departamento, mas porque a app simplesmente
+// ainda não sabia que esse RH existia. Com esta base, a associação
+// Diretor/Supervisor/RH de cada departamento está sempre lá desde o
+// arranque; a sincronização com o Excel Mestre só ACRESCENTA disponibi-
+// lidade (e, se necessário, atualiza/corrige nomes) por cima desta base —
+// o merge é feito por nome normalizado (findMemberIndex/normKey), pelo que
+// nunca cria duplicados.
+function buildOrgBaselineMembers() {
+  const members = [];
+  const upsert = (name, role, dept) => {
+    name = String(name || "").trim();
+    if (!name) return;
+    const idx = members.findIndex((m) => normKey(m.name) === normKey(name));
+    if (idx >= 0) {
+      const depts = new Set(members[idx].departments);
+      depts.add(dept);
+      members[idx] = { ...members[idx], departments: Array.from(depts) };
+    } else {
+      members.push({ id: uid("org"), name, role, title: role, departments: [dept], availability: [] });
+    }
+  };
+  ORG.forEach((o) => {
+    upsert(o.diretor, "Diretor", o.dept);
+    upsert(o.supervisor, "Supervisor", o.dept);
+    o.rh.forEach((n) => upsert(n, "RH", o.dept));
+  });
+  return members;
+}
 
 const PHASE_LABEL = { fase1: "Fase 2", fase2: "Fase 3", fase3: "Fase 4" };
 // Estado de disponibilidade do candidato para a fase em curso — controlável
@@ -224,6 +288,30 @@ function matchDept(raw) {
   const norm = normKey(raw).replace(/[^a-z0-9]+/g, " ").trim();
   if (!norm) return null;
   return DEPARTMENTS.find((d) => normKey(d).replace(/[^a-z0-9]+/g, " ").trim() === norm) || null;
+}
+
+// Encontra o índice de um membro (Diretor/Supervisor/RH) já existente pelo
+// Nome, usando normKey() (trim + lowercase + sem acentos + espaços
+// colapsados) em vez de uma simples comparação de .toLowerCase().
+// CORREÇÃO CRÍTICA: era exatamente esta comparação frágil (só .toLowerCase(),
+// sem normalizar acentos/espaços) que fazia a app criar DOIS registos
+// diferentes para a mesma pessoa sempre que o nome vinha escrito de forma
+// ligeiramente diferente entre a aba "Base Dados Departamentos" (que define
+// Diretor/Supervisor/Membros RH por departamento) e as abas de
+// disponibilidade "Disponibilidade Entrevistas RH/Dinâmicas/Entrevista
+// Final" (ex.: "Tânia Silva" vs "Tania Silva " com espaço a mais, ou
+// maiúsculas diferentes). Resultado: um registo do membro ficava com
+// `departments` preenchido mas `availability: []`, e o outro com
+// `availability` preenchida mas `departments: []` — daí a coluna RH
+// aparecer como "Sem alocação" (o registo "certo" nunca tinha disponibilidade
+// para entrar no cruzamento) e o Horário ficar vazio / "Sem Horário Comum"
+// mesmo quando os dados existiam no Excel. Isto espelha o mesmo bug (e a
+// mesma correção) já aplicado a matchCandidateIndex() para candidatos — só
+// que nunca tinha sido replicado para membros.
+function findMemberIndex(members, name) {
+  const n = normKey(name);
+  if (!n) return -1;
+  return members.findIndex((m) => normKey(m.name) === n);
 }
 
 // Encontra o índice de um candidato já existente. Chave primária: EMAIL
@@ -608,17 +696,300 @@ function translateSheetApiError(code, sheetName) {
   return new Error(`Não foi possível ler a aba "${sheetName}" (${code}).`);
 }
 
-// Extrai disponibilidade de uma linha, aceitando 2 formatos comuns:
-// (a) colunas-grelha em que o próprio slot é o cabeçalho ("Seg 09:00" = x/sim)
-// (b) uma coluna de texto livre "Disponibilidade" com slots separados por | ; ,
-function extractAvailabilityFromRow(header, row) {
+// Normaliza um "token" de dia da semana para uma das 5 chaves canónicas de
+// ============================================================================
+// FUNÇÃO PEDIDA: parseTimeToMinutes — conversão única de QUALQUER formato de
+// hora para minutos desde a meia-noite. Esta é agora a ÚNICA função em todo
+// o ficheiro que interpreta dígitos de hora; tudo o resto (Excel Mestre e
+// Forms dos candidatos) passa por aqui antes de qualquer comparação.
+//
+// CORREÇÃO CRÍTICA: os 54 "Sem Horário Comum" vinham de comparar STRINGS
+// diretamente — "10h30 - 11h00" (Forms, candidatos) nunca é === "10:30 -
+// 11:00" (Excel Mestre, RH/Diretores/Supervisor), mesmo sendo o MESMO
+// horário. A correção não é tentar prever todas as grafias possíveis: é
+// nunca mais comparar texto. Tudo passa a ser convertido para minutos
+// (números) logo na leitura, e a interseção de disponibilidades passa a ser
+// aritmética sobre esses números, não comparação de strings.
+//
+// Aceita: "10h30 - 11h00", "10:30-11:00", "10:30", "10h30", "10.30",
+// "10:30 às 11:00", "10:30–11:00" (travessão), "9h-9h30", "9h- 9h30",
+// "9h00 - 9h30", "11h30 -12h00", "11h30 -12h", "17h-17h30",
+// "2:00 PM", "10:30 AM", "2 PM", "14:00", "14h30", "14.30", etc.
+// Exemplo pedido: parseTimeToMinutes("10h30 - 11h00") -> { inicio: 630, fim: 660 }
+//                 parseTimeToMinutes("10:30 - 11:00") -> { inicio: 630, fim: 660 }
+//                 parseTimeToMinutes("2:00 PM")        -> { inicio: 840, fim: null }  (== 14:00)
+//                 parseTimeToMinutes("10:30 AM")       -> { inicio: 630, fim: null }  (== 10:30)
+
+// Regex universal de horas — a ÚNICA usada em todo o ficheiro para
+// reconhecer texto de horas, partilhada por parseTimeToMinutes() (para
+// extrair minutos) e normalizeSlotString() (para saber onde a hora começa
+// dentro de um cabeçalho). Tem 2 ramos, tentados por esta ordem em cada
+// posição:
+//  1) 12h com AM/PM — "2:00 PM", "10:30 AM", "2 PM", "2:00PM", "10h30 a.m."
+//     (grupo `ampm` só existe se um sufixo AM/PM for encontrado a seguir)
+//  2) 24h com separador ':', 'h' ou '.' — "14:00", "14h30", "14.30", "9h"
+//     (minutos aqui são OPCIONAIS: "9h"/"12h" valem "9h00"/"12h00")
+const TIME_TOKEN_RE = /(?<h12>\d{1,2})(?:\s*[:.h]\s*(?<m12>\d{2}))?\s*(?<ampm>[ap]\.?\s?m\.?)\b|(?<h24>\d{1,2})\s*[:h.]\s*(?<m24>\d{2})?/gi;
+
+function parseTimeToMinutes(str) {
+  const s = String(str || "");
+  const matches = [];
+  for (const m of s.matchAll(TIME_TOKEN_RE)) {
+    if (m.groups.ampm !== undefined) {
+      // 12h -> 24h: 12 AM = 00h; 12 PM = 12h; 1-11 AM ficam iguais;
+      // 1-11 PM somam 12h. "2:00 PM" == "14:00", "10:30 AM" == "10:30".
+      let hour = Number(m.groups.h12) % 12;
+      if (/^p/i.test(m.groups.ampm)) hour += 12;
+      matches.push(hour * 60 + Number(m.groups.m12 || 0));
+    } else if (m.groups.h24 !== undefined) {
+      matches.push(Number(m.groups.h24) * 60 + Number(m.groups.m24 || 0));
+    }
+  }
+  if (!matches.length) return { inicio: null, fim: null };
+  // Primeiro valor = início; último valor = fim (um único horário pontual
+  // devolve fim=null — ver parseAvailabilityRanges abaixo, que nesse caso
+  // assume a duração padrão de 1 slot).
+  return { inicio: matches[0], fim: matches.length > 1 ? matches[matches.length - 1] : null };
+}
+// ============================================================================
+
+// Deteta um "token" de dia da semana para uma das 5 chaves canónicas de
+// DAYS ("Seg".."Sex"), aceitando abreviações, nomes completos, com/sem
+// acentos, com/sem "-feira", maiúsculas/minúsculas, pontuação, etc.
+// Funciona por PREFIXO de 3 letras depois de normalizado (normKey já remove
+// acentos/maiúsculas), o que cobre "Seg", "seg.", "Segunda", "segunda-feira",
+// "SEGUNDA FEIRA", etc. — todos colapsam no mesmo prefixo "seg".
+const DAY_PREFIXES = { seg: "Seg", ter: "Ter", qua: "Qua", qui: "Qui", sex: "Sex" };
+function normalizeDayToken(raw) {
+  const n = normKey(raw).replace(/[^a-z]/g, "");
+  if (!n) return null;
+  return DAY_PREFIXES[n.slice(0, 3)] || null;
+}
+
+// Normaliza um "token" de horário para o formato canónico "HH:MM" usado em
+// TIMES — agora um wrapper fino sobre parseTimeToMinutes(), para que exista
+// UMA SÓ função a interpretar dígitos de hora em todo o ficheiro. Devolve
+// null se não encontrar nenhuma hora reconhecível.
+function normalizeTimeToken(raw) {
+  const { inicio } = parseTimeToMinutes(raw);
+  if (inicio === null) return null;
+  const hh = String(Math.floor(inicio / 60)).padStart(2, "0");
+  const mm = String(inicio % 60).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+// Normaliza uma string livre de "Dia + Hora" (célula de cabeçalho de
+// grelha, ou um item de uma lista separada por | ; ,) para um dos slots
+// canónicos de SLOTS ("Seg 09:00", etc.), ou null se não for possível
+// reconhecer com confiança um dia E uma das 5 horas oficiais da grelha
+// (TIMES). Usada para o caso "ponto exato" (cabeçalho = o próprio slot).
+function normalizeSlotString(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const time = normalizeTimeToken(s);
+  if (!time || !TIMES.includes(time)) return null;
+  const timeIdx = s.search(TIME_TOKEN_RE);
+  const dayPart = timeIdx > 0 ? s.slice(0, timeIdx) : s;
+  const day = normalizeDayToken(dayPart);
+  if (!day) return null;
+  const slot = `${day} ${time}`;
+  return SLOTS.includes(slot) ? slot : null;
+}
+
+// Deteta o DIA da semana referido num cabeçalho de coluna, mesmo quando o
+// cabeçalho tem texto extra à volta — CORREÇÃO PARA EXPORTS DO GOOGLE FORMS
+// COM VÁRIAS SECÇÕES: quando o Forms tem uma secção por departamento e cada
+// secção repete a mesma pergunta de disponibilidade, o Excel/Sheets gera
+// automaticamente um cabeçalho por secção com sufixo para os manter únicos
+// — ex. "Quarta-feira, dia 10 de junho", "Quarta-feira, dia 10 de junho 2",
+// "...  3", até 6. A verificação ANTERIOR exigia que o cabeçalho fosse
+// EXATAMENTE "Quarta"/"Quarta-feira" (nada mais), pelo que NENHUMA destas
+// colunas (nem a primeira, nem as seguintes) era reconhecida como coluna de
+// disponibilidade — todas eram ignoradas, daí os 0 agendamentos. Agora
+// procura-se o nome do dia (com "-feira") em QUALQUER parte do texto do
+// cabeçalho, o que reconhece a coluna seja qual for o sufixo/data anexado.
+const DAY_FEIRA_PATTERNS = [
+  { re: /segunda[-\s]?feira/i, day: "Seg" },
+  { re: /ter[cç]a[-\s]?feira/i, day: "Ter" },
+  { re: /quarta[-\s]?feira/i, day: "Qua" },
+  { re: /quinta[-\s]?feira/i, day: "Qui" },
+  { re: /sexta[-\s]?feira/i, day: "Sex" },
+];
+// Whitelist EXATA (fallback, sem "-feira") para cabeçalhos que são só a
+// abreviação/nome do dia e mais nada (ex. "Seg", "Quarta"). Continua a
+// exigir igualdade exata para nunca confundir "Sexo"/"Segmento" com
+// "Sex"/"Seg" só por partilharem prefixo.
+const DAY_ONLY_WORDS = {
+  seg: "Seg", segunda: "Seg", segundafeira: "Seg",
+  ter: "Ter", terca: "Ter", tercafeira: "Ter",
+  qua: "Qua", quarta: "Qua", quartafeira: "Qua",
+  qui: "Qui", quinta: "Qui", quintafeira: "Qui",
+  sex: "Sex", sexta: "Sex", sextafeira: "Sex",
+};
+function normalizeDayOnlyHeader(raw) {
+  const s = String(raw || "");
+  for (const { re, day } of DAY_FEIRA_PATTERNS) {
+    if (re.test(s)) return day;
+  }
+  const n = normKey(s).replace(/[^a-z]/g, "");
+  if (DAY_ONLY_WORDS[n]) return DAY_ONLY_WORDS[n];
+  // Fallback por NÚMERO DO DIA (ver bloco DAY_NUMBER_TO_WEEKDAY abaixo):
+  // cobre cabeçalhos do Excel Mestre que só trazem a data ("10/06",
+  // "Dia 10"), sem nome de dia da semana nenhum.
+  const num = extractDayNumber(s);
+  return num !== null ? (DAY_NUMBER_TO_WEEKDAY[num] || null) : null;
+}
+
+// ----------------------------------------------------------------------
+// MAPEAMENTO DE DIAS POR NÚMERO DO MÊS
+// ----------------------------------------------------------------------
+// O Forms dos candidatos identifica cada dia por NOME + DATA no mesmo
+// cabeçalho: "Quarta-feira, dia 10 de junho". O Excel Mestre (disponibi-
+// lidade de Diretor/Supervisor/RH), pelo contrário, identifica o mesmo dia
+// só pela DATA, sem nome de dia da semana: "10/06" ou "Dia 10". Como o
+// modelo interno da app organiza tudo por dia da semana (Seg..Sex, ver
+// SLOTS), é preciso descobrir a que dia da semana corresponde cada data —
+// e essa correspondência só está disponível nos cabeçalhos do Forms
+// (que trazem os dois juntos). DAY_NUMBER_TO_WEEKDAY guarda esse mapa
+// (ex.: { 10: "Qua", 11: "Qui", 12: "Sex" }), construído automaticamente
+// à medida que os cabeçalhos do Forms são lidos, e é depois consultado
+// para resolver as colunas do Excel Mestre que só têm a data.
+let DAY_NUMBER_TO_WEEKDAY = {};
+
+// Extrai o dia do mês (1-31) de um texto, tentando por ordem:
+//  1) "dia 10", "Dia 10"
+//  2) "10 de julho", "19 de junho" — dia por extenso, com nome do mês a
+//     seguir (não exige a palavra "dia" antes, ao contrário do padrão 1)
+//  3) "19/06", "19/07/2026", "19-06" — data numérica dd/mm(/aaaa)
+// Ignora números fora do intervalo válido de um dia do mês, para nunca
+// confundir com o sufixo de coluna duplicada do Forms (ex. o " 5" final de
+// "...de junho 5" não é precedido de "dia"/"de <mês>" nem seguido de
+// "/mês", por isso nunca é apanhado por nenhum destes padrões).
+function extractDayNumber(raw) {
+  const s = String(raw || "");
+  let m = s.match(/dia\s*(\d{1,2})\b/i);
+  if (!m) m = s.match(/\b(\d{1,2})\s*de\s*[a-zçãáéíóúâêôõ]+/i);
+  if (!m) m = s.match(/\b(\d{1,2})\s*[\/\-]\s*\d{1,2}(?:\s*[\/\-]\s*\d{2,4})?\b/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 1 && n <= 31 ? n : null;
+}
+
+// Regista no mapa DAY_NUMBER_TO_WEEKDAY a correspondência dia-do-mês -> dia
+// da semana, sempre que um texto trouxer os dois em conjunto (é o caso dos
+// cabeçalhos do Forms). Chamada para TODOS os cabeçalhos antes de os
+// processar (ver extractAvailabilityFromRow), para que o mapa esteja
+// atualizado independentemente da ordem das colunas na folha.
+function registerDayNumberMapping(text) {
+  const s = String(text || "");
+  let weekday = null;
+  for (const { re, day } of DAY_FEIRA_PATTERNS) {
+    if (re.test(s)) { weekday = day; break; }
+  }
+  if (!weekday) return;
+  const num = extractDayNumber(s);
+  if (num !== null) DAY_NUMBER_TO_WEEKDAY[num] = weekday;
+}
+
+// Converte uma célula/token já isolado (um único dia) em intervalo(s)
+// {day, startMin, endMin}, usando SEMPRE parseTimeToMinutes() para os
+// números — nunca comparação de texto. Um único horário sem intervalo
+// (`fim === null`) é tratado como um ponto que cobre exatamente 1 slot
+// (startMin..startMin+SLOT_DURATION_MIN).
+function parseAvailabilityRanges(raw, dayHint) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  const firstDigit = s.search(/\d/);
+  const dayText = firstDigit > 0 ? s.slice(0, firstDigit) : s;
+  const day = dayHint || normalizeDayToken(dayText);
+  if (!day) return [];
+  const { inicio, fim } = parseTimeToMinutes(s);
+  if (inicio === null) return [];
+  return [{ day, startMin: inicio, endMin: fim !== null ? fim : inicio + SLOT_DURATION_MIN }];
+}
+
+// Converte intervalo(s) {day, startMin, endMin} nos slots oficiais da
+// grelha (SLOTS) que ficam TOTALMENTE contidos nesse intervalo — ou seja,
+// alguém que respondeu "disponível das 09:00 às 12:00" fica corretamente
+// marcado como disponível para os slots oficiais "Seg 09:00" E "Seg 10:30"
+// (30 min cada, ambos dentro de 09:00-12:00), mesmo nunca tendo escrito
+// literalmente "09:00" nem "10:30" como pontos exatos. Isto é o que faltava
+// para o cruzamento de 4 vias encontrar sobreposições reais: antes exigia-se
+// que o horário declarado batesse cerácter a carácter com um dos 5 slots.
+function expandRangesToSlots(ranges) {
+  const result = new Set();
+  ranges.forEach(({ day, startMin, endMin }) => {
+    SLOTS.forEach((slot) => {
+      const info = SLOT_INFO[slot];
+      if (info.day === day && startMin <= info.startMin && info.endMin <= endMin) result.add(slot);
+    });
+  });
+  return Array.from(result);
+}
+
+// Divide o conteúdo de UMA célula em itens (| ; , ou quebra de linha) e
+// converte cada item — ponto único OU intervalo — em slots oficiais,
+// unificando tudo num só array. Usado tanto para colunas-dia isoladas como
+// para o campo de texto livre "Disponibilidade". `dayHint`, quando passado
+// (caso das colunas-dia), fixa o dia para todos os itens da célula; caso
+// contrário cada item tem de indicar o seu próprio dia (campo de texto livre
+// com vários dias na mesma célula).
+function parseAvailabilityCell(cellText, dayHint) {
+  const slots = new Set();
+  String(cellText || "").split(/[|;,\n]/).forEach((token) => {
+    expandRangesToSlots(parseAvailabilityRanges(token, dayHint)).forEach((s) => slots.add(s));
+  });
+  return Array.from(slots);
+}
+
+// Extrai disponibilidade de uma linha, aceitando 3 formatos comuns no Excel
+// Mestre / exports de Forms:
+// (a) colunas-grelha em que o próprio cabeçalho é um slot exato (ex.:
+//     "Seg 09:00", "Segunda-feira, 09:00 - 09:30") marcado com um valor
+//     positivo (x/sim/verdadeiro/1/☑)
+// (b) colunas-grelha em que o cabeçalho contém o nome do DIA — incluindo
+//     cabeçalhos duplicados com sufixo de secção do Forms, ex.
+//     "Quarta-feira, dia 10 de junho", "...  2", "...  3" — e a célula tem
+//     um ou mais horários/intervalos em texto livre (ex. "09:00-12:00" ou
+//     "09:00, 10:30"). TODAS as colunas cujo cabeçalho contenha o mesmo dia
+//     são lidas e unificadas no mesmo array — cada candidato só preenche a
+//     secção do SEU departamento, pelo que as restantes ficam vazias e são
+//     ignoradas (`if (cell)`), sem perder a que estiver preenchida.
+// (c) uma coluna de texto livre "Disponibilidade" com um ou mais dias e
+//     intervalos, separados por | ; , ou quebras de linha
+// `rowObj` é um objeto simples { "Nome da Coluna": valor, ... } — tanto faz
+// vir da leitura do Google Sheets (row.obj) como do xlsx.utils.sheet_to_json
+// (linha já vem nesse formato), por isso esta função serve para os dois
+// caminhos de importação (sincronização automática e upload manual de Forms).
+function extractAvailabilityFromRow(header, rowObj) {
+  // Pré-passo: regista no mapa DAY_NUMBER_TO_WEEKDAY qualquer par
+  // "dia da semana + data" encontrado nos cabeçalhos ANTES de extrair
+  // disponibilidade — assim, mesmo que esta chamada seja sobre a aba do
+  // Excel Mestre (que só tem datas) e o Forms dos candidatos só tenha sido
+  // lido depois (ou antes, não importa a ordem dentro desta função), as
+  // colunas "10/06"/"Dia 10" já conseguem ser resolvidas para "Qua" assim
+  // que pelo menos um cabeçalho em QUALQUER aba já processada nesta sessão
+  // trouxer os dois juntos.
+  header.forEach(registerDayNumberMapping);
+
   const slots = new Set();
   header.forEach((h) => {
-    const clean = String(h || "").trim();
-    if (SLOTS.includes(clean) && isPositiveMark(row.obj[h])) slots.add(clean);
+    // (a) cabeçalho é um slot exato ("Seg 09:00") marcado x/sim/true/1/☑
+    const exactSlot = normalizeSlotString(h);
+    if (exactSlot) {
+      if (isPositiveMark(rowObj[h])) slots.add(exactSlot);
+      return;
+    }
+    // (b) cabeçalho contém o nome do dia (com ou sem sufixo de secção); a
+    // célula tem o(s) horário(s)/intervalo(s) em texto livre
+    const dayOnly = normalizeDayOnlyHeader(h);
+    if (dayOnly) {
+      const cell = String(rowObj[h] || "").trim();
+      if (cell) parseAvailabilityCell(cell, dayOnly).forEach((s) => slots.add(s));
+    }
   });
-  const free = String(get(row.obj, "disponibilidade", "horarios", "horários", "slots") || "");
-  free.split(/[|;,]/).map((s) => s.trim()).forEach((s) => { if (SLOTS.includes(s)) slots.add(s); });
+  const free = String(get(rowObj, "disponibilidade", "horarios", "horários", "slots") || "");
+  parseAvailabilityCell(free).forEach((s) => slots.add(s));
   return Array.from(slots).sort((a, b) => SLOTS.indexOf(a) - SLOTS.indexOf(b));
 }
 
@@ -631,7 +1002,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   const upsertMember = (name, role, dept) => {
     name = String(name || "").trim();
     if (!name) return;
-    const idx = members.findIndex((m) => m.name.toLowerCase() === name.toLowerCase());
+    const idx = findMemberIndex(members, name);
     if (idx >= 0) {
       const depts = new Set(members[idx].departments || []);
       if (dept) depts.add(dept);
@@ -672,9 +1043,9 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     (tab?.rows || []).forEach((row) => {
       const name = String(get(row.obj, "nome", "name") || "").trim();
       if (!name) return;
-      const slots = extractAvailabilityFromRow(tab.header, row);
+      const slots = extractAvailabilityFromRow(tab.header, row.obj);
       if (!slots.length) return;
-      const idx = members.findIndex((m) => m.name.toLowerCase() === name.toLowerCase());
+      const idx = findMemberIndex(members, name);
       if (idx >= 0) {
         members[idx] = { ...members[idx], availability: Array.from(new Set([...(members[idx].availability || []), ...slots])) };
       } else {
@@ -987,6 +1358,29 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
    SCHEDULING ALGORITHMS  (lógica inalterada)
 ============================================================================ */
 
+// Compara departamentos ignorando maiúsculas/minúsculas, acentos e espaços
+// a mais — em vez de igualdade estrita de string (===/Array.includes).
+// Dois departamentos "iguais" mas escritos por fontes diferentes (Excel
+// Mestre vs Google Sheets vs edição manual) podem ter, por exemplo,
+// unicode de acentuação diferente ou um espaço a mais sem serem
+// visivelmente distintos — e Array.includes falha nesse caso sem aviso
+// nenhum. deptKey()/memberHasDept() usam a mesma normalização de normKey()
+// já usada no resto do ficheiro (matchDept, findMemberIndex, etc.).
+function deptKey(d) {
+  return normKey(d).replace(/[^a-z0-9]+/g, " ").trim();
+}
+function memberHasDept(member, dept) {
+  const key = deptKey(dept);
+  return (member.departments || []).some((d) => deptKey(d) === key);
+}
+// Lista de RH atribuídos a um departamento — SEM olhar a horários. Esta é
+// a "verdade" da coluna RH: sempre que não vier vazia, um candidato desse
+// departamento NUNCA deve mostrar "Sem alocação", seja qual for o
+// resultado do cruzamento de horários feito depois.
+function rhForDepartment(members, dept) {
+  return members.filter((m) => m.role === "RH" && memberHasDept(m, dept));
+}
+
 function generateInterviewPhase(pool, members, existingBookings, availField, staffKeys) {
   // staffKeys: array like ["diretorId","rhId"] or ["diretorId","rhId","supervisorId"]
   const busy = {};
@@ -999,12 +1393,35 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       busy[b[k]].add(b.slot);
     });
   });
+
+  // PASSO 2 — DISTRIBUIÇÃO EQUITATIVA (ROUND-ROBIN) POR DEPARTAMENTO.
+  // Um índice rotativo por departamento (não uma contagem de carga): avança
+  // 1 posição por CADA candidato desse departamento, alternando estritamente
+  // RH A -> RH B -> RH A -> ... independentemente de haver ou não slot
+  // comum — é o que garante Candidato 1 -> RH A, Candidato 2 -> RH B,
+  // Candidato 3 -> RH A, tal como pedido.
+  const roundRobinIndex = {};
+  function nextRoundRobinRH(dept, rhList) {
+    if (!rhList.length) return null;
+    const key = deptKey(dept);
+    const i = roundRobinIndex[key] || 0;
+    roundRobinIndex[key] = (i + 1) % rhList.length;
+    return rhList[i % rhList.length];
+  }
+
   const bookings = [...kept];
   pool.forEach((c) => {
     if (kept.some((b) => b.candidateId === c.id)) return;
-    const diretor = members.find((m) => m.role === "Diretor" && m.departments.includes(c.department));
-    const supervisor = staffKeys.includes("supervisorId") ? members.find((m) => m.role === "Supervisor" && m.departments.includes(c.department)) : null;
-    const rhList = members.filter((m) => m.role === "RH" && m.departments.includes(c.department));
+    const diretor = members.find((m) => m.role === "Diretor" && memberHasDept(m, c.department));
+    const supervisor = staffKeys.includes("supervisorId") ? members.find((m) => m.role === "Supervisor" && memberHasDept(m, c.department)) : null;
+
+    // PASSO 1 — ATRIBUIÇÃO DIRETA POR DEPARTAMENTO, independente do
+    // horário: primeiro decide-se QUEM é o RH responsável (rhForDepartment
+    // + round-robin), só depois é que se tenta cruzar horários. A coluna
+    // RH usa sempre `assignedRH`, mesmo que o cruzamento abaixo não
+    // encontre nenhum slot comum.
+    const rhList = rhForDepartment(members, c.department);
+    const assignedRH = nextRoundRobinRH(c.department, rhList);
 
     let found = null;
     for (const slot of c.availability[availField]) {
@@ -1012,7 +1429,13 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       if (staffKeys.includes("supervisorId")) {
         if (!supervisor || !supervisor.availability.includes(slot) || busy[supervisor.id]?.has(slot)) continue;
       }
-      const rh = rhList.find((r) => r.availability.includes(slot) && !busy[r.id]?.has(slot));
+      // PASSO 3 — FALLBACK DE DISPONIBILIDADE: tenta primeiro o RH
+      // atribuído pelo round-robin (`assignedRH`); só se ele não tiver
+      // este slot livre (ou estiver ocupado com outro candidato) é que se
+      // testam os restantes membros de RH do mesmo departamento, por
+      // ordem, antes de desistir deste slot e passar ao seguinte.
+      const rhCandidates = [assignedRH, ...rhList.filter((r) => r.id !== assignedRH?.id)].filter(Boolean);
+      const rh = rhCandidates.find((r) => r.availability.includes(slot) && !busy[r.id]?.has(slot));
       if (rh) { found = { slot, diretor, rh, supervisor }; break; }
     }
 
@@ -1022,7 +1445,11 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       staffKeys.forEach((k) => { const mid = record[k]; if (mid) { busy[mid] = busy[mid] || new Set(); busy[mid].add(found.slot); } });
       bookings.push(record);
     } else {
-      const record = { id: uid("bk"), candidateId: c.id, slot: null, diretorId: diretor?.id || null, rhId: null, status: "Sem Horário Comum", manual: false };
+      // "Sem alocação" só deve aparecer quando o departamento realmente não
+      // tem NENHUM RH (rhList vazia -> assignedRH null). Havendo RH, a
+      // coluna mostra sempre `assignedRH` — só o Horário fica por
+      // preencher e o Estado mantém "Sem Horário Comum".
+      const record = { id: uid("bk"), candidateId: c.id, slot: null, diretorId: diretor?.id || null, rhId: assignedRH?.id || null, status: "Sem Horário Comum", manual: false };
       if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
       bookings.push(record);
     }
@@ -1078,7 +1505,7 @@ function generatePhase2(pool, members) {
     const directorIds = [];
     if (bestSlot) {
       depts.forEach((d) => {
-        const dir = members.find((m) => m.role === "Diretor" && m.departments.includes(d));
+        const dir = members.find((m) => m.role === "Diretor" && memberHasDept(m, d));
         if (dir && dir.availability.includes(bestSlot) && !busy[dir.id]?.has(bestSlot)) {
           directorIds.push(dir.id); busy[dir.id] = busy[dir.id] || new Set(); busy[dir.id].add(bestSlot);
         } else {
@@ -1092,8 +1519,8 @@ function generatePhase2(pool, members) {
       const freeRH = members
         .filter((m) => m.role === "RH" && m.availability.includes(bestSlot) && !busy[m.id]?.has(bestSlot))
         .sort((a, b) => {
-          const am = depts.some((d) => a.departments.includes(d)) ? 1 : 0;
-          const bm = depts.some((d) => b.departments.includes(d)) ? 1 : 0;
+          const am = depts.some((d) => memberHasDept(a, d)) ? 1 : 0;
+          const bm = depts.some((d) => memberHasDept(b, d)) ? 1 : 0;
           return bm - am;
         });
       rhIds = freeRH.slice(0, 3).map((r) => r.id);
@@ -1341,6 +1768,9 @@ function TopNav({ page, setPage, onLogout, counts }) {
           <LogOut size={14} /> TERMINAR SESSÃO
         </button>
       </div>
+      <div className="max-w-[1400px] mx-auto px-6 pb-1 -mt-1 text-right">
+        <span className="text-[10px] font-mono" style={{ color: hexToRgba(COLORS.mint, 0.3) }} title="Confirma que este valor corresponde ao build mais recente enviado">{APP_BUILD}</span>
+      </div>
     </header>
   );
 }
@@ -1373,6 +1803,7 @@ function UploadCard({ icon: Icon, title, description, hint, status, onFile, acce
       )}
 
       {error && <p className="text-[11px] mb-2" style={{ color: "#c0227a" }}>{error}</p>}
+      {!error && status.warning && <p className="text-[11px] mb-2" style={{ color: "#c0227a" }}>{status.warning}</p>}
 
       <label className="yme-btn-outline-light flex items-center justify-center gap-1.5 text-xs font-medium rounded-lg px-3 py-2 cursor-pointer">
         <UploadCloud size={13} /> {status.loaded ? "Substituir ficheiro" : "Carregar ficheiro"}
@@ -1492,8 +1923,11 @@ function ImportHubPage({
             else if (/supervisor|c-level|clevel/i.test(sheetName)) role = "Supervisor";
           }
           const deptsRaw = String(get(row, "departamentos", "departamento")).split(/[,;|]/).map((s) => matchDept(s)).filter(Boolean);
-          const availRaw = String(get(row, "disponibilidade", "horarios", "slots")).split("|").map((s) => s.trim()).filter((s) => SLOTS.includes(s));
-          const idx = next.findIndex((m) => m.name.toLowerCase() === name.toLowerCase());
+          // Mesma correção: usa o parser tolerante (grelha OU texto livre,
+          // com normalização de dia/hora) em vez de exigir texto livre no
+          // formato exato "Seg 09:00|Ter 14:00".
+          const availRaw = extractAvailabilityFromRow(Object.keys(row), row);
+          const idx = findMemberIndex(next, name);
           count++;
           if (idx >= 0) {
             next[idx] = {
@@ -1516,6 +1950,7 @@ function ImportHubPage({
     const wb = await readWorkbook(file);
     const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
     let count = 0;
+    let rowsWithoutAvailability = 0;
     setCandidates((prev) => {
       const next = [...prev];
       rows.forEach((row) => {
@@ -1523,7 +1958,18 @@ function ImportHubPage({
         if (!name) return;
         const department = matchDept(get(row, "departamento", "department"));
         const email = String(get(row, "email")).trim();
-        const availability = String(get(row, "disponibilidade", "horarios", "slots")).split("|").map((s) => s.trim()).filter((s) => SLOTS.includes(s));
+        // CORREÇÃO: antes só se lia uma única coluna de texto livre
+        // ("Disponibilidade"/"Horários"/"Slots") com formato fixo. Exports
+        // reais do Google/Microsoft Forms costumam vir em formato de
+        // GRELHA (uma coluna por slot, ex. "Segunda-feira, 09:00 - 09:30"),
+        // exatamente como já era suportado para a disponibilidade de
+        // Diretores/Supervisores/RH — extractAvailabilityFromRow() agora é
+        // partilhada por ambos os caminhos e tolera variações de dia/hora
+        // (ver normalizeSlotString). Isto é o que fazia o dashboard mostrar
+        // "Recebida" (o nome/email foram lidos) mas 0 entrevistas agendadas
+        // (o array de disponibilidade ficava sempre vazio).
+        const availability = extractAvailabilityFromRow(Object.keys(row), row);
+        if (!availability.length) rowsWithoutAvailability++;
         const idx = matchCandidateIndex(next, name, email);
         count++;
         if (idx >= 0) {
@@ -1557,7 +2003,19 @@ function ImportHubPage({
       });
       return next;
     });
-    setImportStatus((prev) => ({ ...prev, [phaseKey]: { loaded: true, filename: file.name, count } }));
+    setImportStatus((prev) => ({
+      ...prev,
+      [phaseKey]: {
+        loaded: true, filename: file.name, count,
+        // Aviso explícito quando o nome/email foi lido mas nenhum slot foi
+        // reconhecido — sinal de que os cabeçalhos do ficheiro não batem
+        // certo com nenhum dos 5 horários oficiais (TIMES), em vez de
+        // falhar silenciosamente como antes.
+        warning: rowsWithoutAvailability > 0
+          ? `${rowsWithoutAvailability} de ${count} linha(s) sem nenhum horário reconhecido — confirma se os cabeçalhos das colunas de disponibilidade correspondem aos 5 horários oficiais (${TIMES.join(", ")}) para algum dos 5 dias (${DAYS.join(", ")}).`
+          : null,
+      },
+    }));
   };
 
   const downloadTemplate = (kind) => {
@@ -1631,7 +2089,40 @@ function ImportHubPage({
       </div>
       <button onClick={() => downloadTemplate("forms")} className="yme-link text-xs -mt-6 mb-8">Descarregar modelo CSV de Forms ↓</button>
 
-      <p className="text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: "#94a3b8" }}>Estrutura Organizacional (referência)</p>
+      <p className="text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: "#94a3b8" }}>Diagnóstico ao vivo: Diretor/Supervisor/RH por departamento</p>
+      <p className="text-xs mb-2" style={{ color: hexToRgba(COLORS.white, 0.55) }}>
+        Ao contrário da tabela "referência" que existia aqui antes (estática, só mostrava o `ORG` fixo no código), esta lê diretamente o estado `members` que a app está a usar neste preciso momento — os mesmos dados que alimentam as colunas RH/Diretor/Horário das páginas de agendamento. Se uma célula aparecer a vermelho aqui, é um problema de DADOS (sincronização ainda não correu, nome escrito de forma diferente) — corrige na folha/import. Se aparecer tudo verde aqui mas as tabelas de agendamento continuarem a mostrar "Sem alocação", o browser está a mostrar uma versão desatualizada da app — recarrega/limpa cache.
+      </p>
+      <div className="rounded-xl border overflow-hidden mb-8" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.1) }}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs uppercase tracking-wide" style={{ backgroundColor: COLORS.navy, color: COLORS.white }}>
+              <th className="px-4 py-3 font-medium">Departamento</th>
+              <th className="px-4 py-3 font-medium">Diretor(a)</th>
+              <th className="px-4 py-3 font-medium">Supervisor</th>
+              <th className="px-4 py-3 font-medium">Membro(s) RH</th>
+            </tr>
+          </thead>
+          <tbody>
+            {DEPARTMENTS.map((dept) => {
+              const diretor = members.find((m) => m.role === "Diretor" && memberHasDept(m, dept));
+              const supervisor = members.find((m) => m.role === "Supervisor" && memberHasDept(m, dept));
+              const rh = rhForDepartment(members, dept);
+              const missing = <span className="text-xs font-medium" style={{ color: "#c0227a" }}>— não mapeado —</span>;
+              return (
+                <tr key={dept} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
+                  <td className="px-4 py-3"><DeptBadge dept={dept} /></td>
+                  <td className="px-4 py-3" style={{ color: COLORS.navy }}>{diretor?.name || missing}</td>
+                  <td className="px-4 py-3" style={{ color: COLORS.navy }}>{supervisor?.name || missing}</td>
+                  <td className="px-4 py-3" style={{ color: COLORS.navy }}>{rh.length ? rh.map((r) => r.name).join(", ") : missing}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: "#94a3b8" }}>Estrutura Organizacional (referência fixa no código)</p>
       <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.1) }}>
         <table className="w-full text-sm">
           <thead>
@@ -1847,13 +2338,14 @@ function InterviewPhasePage({
 
   const scheduled = bookings.filter((b) => b.status === "Agendado").length;
   const conflicts = bookings.filter((b) => b.status !== "Agendado").length;
-  // Lista de elegíveis para esta fase: passaram a fase anterior — não
-  // depende de já terem submetido o Forms de disponibilidade (isso é
-  // precisamente o que a coluna "Disponibilidade" abaixo acompanha).
-  // Na Fase 2 (Soft Skills), os candidatos Fast-Track da Talent Pool são
-  // excluídos: eles saltam esta fase e só aparecem a partir da Fase 3.
-  const eligible = candidates.filter((c) => c[prevStatusField] === "Aprovado" && (!excludeTalentPool || !c.veioTalentPool));
-  const missingForms = candidates.filter((c) => c[prevStatusField] === "Aprovado" && !c.formsSubmitted[formsField]).length;
+  // REMOÇÃO DA TRAVA DE VISIBILIDADE: já não se filtra por
+  // `c[prevStatusField] === "Aprovado"` — todos os candidatos do
+  // departamento (exceto Fast-Track da Talent Pool na Fase 2, que segue
+  // rota própria) aparecem sempre na tabela, independentemente de ainda
+  // não terem submetido o Forms desta fase ou da validação da fase
+  // anterior.
+  const eligible = candidates.filter((c) => !excludeTalentPool || !c.veioTalentPool);
+  const missingForms = candidates.filter((c) => !c.formsSubmitted[formsField]).length;
   const availabilityConfirmed = eligible.filter((c) => (c.availabilityStatus?.[formsField] || "nao_enviada") === "recebida").length;
 
   const setAvailability = (candId, value) => {
@@ -1936,7 +2428,7 @@ function InterviewPhasePage({
               </tr>
             ))}
             {eligible.length === 0 && (
-              <tr><td colSpan={3} className="px-4 py-8 text-center text-sm" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Ainda não há candidatos aprovados na fase anterior.</td></tr>
+              <tr><td colSpan={3} className="px-4 py-8 text-center text-sm" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Ainda não há candidatos neste departamento.</td></tr>
             )}
           </tbody>
         </table>
@@ -1944,7 +2436,7 @@ function InterviewPhasePage({
 
       {bookings.length === 0 && (
         <div className="rounded-xl border border-dashed p-10 text-center text-sm" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.2), color: hexToRgba(COLORS.navy, 0.5) }}>
-          Ainda não há candidatos aprovados na fase anterior que tenham submetido o Forms desta fase.
+          Ainda não há candidatos para agendar nesta fase.
         </div>
       )}
 
@@ -2322,11 +2814,15 @@ export default function App() {
   const [page, setPage] = useState("dashboard");
   const [showAddCandidate, setShowAddCandidate] = useState(false);
 
-  // Sem mock data: a app arranca sempre vazia. members/candidates só
-  // ganham conteúdo real através da sincronização com o Excel Mestre
-  // (Google Sheets) — ver runSync/useEffect mais abaixo — ou, como
-  // alternativa manual/backup, via upload de ficheiro no Hub de Importação.
-  const [members, setMembers] = useState(() => []);
+  // members arranca com a base fixa da organização (Diretor/Supervisor/RH
+  // por departamento — ver buildOrgBaselineMembers), para que a coluna RH
+  // nunca apareça "Sem alocação" só por falta de sincronização. candidates
+  // continua vazio: só ganha conteúdo real através da sincronização com o
+  // Excel Mestre (Google Sheets) — ver runSync/useEffect mais abaixo — ou,
+  // como alternativa manual/backup, via upload de ficheiro no Hub de
+  // Importação. A sincronização/importação de membros faz sempre merge por
+  // nome com esta base (nunca substitui), acrescentando disponibilidade.
+  const [members, setMembers] = useState(() => buildOrgBaselineMembers());
   const [candidates, setCandidates] = useState(() => []);
   const [importStatus, setImportStatus] = useState({
     excel: { loaded: false, filename: "", count: 0 },
@@ -2441,11 +2937,23 @@ export default function App() {
   // preenchido não é motivo de exclusão: generateInterviewPhase já trata
   // esse caso de forma explícita, marcando a entrevista como "Sem Horário
   // Comum" em vez de omitir o candidato.
-  const phase1Pool = useMemo(() => candidates.filter((c) => c.phase0Status === "Aprovado" && !c.veioTalentPool), [candidates]);
+  // REMOÇÃO DA TRAVA DE VISIBILIDADE: phase1Pool/phase3Pool deixam de
+  // filtrar por `phase0Status`/`phase2Status === "Aprovado"` — esse filtro
+  // escondia da tabela (e por isso também do algoritmo de agendamento, que
+  // só gera registo para quem está no pool) candidatos que ainda não
+  // tinham validação da etapa anterior ou Forms "Pendente". Agora TODOS os
+  // candidatos do departamento entram no pool e recebem sempre um registo
+  // de agendamento — Diretor, RH (via Round-Robin) e a tentativa de
+  // cruzamento de horário correm para todos, sem exceção. veioTalentPool
+  // continua de fora da Fase 2 porque é uma rota diferente por desenho (o
+  // Fast-Track salta a Fase 2 e só entra a partir da Fase 3) — não é uma
+  // validação de etapa a esconder candidatos, é o próprio fluxo desses
+  // candidatos.
+  const phase1Pool = useMemo(() => candidates.filter((c) => !c.veioTalentPool), [candidates]);
   const phase2Pool = useMemo(() => candidates.filter((c) => c.phase1Status === "Aprovado"), [candidates]);
-  const phase3Pool = useMemo(() => candidates.filter((c) => c.phase2Status === "Aprovado"), [candidates]);
+  const phase3Pool = useMemo(() => candidates, [candidates]);
 
-  const [phase1Bookings, setPhase1Bookings] = useState(() => generateInterviewPhase(phase1Pool, members, [], "fase1", ["diretorId", "rhId"]));
+  const [phase1Bookings, setPhase1Bookings] = useState(() => generateInterviewPhase(phase1Pool, members, [], "fase1", ["diretorId", "supervisorId", "rhId"]));
   const [phase2Groups, setPhase2Groups] = useState(() => generatePhase2(phase2Pool, members));
   const [phase3Bookings, setPhase3Bookings] = useState(() => generateInterviewPhase(phase3Pool, members, [], "fase3", ["diretorId", "rhId", "supervisorId"]));
 
@@ -2476,12 +2984,12 @@ export default function App() {
         {page === "fase1" && (
           <InterviewPhasePage
             title="Fase 2 — Entrevista de Soft Skills"
-            subtitle="Candidato + Diretor do Departamento + 1 Membro RH — cruzamento de disponibilidades (Forms Fase 2 ∩ Excel Mestre)."
+            subtitle="Candidato + Diretor(a) + Supervisor(a) + 1 Membro RH do Departamento — cruzamento exato entre 4 intervenientes (Forms Fase 2 ∩ Excel Mestre)."
             phaseKey="fase1" availField="fase1" formsField="fase1" prevStatusField="phase0Status"
             candidates={candidates} setCandidates={setCandidates} members={members}
             bookings={phase1Bookings} setBookings={setPhase1Bookings}
-            onGenerate={() => setPhase1Bookings(generateInterviewPhase(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "rhId"]))}
-            columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }]}
+            onGenerate={() => setPhase1Bookings(generateInterviewPhase(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "supervisorId", "rhId"]))}
+            columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "supervisorId", label: "Supervisor" }, { key: "rhId", label: "RH" }]}
             showCalendar={false}
             excludeTalentPool
           />
