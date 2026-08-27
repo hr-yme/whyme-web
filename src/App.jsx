@@ -110,6 +110,10 @@ const ORG = [
   { dept: "Sales & Commercial", diretor: "Tomás Costa", supervisor: "Inês Costa", supervisorTitle: "CMO", rh: ["Catarina Lamego"] },
 ];
 const DEPARTMENTS = ORG.map((o) => o.dept);
+// Opção "sem filtro" do seletor de Departamento nas fases individuais
+// (Soft Skills / Hard Skills — não nas Dinâmicas de Grupo, que continuam a
+// juntar candidatos de vários departamentos por desenho).
+const ALL_DEPARTMENTS_OPTION = "Todos os Departamentos";
 
 // Constrói os membros base (Diretor/Supervisor/RH) diretamente da estrutura
 // organizacional fixa (ORG) — GARANTE que a associação Departamento ->
@@ -2077,6 +2081,29 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
   return bookings;
 }
 
+// Regenera o agendamento de UMA fase individual apenas para um
+// DEPARTAMENTO (ou para todos, com ALL_DEPARTMENTS_OPTION) sem apagar os
+// agendamentos já existentes dos restantes departamentos — CORREÇÃO: como
+// generateInterviewPhase() só devolve registos para quem está no `pool`
+// que recebe, gerar diretamente com um pool filtrado por departamento e
+// usar esse resultado para SUBSTITUIR o estado inteiro apagaria os
+// agendamentos de todos os outros departamentos (que não fariam parte
+// desse pool mais pequeno). Esta função isola a regeneração ao
+// departamento escolhido: filtra o pool E os `existingBookings` (para que
+// os agendamentos MANUAIS desse departamento sejam preservados, tal como
+// generateInterviewPhase já faz), gera só para esse subconjunto, e depois
+// funde o resultado com os agendamentos dos OUTROS departamentos que já
+// existiam, deixando-os intocados.
+function regenerateForDepartment(pool, members, existingBookings, availField, staffKeys, department) {
+  const targetPool = department === ALL_DEPARTMENTS_OPTION ? pool : pool.filter((c) => c.department === department);
+  const targetIds = new Set(targetPool.map((c) => c.id));
+  const regenerated = generateInterviewPhase(
+    targetPool, members, existingBookings.filter((b) => targetIds.has(b.candidateId)), availField, staffKeys
+  );
+  const untouched = existingBookings.filter((b) => !targetIds.has(b.candidateId));
+  return [...untouched, ...regenerated];
+}
+
 function generatePhase2(pool, members) {
   const buckets = {};
   DEPARTMENTS.forEach((d) => (buckets[d] = pool.filter((c) => c.department === d).slice()));
@@ -3007,12 +3034,22 @@ function InterviewPhasePage({
 }) {
   const [editing, setEditing] = useState(null);
   const [view, setView] = useState("list");
+  // Requisito 1 (agendamento isolado por departamento): seletor local a
+  // esta fase — cada separador (Soft Skills, Hard Skills) tem o seu
+  // próprio filtro, começando sempre em "Todos os Departamentos".
+  const [departmentFilter, setDepartmentFilter] = useState(ALL_DEPARTMENTS_OPTION);
 
   const byId = (id) => members.find((m) => m.id === id);
   const candById = (id) => candidates.find((c) => c.id === id);
 
-  const scheduled = bookings.filter((b) => b.status === "Agendado").length;
-  const conflicts = bookings.filter((b) => b.status !== "Agendado").length;
+  // Departamentos DETETADOS nos ficheiros carregados (não a lista fixa de
+  // 6 departamentos "possíveis") — só aparecem no dropdown os que
+  // realmente têm candidatos nesta fase.
+  const availableDepartments = useMemo(
+    () => Array.from(new Set(candidates.map((c) => c.department).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [candidates]
+  );
+
   // REMOÇÃO DA TRAVA DE VISIBILIDADE: já não se filtra por
   // `c[prevStatusField] === "Aprovado"` — todos os candidatos do
   // departamento (exceto Fast-Track da Talent Pool na Fase 2, que segue
@@ -3024,7 +3061,15 @@ function InterviewPhasePage({
   // isso não devem contar como "elegível" nem aparecer como "À espera do
   // Forms". Com 74 candidatos, 11 Rejeitados na Fase 1 e 9 da Talent Pool,
   // isto dá exatamente os 54 elegíveis da Fase 2.
-  const eligible = candidates.filter((c) => (!excludeTalentPool || !c.veioTalentPool) && c[prevStatusField] !== "Rejeitado");
+  // Requisito 2: quando um departamento está selecionado, "elegível"
+  // passa a significar "elegível E desse departamento" — filtra tanto os
+  // candidatos como (indiretamente, via generateInterviewPhase já ser
+  // department-aware) os avaliadores cruzados.
+  const eligible = candidates.filter((c) =>
+    (!excludeTalentPool || !c.veioTalentPool) &&
+    c[prevStatusField] !== "Rejeitado" &&
+    (departmentFilter === ALL_DEPARTMENTS_OPTION || c.department === departmentFilter)
+  );
   // "À espera do Forms" só faz sentido dentro do próprio conjunto de
   // elegíveis — antes contava TODOS os candidatos (incluindo Rejeitados/
   // Talent Pool), o que inflacionava este número mesmo com 100% das
@@ -3032,29 +3077,43 @@ function InterviewPhasePage({
   const missingForms = eligible.filter((c) => !c.formsSubmitted[formsField]).length;
   const availabilityConfirmed = eligible.filter((c) => (c.availabilityStatus?.[formsField] || "nao_enviada") === "recebida").length;
 
+  // Requisito 3: a grelha/resumo final refletem só o departamento
+  // selecionado — `visibleBookings` filtra os agendamentos pelo
+  // departamento do respetivo candidato. Com "Todos os Departamentos"
+  // continua a mostrar tudo (cada linha já tem o seu próprio DeptBadge,
+  // dando a separação clara pedida sem precisar de agrupar por secções).
+  const visibleBookings = departmentFilter === ALL_DEPARTMENTS_OPTION
+    ? bookings
+    : bookings.filter((b) => candById(b.candidateId)?.department === departmentFilter);
+
+  const scheduled = visibleBookings.filter((b) => b.status === "Agendado").length;
+  const conflicts = visibleBookings.filter((b) => b.status !== "Agendado").length;
+
   // DIAGNÓSTICO AGREGADO (requisito 3): quando NENHUMA entrevista fica
   // agendada, mostra logo no topo um resumo dos motivos mais comuns em vez
   // de obrigar o RH a passar o rato linha a linha — cada `b.reason`
   // (calculado em generateInterviewPhase) já identifica exatamente quem
   // falhou no cruzamento (Diretor/RH sem departamento associado, sem
-  // horários no Excel Mestre, ou sem interseção de facto).
+  // horários no Excel Mestre, ou sem interseção de facto). Calculado sobre
+  // `visibleBookings`, para o resumo bater com o departamento selecionado.
   const failureReasonCounts = {};
-  bookings.forEach((b) => { if (b.reason) failureReasonCounts[b.reason] = (failureReasonCounts[b.reason] || 0) + 1; });
+  visibleBookings.forEach((b) => { if (b.reason) failureReasonCounts[b.reason] = (failureReasonCounts[b.reason] || 0) + 1; });
   const topFailureReasons = Object.entries(failureReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
 
   const setAvailability = (candId, value) => {
     setCandidates((prev) => prev.map((c) => (c.id === candId ? { ...c, availabilityStatus: { ...c.availabilityStatus, [formsField]: value } } : c)));
   };
 
-  const { page, setPage, totalPages, pageItems } = usePagination(bookings, 12, bookings.length);
+  const { page, setPage, totalPages, pageItems } = usePagination(visibleBookings, 12, visibleBookings.length);
 
   const exportCSV = () => {
     const header = ["Candidato", "Departamento", ...columns.map((c) => c.label), "Horário", "Estado"];
-    const rows = bookings.map((b) => {
+    const rows = visibleBookings.map((b) => {
       const cand = candById(b.candidateId);
       return [cand?.name, cand?.department, ...columns.map((c) => byId(b[c.key])?.name || "—"), b.slot || "—", b.status];
     });
-    downloadCSV(`${phaseKey}-agendamentos.csv`, [header, ...rows]);
+    const deptSuffix = departmentFilter === ALL_DEPARTMENTS_OPTION ? "" : `-${slugify(departmentFilter)}`;
+    downloadCSV(`${phaseKey}-agendamentos${deptSuffix}.csv`, [header, ...rows]);
   };
 
   return (
@@ -3065,6 +3124,18 @@ function InterviewPhasePage({
           <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>{subtitle}</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* Requisito 1: dropdown de Departamento — lista automaticamente
+              os departamentos detetados em `candidates`, com "Todos os
+              Departamentos" como opção por defeito. */}
+          <select
+            value={departmentFilter}
+            onChange={(e) => setDepartmentFilter(e.target.value)}
+            className="yme-input text-sm rounded-lg px-3 py-2"
+            aria-label="Filtrar por departamento"
+          >
+            <option value={ALL_DEPARTMENTS_OPTION}>{ALL_DEPARTMENTS_OPTION}</option>
+            {availableDepartments.map((d) => <option key={d} value={d}>{d}</option>)}
+          </select>
           {showCalendar && (
             <div className="flex rounded-lg overflow-hidden text-sm" style={{ border: `1px solid ${hexToRgba(COLORS.mint, 0.25)}` }}>
               <button onClick={() => setView("list")} className="px-3 py-2 flex items-center gap-1.5" style={view === "list" ? { backgroundColor: COLORS.pink, color: COLORS.navy } : { backgroundColor: "transparent", color: "#94a3b8" }}><ListChecks size={14} /> Lista</button>
@@ -3074,17 +3145,17 @@ function InterviewPhasePage({
           <button onClick={exportCSV} className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2">
             <Download size={14} /> Exportar CSV
           </button>
-          <button onClick={onGenerate} className="yme-btn-primary flex items-center gap-1.5 text-sm rounded-lg px-3 py-2 font-medium">
+          <button onClick={() => onGenerate(departmentFilter)} className="yme-btn-primary flex items-center gap-1.5 text-sm rounded-lg px-3 py-2 font-medium">
             <RefreshCw size={14} /> Gerar Agendamentos Automaticamente
           </button>
         </div>
       </div>
 
-      {bookings.length > 0 && scheduled === 0 && (
+      {visibleBookings.length > 0 && scheduled === 0 && (
         <div className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-6" style={{ backgroundColor: hexToRgba("#c0227a", 0.08), borderColor: hexToRgba("#c0227a", 0.3) }}>
           <AlertTriangle size={16} className="shrink-0 mt-0.5" style={{ color: "#c0227a" }} />
           <div className="text-xs leading-relaxed" style={{ color: COLORS.navy }}>
-            <p className="font-semibold mb-1">Nenhum horário comum encontrado para nenhum candidato desta fase.</p>
+            <p className="font-semibold mb-1">Nenhum horário comum encontrado para nenhum candidato {departmentFilter === ALL_DEPARTMENTS_OPTION ? "desta fase" : `de "${departmentFilter}"`}.</p>
             {topFailureReasons.length > 0 ? (
               <ul className="space-y-0.5">
                 {topFailureReasons.map(([reason, n]) => (
@@ -3101,6 +3172,7 @@ function InterviewPhasePage({
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: COLORS.mint, color: COLORS.navy }}>
           <UsersRound size={13} /> {title.split("—")[0].trim()}: {eligible.length} Candidato(s)
+          {departmentFilter !== ALL_DEPARTMENTS_OPTION && ` · ${departmentFilter}`}
         </span>
         <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: availabilityConfirmed === eligible.length && eligible.length > 0 ? "#bbf7d0" : COLORS.mint, color: COLORS.navy }}>
           <FileClock size={13} /> {availabilityConfirmed}/{eligible.length} Disponibilidades Recebidas
@@ -3146,13 +3218,13 @@ function InterviewPhasePage({
         </table>
       </div>
 
-      {bookings.length === 0 && (
+      {visibleBookings.length === 0 && (
         <div className="rounded-xl border border-dashed p-10 text-center text-sm" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.2), color: hexToRgba(COLORS.navy, 0.5) }}>
-          Ainda não há candidatos para agendar nesta fase.
+          Ainda não há candidatos para agendar {departmentFilter === ALL_DEPARTMENTS_OPTION ? "nesta fase" : `em "${departmentFilter}"`}.
         </div>
       )}
 
-      {bookings.length > 0 && view === "list" && (
+      {visibleBookings.length > 0 && view === "list" && (
         <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.1) }}>
           <table className="w-full text-sm">
             <thead>
@@ -3188,8 +3260,8 @@ function InterviewPhasePage({
         </div>
       )}
 
-      {bookings.length > 0 && view === "calendar" && (
-        <CalendarView bookings={bookings} candById={candById} byId={byId} columns={columns} />
+      {visibleBookings.length > 0 && view === "calendar" && (
+        <CalendarView bookings={visibleBookings} candById={candById} byId={byId} columns={columns} />
       )}
 
       {editing && (
@@ -3714,7 +3786,7 @@ export default function App() {
             phaseKey="fase1" availField="fase1" formsField="fase1" prevStatusField="phase0Status"
             candidates={candidates} setCandidates={setCandidates} members={members}
             bookings={phase1Bookings} setBookings={setPhase1Bookings}
-            onGenerate={() => setPhase1Bookings(generateInterviewPhase(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "rhId"]))}
+            onGenerate={(dept) => setPhase1Bookings(regenerateForDepartment(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "rhId"], dept))}
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }]}
             showCalendar={false}
             excludeTalentPool
@@ -3734,7 +3806,7 @@ export default function App() {
             phaseKey="fase3" availField="fase3" formsField="fase3" prevStatusField="phase2Status"
             candidates={candidates} setCandidates={setCandidates} members={members}
             bookings={phase3Bookings} setBookings={setPhase3Bookings}
-            onGenerate={() => setPhase3Bookings(generateInterviewPhase(phase3Pool, members, phase3Bookings, "fase3", ["diretorId", "rhId", "supervisorId"]))}
+            onGenerate={(dept) => setPhase3Bookings(regenerateForDepartment(phase3Pool, members, phase3Bookings, "fase3", ["diretorId", "rhId", "supervisorId"], dept))}
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }, { key: "supervisorId", label: "Supervisor" }]}
             showCalendar={true}
           />
