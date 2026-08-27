@@ -273,6 +273,75 @@ function get(row, ...keys) {
   }
   return "";
 }
+
+// Limpa o CONTEÚDO BRUTO de uma célula (nome, email, disponibilidade, etc.)
+// antes de qualquer trim/parse: remove caracteres invisíveis comuns em
+// exports de Google/Microsoft Forms — zero-width space/joiner (\u200B-
+// \u200D), BOM (\uFEFF) — troca espaço inseparável (NBSP, \u00A0) por um
+// espaço normal, normaliza quebras de linha "\r\n"/"\r" para "\n", e só
+// depois apara os espaços nas pontas. CORREÇÃO: estes caracteres são
+// invisíveis no Excel/Sheets mas sobrevivem à exportação — uma célula que
+// parece vazia ("Segunda 09:00\r\n") ou um "N/A" com um NBSP a seguir
+// passavam incólumes por um simples `.trim()` e faziam o parser falhar
+// silenciosamente em linhas que, a olho nu, pareciam perfeitamente normais.
+function cleanCellText(raw) {
+  return String(raw ?? "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+}
+
+// Respostas explícitas de "não tenho disponibilidade" — o candidato
+// respondeu ao Forms, mas para dizer que não tem nenhum horário possível
+// (ou a pergunta não se aplica). Isto é uma resposta VÁLIDA, não um erro de
+// leitura: o candidato deve continuar a ser aceite no sistema, só que com
+// disponibilidade vazia ([]) nesse dia/campo — nunca contabilizado como
+// "linha sem horário reconhecido" (ver isNoAvailabilityResponse).
+const NO_AVAILABILITY_PHRASES = new Set([
+  "nao tenho disponibilidade", "sem disponibilidade", "indisponivel",
+  "nao disponivel", "n a", "na", "nenhum", "nenhuma",
+  "nenhum dos horarios", "nenhum dos horarios disponiveis",
+  "nenhuma das opcoes", "nenhuma opcao", "none", "n d", "nd", "-",
+]);
+// Devolve true se `raw` for uma célula em branco OU um dos textos acima —
+// ou seja, uma resposta que deve ser aceite com disponibilidade vazia, sem
+// disparar aviso de "horário não reconhecido".
+function isNoAvailabilityResponse(raw) {
+  const cleaned = cleanCellText(raw);
+  if (!cleaned) return true;
+  const norm = normKey(cleaned).replace(/[^a-z0-9]+/g, " ").trim();
+  return NO_AVAILABILITY_PHRASES.has(norm);
+}
+
+// Junta uma lista de valores em texto no formato "1, 2 e 3" (PT), usado
+// para listar números de linha / nomes de candidatos em avisos.
+function joinWithE(items) {
+  const arr = items.map(String);
+  if (arr.length <= 1) return arr.join("");
+  return `${arr.slice(0, -1).join(", ")} e ${arr[arr.length - 1]}`;
+}
+
+// Máximo de linhas listadas explicitamente no aviso de "sem horários
+// selecionados" — evita uma mensagem gigante quando muitas linhas têm o
+// mesmo problema; o resto fica resumido num "+N linha(s)".
+const MAX_WARNING_ROWS = 8;
+// Constrói a mensagem de aviso pedida: identifica exatamente QUAIS linhas/
+// candidatos ficaram sem nenhum horário reconhecido (nunca apenas uma
+// contagem), distinguindo isso de candidatos que simplesmente não
+// submeteram disponibilidade (esses nem entram nesta lista — ver
+// hasUnrecognizedContent em extractAvailabilityFromRow). `rows` é uma lista
+// de { rowNumber, name }.
+function buildUnrecognizedRowsWarning(rows) {
+  if (!rows.length) return null;
+  const shown = rows.slice(0, MAX_WARNING_ROWS);
+  const rowNumbers = joinWithE(shown.map((r) => r.rowNumber));
+  const names = shown.map((r) => r.name).join(", ");
+  const extra = rows.length > MAX_WARNING_ROWS ? ` (+ ${rows.length - MAX_WARNING_ROWS} linha(s) adicional(is))` : "";
+  const plural = rows.length > 1;
+  return `Linha${plural ? "s" : ""} ${rowNumbers} (${names})${extra} sem horários selecionados — confirma o formato dessas células (coluna por slot, "Dia Hora" numa coluna por dia, ou texto livre "Seg 09:00 | Ter 10:30").`;
+}
+
 // Valores de erro típicos de fórmulas do Excel/Sheets (ex.: candidato ainda
 // não chegou a essa fase -> a fórmula devolve #N/A) ou de células vazias.
 // Estes NÃO são nomes/emails válidos e devem ser tratados como "slot ainda
@@ -289,6 +358,7 @@ function matchDept(raw) {
   if (!norm) return null;
   return DEPARTMENTS.find((d) => normKey(d).replace(/[^a-z0-9]+/g, " ").trim() === norm) || null;
 }
+
 
 // Encontra o índice de um membro (Diretor/Supervisor/RH) já existente pelo
 // Nome, usando normKey() (trim + lowercase + sem acentos + espaços
@@ -587,6 +657,24 @@ function isPositiveMark(val) {
   const v = String(val ?? "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   if (!v) return false;
   return ["x", "sim", "true", "verdadeiro", "1", "aprovado", "selecionado", "apto", "avanca", "yes", "✓", "v", "☑", "☒"].includes(v);
+}
+// Extensão de isPositiveMark() específica para MARCAÇÃO DE DISPONIBILIDADE
+// em colunas-grelha (uma coluna = um slot exato, ex. "Seg 09:00"): além dos
+// valores positivos já reconhecidos globalmente (x, sim, true, 1, ✓, etc.),
+// aceita também "Disponível"/"disponivel" e "Check", e ainda o caso em que
+// o candidato escreveu a PRÓPRIA HORA na célula em vez de um "x" (ex. a
+// célula da coluna "Seg 09:00" contém literalmente "09:00" ou "9h"). Estes
+// dois casos extra são específicos de respostas de disponibilidade — por
+// isso ficam isolados aqui, em vez de serem acrescentados a isPositiveMark()
+// globalmente (que também é usada para aprovações de fase, onde não fazem
+// sentido).
+function isAvailabilityPositiveMark(val) {
+  const cleaned = cleanCellText(val);
+  if (isPositiveMark(cleaned)) return true;
+  const norm = normKey(cleaned).replace(/[^a-z0-9]/g, "");
+  if (["disponivel", "check"].includes(norm)) return true;
+  const { inicio } = parseTimeToMinutes(cleaned);
+  return inicio !== null;
 }
 // "pending" = célula vazia (ainda sem decisão); "positive"/"negative" = célula preenchida.
 function cellStatus(val) {
@@ -1041,7 +1129,8 @@ function parseAvailabilityCell(cellText, dayHint) {
 // Mestre / exports de Forms:
 // (a) colunas-grelha em que o próprio cabeçalho é um slot exato (ex.:
 //     "Seg 09:00", "Segunda-feira, 09:00 - 09:30") marcado com um valor
-//     positivo (x/sim/verdadeiro/1/☑)
+//     positivo (x/sim/verdadeiro/1/☑/disponível/check/a própria hora — ver
+//     isAvailabilityPositiveMark)
 // (b) colunas-grelha em que o cabeçalho contém o nome do DIA — incluindo
 //     cabeçalhos duplicados com sufixo de secção do Forms, ex.
 //     "Quarta-feira, dia 10 de junho", "...  2", "...  3" — e a célula tem
@@ -1049,13 +1138,29 @@ function parseAvailabilityCell(cellText, dayHint) {
 //     "09:00, 10:30"). TODAS as colunas cujo cabeçalho contenha o mesmo dia
 //     são lidas e unificadas no mesmo array — cada candidato só preenche a
 //     secção do SEU departamento, pelo que as restantes ficam vazias e são
-//     ignoradas (`if (cell)`), sem perder a que estiver preenchida.
-// (c) uma coluna de texto livre "Disponibilidade" com um ou mais dias e
-//     intervalos, separados por | ; , ou quebras de linha
+//     ignoradas, sem perder a que estiver preenchida.
+// (c)/(d) uma coluna de texto livre ("Disponibilidade", ou qualquer outra
+//     cujo cabeçalho não indique dia/hora) com um ou mais dias e
+//     intervalos, separados por | ; , ou quebras de linha, ex. "Seg 09:00
+//     | Ter 10:30", "Qui 14h-15h30".
 // `rowObj` é um objeto simples { "Nome da Coluna": valor, ... } — tanto faz
 // vir da leitura do Google Sheets (row.obj) como do xlsx.utils.sheet_to_json
 // (linha já vem nesse formato), por isso esta função serve para os dois
 // caminhos de importação (sincronização automática e upload manual de Forms).
+//
+// Devolve { slots, hasUnrecognizedContent }, em vez de só o array de slots:
+// `hasUnrecognizedContent` distingue duas situações que ANTES eram tratadas
+// da mesma forma (disponibilidade vazia == "linha sem horário reconhecido",
+// e portanto um aviso/erro) mas que na prática são bem diferentes:
+//   - o candidato respondeu explicitamente "Não tenho disponibilidade",
+//     "N/A", "Nenhum(a)" ou deixou a célula em branco -> resposta VÁLIDA,
+//     disponibilidade fica [] nesse campo, `hasUnrecognizedContent` NÃO é
+//     marcado (nada de errado a reportar);
+//   - o candidato escreveu qualquer outra coisa numa coluna reconhecida de
+//     disponibilidade (dia isolado ou campo de texto livre) e essa coisa
+//     não bateu com nenhum formato suportado -> aí sim é um problema real
+//     de formato, e `hasUnrecognizedContent` fica true, para o chamador
+//     poder avisar exatamente quais as linhas afetadas.
 function extractAvailabilityFromRow(header, rowObj) {
   // Pré-passo: regista no mapa DAY_NUMBER_TO_WEEKDAY qualquer par
   // "dia da semana + data" encontrado nos cabeçalhos ANTES de extrair
@@ -1068,19 +1173,27 @@ function extractAvailabilityFromRow(header, rowObj) {
   header.forEach(registerDayNumberMapping);
 
   const slots = new Set();
+  let hasUnrecognizedContent = false;
   header.forEach((h) => {
-    // (a) cabeçalho é um slot exato ("Seg 09:00") marcado x/sim/true/1/☑
+    // (a) cabeçalho é um slot exato ("Seg 09:00") marcado x/sim/true/1/☑/
+    //     disponível/check/a própria hora
     const exactSlot = normalizeSlotString(h);
     if (exactSlot) {
-      if (isPositiveMark(rowObj[h])) slots.add(exactSlot);
+      if (isAvailabilityPositiveMark(rowObj[h])) slots.add(exactSlot);
+      // célula vazia ou negativa aqui é uma resposta normal de checkbox
+      // (candidato não marcou ESTE slot específico) — não é conteúdo por
+      // reconhecer, por isso nunca marca hasUnrecognizedContent.
       return;
     }
     // (b) cabeçalho contém o nome do dia (com ou sem sufixo de secção); a
     // célula tem o(s) horário(s)/intervalo(s) em texto livre
     const dayOnly = normalizeDayOnlyHeader(h);
     if (dayOnly) {
-      const cell = String(rowObj[h] || "").trim();
-      if (cell) parseAvailabilityCell(cell, dayOnly).forEach((s) => slots.add(s));
+      const cell = cleanCellText(rowObj[h]);
+      if (isNoAvailabilityResponse(cell)) return; // em branco ou "N/A"/"Nenhum" — aceite, sem disponibilidade nesse dia
+      const found = parseAvailabilityCell(cell, dayOnly);
+      found.forEach((s) => slots.add(s));
+      if (!found.length) hasUnrecognizedContent = true; // havia texto, não era "sem disponibilidade", e não deu para interpretar
       return;
     }
     // (d) FALLBACK — o cabeçalho não indica nem dia nem hora (pergunta de
@@ -1088,17 +1201,29 @@ function extractAvailabilityFromRow(header, rowObj) {
     // ex. "Quais os teus horários disponíveis?"): em vez de descartar a
     // coluna, tenta interpretar o CONTEÚDO da célula como uma lista de
     // slots "Dia Hora" separados por | ; , ou quebra de linha (ex.: "Seg
-    // 09:00 | Ter 10:30"), sem depender do nome da coluna — cada item é
-    // resolvido pelo próprio parseAvailabilityRanges (via
-    // parseAvailabilityCell sem dayHint), que só produz slot se o item
-    // começar por um dia reconhecível, pelo que colunas verdadeiramente
-    // não relacionadas (nome, email, etc.) não geram falsos positivos.
-    const cell = String(rowObj[h] || "").trim();
-    if (cell) parseAvailabilityCell(cell).forEach((s) => slots.add(s));
+    // 09:00 | Ter 10:30", "Qui 14h-15h30") — sem depender do nome da
+    // coluna. Cada item só produz slot se começar por um dia reconhecível,
+    // pelo que colunas verdadeiramente não relacionadas (nome, email, "como
+    // conheceu a YME?", etc.) não geram falsos positivos — por isso, ao
+    // contrário do caso (b), uma coluna deste tipo sem nenhum slot NÃO é
+    // marcada como hasUnrecognizedContent (não sabemos se era suposto ser
+    // uma coluna de disponibilidade); só o campo livre "disponibilidade"
+    // explícito, tratado a seguir, é que conta para esse aviso.
+    const cell = cleanCellText(rowObj[h]);
+    if (cell && !isNoAvailabilityResponse(cell)) {
+      parseAvailabilityCell(cell).forEach((s) => slots.add(s));
+    }
   });
-  const free = String(get(rowObj, "disponibilidade", "horarios", "horários", "slots") || "");
-  parseAvailabilityCell(free).forEach((s) => slots.add(s));
-  return Array.from(slots).sort((a, b) => SLOTS.indexOf(a) - SLOTS.indexOf(b));
+  const free = cleanCellText(get(rowObj, "disponibilidade", "horarios", "horários", "slots"));
+  if (!isNoAvailabilityResponse(free)) {
+    const found = parseAvailabilityCell(free);
+    found.forEach((s) => slots.add(s));
+    if (!found.length) hasUnrecognizedContent = true;
+  }
+  return {
+    slots: Array.from(slots).sort((a, b) => SLOTS.indexOf(a) - SLOTS.indexOf(b)),
+    hasUnrecognizedContent,
+  };
 }
 
 // Aplica os dados brutos das abas do Excel Mestre ao estado de members/candidates
@@ -1151,7 +1276,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     (tab?.rows || []).forEach((row) => {
       const name = String(get(row.obj, "nome", "name") || "").trim();
       if (!name) return;
-      const slots = extractAvailabilityFromRow(tab.header, row.obj);
+      const { slots } = extractAvailabilityFromRow(tab.header, row.obj);
       if (!slots.length) return;
       const idx = findMemberIndex(members, name);
       if (idx >= 0) {
@@ -2022,19 +2147,19 @@ function ImportHubPage({
       wb.SheetNames.forEach((sheetName) => {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
         rows.forEach((row) => {
-          const name = String(get(row, "nome", "name")).trim();
+          const name = cleanCellText(get(row, "nome", "name"));
           if (!name) return;
-          let role = String(get(row, "role", "cargo")).trim();
+          let role = cleanCellText(get(row, "role", "cargo"));
           if (!role) {
             if (/diretor/i.test(sheetName)) role = "Diretor";
             else if (/rh|recursos/i.test(sheetName)) role = "RH";
             else if (/supervisor|c-level|clevel/i.test(sheetName)) role = "Supervisor";
           }
-          const deptsRaw = String(get(row, "departamentos", "departamento")).split(/[,;|]/).map((s) => matchDept(s)).filter(Boolean);
+          const deptsRaw = cleanCellText(get(row, "departamentos", "departamento")).split(/[,;|]/).map((s) => matchDept(s)).filter(Boolean);
           // Mesma correção: usa o parser tolerante (grelha OU texto livre,
           // com normalização de dia/hora) em vez de exigir texto livre no
           // formato exato "Seg 09:00|Ter 14:00".
-          const availRaw = extractAvailabilityFromRow(Object.keys(row), row);
+          const { slots: availRaw } = extractAvailabilityFromRow(Object.keys(row), row);
           const idx = findMemberIndex(next, name);
           count++;
           if (idx >= 0) {
@@ -2058,26 +2183,39 @@ function ImportHubPage({
     const wb = await readWorkbook(file);
     const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
     let count = 0;
-    let rowsWithoutAvailability = 0;
+    // Linhas onde HAVIA texto de disponibilidade mas nenhum slot foi
+    // reconhecido — diferente de candidatos que não submeteram nada ou
+    // responderam explicitamente "não tenho disponibilidade" (esses são
+    // aceites normalmente, com disponibilidade [], sem entrar aqui — ver
+    // isNoAvailabilityResponse/hasUnrecognizedContent). `rowNumber` conta a
+    // partir de 2 porque a linha 1 da folha é o cabeçalho.
+    const unrecognizedRows = [];
     setCandidates((prev) => {
       const next = [...prev];
-      rows.forEach((row) => {
-        const name = String(get(row, "nome", "name")).trim();
+      rows.forEach((row, i) => {
+        const rowNumber = i + 2;
+        // Requisito 1: cada célula lida (nome/email/departamento) passa por
+        // cleanCellText — remove \r, \n e caracteres invisíveis antes do
+        // trim, para que uma resposta com uma quebra de linha a mais nunca
+        // pareça diferente de uma sem ela.
+        const name = cleanCellText(get(row, "nome", "name"));
         if (!name) return;
         const department = matchDept(get(row, "departamento", "department"));
-        const email = String(get(row, "email")).trim();
+        const email = cleanCellText(get(row, "email"));
         // CORREÇÃO: antes só se lia uma única coluna de texto livre
         // ("Disponibilidade"/"Horários"/"Slots") com formato fixo. Exports
         // reais do Google/Microsoft Forms costumam vir em formato de
         // GRELHA (uma coluna por slot, ex. "Segunda-feira, 09:00 - 09:30"),
         // exatamente como já era suportado para a disponibilidade de
         // Diretores/Supervisores/RH — extractAvailabilityFromRow() agora é
-        // partilhada por ambos os caminhos e tolera variações de dia/hora
-        // (ver normalizeSlotString). Isto é o que fazia o dashboard mostrar
-        // "Recebida" (o nome/email foram lidos) mas 0 entrevistas agendadas
-        // (o array de disponibilidade ficava sempre vazio).
-        const availability = extractAvailabilityFromRow(Object.keys(row), row);
-        if (!availability.length) rowsWithoutAvailability++;
+        // partilhada por ambos os caminhos, tolera variações de dia/hora
+        // (ver normalizeSlotString/normalizeDayOnlyHeader) e distingue
+        // "sem disponibilidade" de "formato não reconhecido" (ver
+        // hasUnrecognizedContent, requisito 1 e 3 do pedido).
+        const { slots: availability, hasUnrecognizedContent } = extractAvailabilityFromRow(Object.keys(row), row);
+        if (!availability.length && hasUnrecognizedContent) {
+          unrecognizedRows.push({ rowNumber, name });
+        }
         const idx = matchCandidateIndex(next, name, email);
         count++;
         if (idx >= 0) {
@@ -2087,7 +2225,17 @@ function ImportHubPage({
             email: email || next[idx].email,
             formsSubmitted: { ...next[idx].formsSubmitted, [phaseKey]: true },
             availabilityStatus: { ...next[idx].availabilityStatus, [phaseKey]: "recebida" },
-            availability: { ...next[idx].availability, [phaseKey]: availability.length ? availability : next[idx].availability[phaseKey] },
+            // Requisito 1: um candidato que respondeu "N/A"/"Nenhum"/deixou
+            // em branco é aceite normalmente com [] — essa resposta é
+            // válida e substitui qualquer valor anterior. Já um formato
+            // realmente não reconhecido (hasUnrecognizedContent) preserva o
+            // valor anterior em vez de o apagar, para uma reimportação com
+            // um ficheiro com problemas não destruir disponibilidade boa já
+            // lida antes.
+            availability: {
+              ...next[idx].availability,
+              [phaseKey]: (!availability.length && hasUnrecognizedContent) ? next[idx].availability[phaseKey] : availability,
+            },
           };
         } else {
           next.push({
@@ -2115,13 +2263,13 @@ function ImportHubPage({
       ...prev,
       [phaseKey]: {
         loaded: true, filename: file.name, count,
-        // Aviso explícito quando o nome/email foi lido mas nenhum slot foi
-        // reconhecido — sinal de que os cabeçalhos do ficheiro não batem
-        // certo com nenhum dos 5 horários oficiais (TIMES), em vez de
-        // falhar silenciosamente como antes.
-        warning: rowsWithoutAvailability > 0
-          ? `${rowsWithoutAvailability} de ${count} linha(s) sem nenhum horário reconhecido — confirma se os cabeçalhos das colunas de disponibilidade correspondem aos 5 horários oficiais (${TIMES.join(", ")}) para algum dos 5 dias (${DAYS.join(", ")}).`
-          : null,
+        // Requisito 3: em vez de uma contagem genérica, identifica
+        // exatamente quais linhas/candidatos ficaram sem nenhum horário
+        // reconhecido — e só entram aqui os casos de formato realmente não
+        // suportado, nunca os candidatos que legitimamente não submeteram
+        // disponibilidade (em branco ou "Não tenho disponibilidade"/"N/A"/
+        // "Nenhum", que são aceites em silêncio com []).
+        warning: buildUnrecognizedRowsWarning(unrecognizedRows),
       },
     }));
   };
