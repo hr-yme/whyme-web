@@ -2706,9 +2706,18 @@ function InterviewPhasePage({
   // departamento (exceto Fast-Track da Talent Pool na Fase 2, que segue
   // rota própria) aparecem sempre na tabela, independentemente de ainda
   // não terem submetido o Forms desta fase ou da validação da fase
-  // anterior.
-  const eligible = candidates.filter((c) => !excludeTalentPool || !c.veioTalentPool);
-  const missingForms = candidates.filter((c) => !c.formsSubmitted[formsField]).length;
+  // anterior. CORREÇÃO DA MATEMÁTICA DO FUNIL: continua sem exigir
+  // "Aprovado", mas passa a excluir quem já ficou "Rejeitado" na fase
+  // anterior (`prevStatusField`) — esses nunca chegam a esta fase, e por
+  // isso não devem contar como "elegível" nem aparecer como "À espera do
+  // Forms". Com 74 candidatos, 11 Rejeitados na Fase 1 e 9 da Talent Pool,
+  // isto dá exatamente os 54 elegíveis da Fase 2.
+  const eligible = candidates.filter((c) => (!excludeTalentPool || !c.veioTalentPool) && c[prevStatusField] !== "Rejeitado");
+  // "À espera do Forms" só faz sentido dentro do próprio conjunto de
+  // elegíveis — antes contava TODOS os candidatos (incluindo Rejeitados/
+  // Talent Pool), o que inflacionava este número mesmo com 100% das
+  // respostas dos elegíveis já recebidas.
+  const missingForms = eligible.filter((c) => !c.formsSubmitted[formsField]).length;
   const availabilityConfirmed = eligible.filter((c) => (c.availabilityStatus?.[formsField] || "nao_enviada") === "recebida").length;
 
   const setAvailability = (candId, value) => {
@@ -3312,11 +3321,18 @@ export default function App() {
   // Fast-Track salta a Fase 2 e só entra a partir da Fase 3) — não é uma
   // validação de etapa a esconder candidatos, é o próprio fluxo desses
   // candidatos.
-  const phase1Pool = useMemo(() => candidates.filter((c) => !c.veioTalentPool), [candidates]);
+  // CORREÇÃO DA MATEMÁTICA DO FUNIL: além da Talent Pool, exclui também
+  // quem já foi Rejeitado na Fase 1 (phase0Status) — esses nunca chegam à
+  // Fase 2. Com 74 candidatos, 11 Rejeitados e 9 da Talent Pool, sobram
+  // exatamente os 54 elegíveis pedidos.
+  const phase1Pool = useMemo(
+    () => candidates.filter((c) => !c.veioTalentPool && c.phase0Status !== "Rejeitado"),
+    [candidates]
+  );
   const phase2Pool = useMemo(() => candidates.filter((c) => c.phase1Status === "Aprovado"), [candidates]);
   const phase3Pool = useMemo(() => candidates, [candidates]);
 
-  const [phase1Bookings, setPhase1Bookings] = useState(() => generateInterviewPhase(phase1Pool, members, [], "fase1", ["diretorId", "supervisorId", "rhId"]));
+  const [phase1Bookings, setPhase1Bookings] = useState(() => generateInterviewPhase(phase1Pool, members, [], "fase1", ["diretorId", "rhId"]));
   const [phase2Groups, setPhase2Groups] = useState(() => generatePhase2(phase2Pool, members));
   const [phase3Bookings, setPhase3Bookings] = useState(() => generateInterviewPhase(phase3Pool, members, [], "fase3", ["diretorId", "rhId", "supervisorId"]));
 
@@ -3347,12 +3363,12 @@ export default function App() {
         {page === "fase1" && (
           <InterviewPhasePage
             title="Fase 2 — Entrevista de Soft Skills"
-            subtitle="Candidato + Diretor(a) + Supervisor(a) + 1 Membro RH do Departamento — cruzamento exato entre 4 intervenientes (Forms Fase 2 ∩ Excel Mestre)."
+            subtitle="Candidato + Diretor(a) + 1 Membro RH do Departamento — cruzamento entre 3 intervenientes (Forms Fase 2 ∩ Excel Mestre)."
             phaseKey="fase1" availField="fase1" formsField="fase1" prevStatusField="phase0Status"
             candidates={candidates} setCandidates={setCandidates} members={members}
             bookings={phase1Bookings} setBookings={setPhase1Bookings}
-            onGenerate={() => setPhase1Bookings(generateInterviewPhase(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "supervisorId", "rhId"]))}
-            columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "supervisorId", label: "Supervisor" }, { key: "rhId", label: "RH" }]}
+            onGenerate={() => setPhase1Bookings(generateInterviewPhase(phase1Pool, members, phase1Bookings, "fase1", ["diretorId", "rhId"]))}
+            columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }]}
             showCalendar={false}
             excludeTalentPool
           />
