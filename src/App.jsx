@@ -1685,6 +1685,40 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
    SCHEDULING ALGORITHMS  (lógica inalterada)
 ============================================================================ */
 
+// Compara departamentos com tolerância — não exige igualdade exata mesmo
+// depois de normalizado. Cobre 3 situações reais do Excel Mestre:
+//  1) "Geral" ou SEM departamento definido -> conta como disponível para
+//     TODOS os departamentos (Diretor/RH partilhado, ou aba ainda por
+//     preencher corretamente);
+//  2) abreviatura por iniciais (ex. "QM" -> "Quality Management", "RH" não
+//     se aplica aqui pois é o próprio role, mas "BS" -> "Brand Strategy");
+//  3) nome parcial/prefixo (ex. "Quality" dentro de "Quality Management").
+// `.toLowerCase().trim()` já está embutido em deptKey() (via normKey), que
+// também remove acentos e colapsa espaços a mais.
+const CATCH_ALL_DEPT_KEYS = new Set([
+  "geral", "todos", "all", "any", "todososdepartamentos",
+  "qualquerdepartamento", "semdepartamento", "n a", "na",
+]);
+function deptAbbrev(name) {
+  return normKey(name).replace(/[^a-z ]/g, "").split(" ").filter(Boolean).map((w) => w[0]).join("");
+}
+function deptMatches(memberDeptRaw, targetDept) {
+  const memberKey = deptKey(memberDeptRaw);
+  if (!memberKey || CATCH_ALL_DEPT_KEYS.has(memberKey.replace(/\s+/g, ""))) return true;
+  const targetKey = deptKey(targetDept);
+  if (memberKey === targetKey) return true;
+  // Resolve o texto do membro para um dos 6 departamentos oficiais (mesma
+  // tolerância já usada no resto da app — matchDept) e compara os canónicos.
+  const resolved = matchDept(memberDeptRaw);
+  if (resolved && deptKey(resolved) === targetKey) return true;
+  // Abreviatura por iniciais (ex. "QM" -> "Quality Management").
+  if (memberKey.replace(/\s+/g, "") === deptAbbrev(targetDept)) return true;
+  // Nome parcial/prefixo (ex. "Quality" dentro de "Quality Management") —
+  // só a partir de 3 letras, para não confundir siglas curtas com o
+  // prefixo de outro departamento.
+  if (memberKey.length >= 3 && (targetKey.startsWith(memberKey) || memberKey.startsWith(targetKey))) return true;
+  return false;
+}
 // Compara departamentos ignorando maiúsculas/minúsculas, acentos e espaços
 // a mais — em vez de igualdade estrita de string (===/Array.includes).
 // Dois departamentos "iguais" mas escritos por fontes diferentes (Excel
@@ -1697,8 +1731,11 @@ function deptKey(d) {
   return normKey(d).replace(/[^a-z0-9]+/g, " ").trim();
 }
 function memberHasDept(member, dept) {
-  const key = deptKey(dept);
-  return (member.departments || []).some((d) => deptKey(d) === key);
+  const depts = member.departments || [];
+  // Sem NENHUM departamento definido -> tratado como "Geral", disponível
+  // para todos (ver CORREÇÃO DA TOLERÂNCIA DE DEPARTAMENTOS acima).
+  if (!depts.length) return true;
+  return depts.some((d) => deptMatches(d, dept));
 }
 // Lista de RH atribuídos a um departamento — SEM olhar a horários. Esta é
 // a "verdade" da coluna RH: sempre que não vier vazia, um candidato desse
@@ -1706,6 +1743,39 @@ function memberHasDept(member, dept) {
 // resultado do cruzamento de horários feito depois.
 function rhForDepartment(members, dept) {
   return members.filter((m) => m.role === "RH" && memberHasDept(m, dept));
+}
+
+// Converte um slot (canónico "Seg 09:00", ou qualquer outra representação
+// reconhecida por parseTimeToMinutes) em { day, startMin } — SEMPRE por
+// aritmética de minutos, nunca por igualdade de string. CORREÇÃO CRÍTICA:
+// comparar strings de hora diretamente ("9h-9h30" !== "09:00 - 09:00")
+// é frágil a qualquer diferença de formatação entre fontes (Forms vs Excel
+// Mestre vs edição manual) — mesmo pequenas variações invisíveis fazem o
+// cruzamento falhar por completo. slotToMinutes()/availabilityMinuteSet()/
+// hasSlot() garantem que a comparação de disponibilidade entre Candidato,
+// Diretor e RH é sempre feita em minutos desde a meia-noite.
+function slotToMinutes(slot) {
+  const s = String(slot || "");
+  const spaceIdx = s.indexOf(" ");
+  if (spaceIdx < 0) return null;
+  const day = s.slice(0, spaceIdx);
+  const { inicio } = parseTimeToMinutes(s.slice(spaceIdx + 1));
+  return inicio === null ? null : { day, startMin: inicio };
+}
+// Constrói um Set de chaves "Dia|minutos" a partir de uma lista de slots de
+// disponibilidade — usado para consultas O(1) por aritmética, em vez de
+// `.includes(slot)` (igualdade de string).
+function availabilityMinuteSet(slots) {
+  const set = new Set();
+  (slots || []).forEach((s) => {
+    const info = slotToMinutes(s);
+    if (info) set.add(`${info.day}|${info.startMin}`);
+  });
+  return set;
+}
+function hasSlot(minuteSet, slot) {
+  const info = slotToMinutes(slot);
+  return info ? minuteSet.has(`${info.day}|${info.startMin}`) : false;
 }
 
 function generateInterviewPhase(pool, members, existingBookings, availField, staffKeys) {
@@ -1720,6 +1790,16 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       busy[b[k]].add(b.slot);
     });
   });
+
+  // Cache de disponibilidade em minutos por membro (id -> Set "Dia|min"),
+  // calculada uma única vez por membro em vez de re-parsear a cada
+  // candidato — ver slotToMinutes/availabilityMinuteSet acima.
+  const minuteSetCache = new Map();
+  function minutesOf(member) {
+    if (!member) return null;
+    if (!minuteSetCache.has(member.id)) minuteSetCache.set(member.id, availabilityMinuteSet(member.availability));
+    return minuteSetCache.get(member.id);
+  }
 
   // PASSO 2 — DISTRIBUIÇÃO EQUITATIVA (ROUND-ROBIN) POR DEPARTAMENTO.
   // Um índice rotativo por departamento (não uma contagem de carga): avança
@@ -1752,9 +1832,9 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
 
     let found = null;
     for (const slot of c.availability[availField]) {
-      if (!diretor || !diretor.availability.includes(slot) || busy[diretor.id]?.has(slot)) continue;
+      if (!diretor || !hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) continue;
       if (staffKeys.includes("supervisorId")) {
-        if (!supervisor || !supervisor.availability.includes(slot) || busy[supervisor.id]?.has(slot)) continue;
+        if (!supervisor || !hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) continue;
       }
       // PASSO 3 — FALLBACK DE DISPONIBILIDADE: tenta primeiro o RH
       // atribuído pelo round-robin (`assignedRH`); só se ele não tiver
@@ -1762,7 +1842,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       // testam os restantes membros de RH do mesmo departamento, por
       // ordem, antes de desistir deste slot e passar ao seguinte.
       const rhCandidates = [assignedRH, ...rhList.filter((r) => r.id !== assignedRH?.id)].filter(Boolean);
-      const rh = rhCandidates.find((r) => r.availability.includes(slot) && !busy[r.id]?.has(slot));
+      const rh = rhCandidates.find((r) => hasSlot(minutesOf(r), slot) && !busy[r.id]?.has(slot));
       if (rh) { found = { slot, diretor, rh, supervisor }; break; }
     }
 
@@ -1778,6 +1858,27 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       // preencher e o Estado mantém "Sem Horário Comum".
       const record = { id: uid("bk"), candidateId: c.id, slot: null, diretorId: diretor?.id || null, rhId: assignedRH?.id || null, status: "Sem Horário Comum", manual: false };
       if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
+      // DIAGNÓSTICO (requisito 3): em vez de só "Sem Horário Comum" sem
+      // mais nenhuma pista, guarda no próprio registo qual foi exatamente
+      // o motivo — mostrado como tooltip no Estado (ver StatusBadge). A
+      // ordem dos testes segue a cadeia de dependências reais do
+      // cruzamento: primeiro se sequer existe Diretor/RH para o
+      // departamento, depois se algum deles tem disponibilidade nenhuma
+      // registada, e só por fim (o caso mais comum) se não há
+      // interseção de horários entre quem já existe.
+      let reason;
+      if (!diretor) {
+        reason = `Nenhum(a) Diretor(a) associado ao departamento "${c.department}" no Excel Mestre.`;
+      } else if (!minutesOf(diretor).size) {
+        reason = `Diretor(a) ${diretor.name} sem horários registados no Excel Mestre.`;
+      } else if (!rhList.length) {
+        reason = `Nenhum Membro de RH associado ao departamento "${c.department}" no Excel Mestre.`;
+      } else if (!rhList.some((r) => minutesOf(r).size)) {
+        reason = `Equipa de RH de "${c.department}" sem horários registados no Excel Mestre.`;
+      } else {
+        reason = `Sem interseção entre os horários de ${c.name} e a equipa (Diretor(a)/RH) de "${c.department}".`;
+      }
+      record.reason = reason;
       bookings.push(record);
     }
   });
@@ -1872,11 +1973,12 @@ const LOGO_LIGHT_DATA_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAX4AA
    SMALL SHARED UI
 ============================================================================ */
 
-function Badge({ children, className = "", style }) {
+function Badge({ children, className = "", style, title }) {
   return (
     <span
       className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium border ${className}`}
       style={style}
+      title={title}
     >
       {children}
     </span>
@@ -1885,8 +1987,8 @@ function Badge({ children, className = "", style }) {
 function DeptBadge({ dept }) {
   return <Badge className={deptBadgeClass(dept)}>{dept}</Badge>;
 }
-function StatusBadge({ status }) {
-  return <Badge className={statusBadgeClass(status)}>{status}</Badge>;
+function StatusBadge({ status, title }) {
+  return <Badge className={statusBadgeClass(status)} title={title}>{status}</Badge>;
 }
 function StatCard({ label, value, icon: Icon, tone = "neutral" }) {
   const t = STAT_TONES[tone] || STAT_TONES.neutral;
@@ -2720,6 +2822,16 @@ function InterviewPhasePage({
   const missingForms = eligible.filter((c) => !c.formsSubmitted[formsField]).length;
   const availabilityConfirmed = eligible.filter((c) => (c.availabilityStatus?.[formsField] || "nao_enviada") === "recebida").length;
 
+  // DIAGNÓSTICO AGREGADO (requisito 3): quando NENHUMA entrevista fica
+  // agendada, mostra logo no topo um resumo dos motivos mais comuns em vez
+  // de obrigar o RH a passar o rato linha a linha — cada `b.reason`
+  // (calculado em generateInterviewPhase) já identifica exatamente quem
+  // falhou no cruzamento (Diretor/RH sem departamento associado, sem
+  // horários no Excel Mestre, ou sem interseção de facto).
+  const failureReasonCounts = {};
+  bookings.forEach((b) => { if (b.reason) failureReasonCounts[b.reason] = (failureReasonCounts[b.reason] || 0) + 1; });
+  const topFailureReasons = Object.entries(failureReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
   const setAvailability = (candId, value) => {
     setCandidates((prev) => prev.map((c) => (c.id === candId ? { ...c, availabilityStatus: { ...c.availabilityStatus, [formsField]: value } } : c)));
   };
@@ -2757,6 +2869,24 @@ function InterviewPhasePage({
           </button>
         </div>
       </div>
+
+      {bookings.length > 0 && scheduled === 0 && (
+        <div className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-6" style={{ backgroundColor: hexToRgba("#c0227a", 0.08), borderColor: hexToRgba("#c0227a", 0.3) }}>
+          <AlertTriangle size={16} className="shrink-0 mt-0.5" style={{ color: "#c0227a" }} />
+          <div className="text-xs leading-relaxed" style={{ color: COLORS.navy }}>
+            <p className="font-semibold mb-1">Nenhum horário comum encontrado para nenhum candidato desta fase.</p>
+            {topFailureReasons.length > 0 ? (
+              <ul className="space-y-0.5">
+                {topFailureReasons.map(([reason, n]) => (
+                  <li key={reason}>• {reason}{n > 1 ? ` (${n} candidato${n > 1 ? "s" : ""})` : ""}</li>
+                ))}
+              </ul>
+            ) : (
+              <p>Passa o rato sobre o Estado de cada linha para veres o motivo específico.</p>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <span className="inline-flex items-center gap-1.5 text-xs font-medium rounded-full px-3 py-1.5" style={{ backgroundColor: COLORS.mint, color: COLORS.navy }}>
@@ -2835,7 +2965,7 @@ function InterviewPhasePage({
                     <td className="px-4 py-3"><DeptBadge dept={cand.department} /></td>
                     {columns.map((c) => <td key={c.key} className="px-4 py-3" style={{ color: hexToRgba(COLORS.navy, 0.75) }}>{byId(b[c.key])?.name || <span className="text-xs" style={{ color: "#c0227a" }}>Sem alocação</span>}</td>)}
                     <td className="px-4 py-3 font-mono text-xs" style={{ color: hexToRgba(COLORS.navy, 0.6) }}>{b.slot || "—"}</td>
-                    <td className="px-4 py-3"><StatusBadge status={b.status} /></td>
+                    <td className="px-4 py-3"><StatusBadge status={b.status} title={b.reason} /></td>
                     <td className="px-4 py-3 text-right">
                       <button onClick={() => setEditing(b)} style={{ color: hexToRgba(COLORS.navy, 0.45) }}><Pencil size={15} /></button>
                     </td>
