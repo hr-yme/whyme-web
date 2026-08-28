@@ -140,7 +140,7 @@ const ALL_DEPARTMENTS_OPTION = "Todos os Departamentos";
 function buildOrgBaselineMembers() {
   const members = [];
   const upsert = (name, role, dept) => {
-    name = String(name || "").trim();
+    name = cleanCellText(name);
     if (!name) return;
     const idx = members.findIndex((m) => normKey(m.name) === normKey(name));
     if (idx >= 0) {
@@ -277,12 +277,28 @@ function readWorkbook(file) {
     reader.readAsArrayBuffer(file);
   });
 }
-// Normaliza texto para comparação de cabeçalhos/valores: remove acentos,
-// baixa para minúsculas, apara espaços e colapsa espaços internos múltiplos.
-// Essencial para que pequenas variações no Excel Mestre (maiúsculas,
-// acentuação, espaços a mais) nunca façam uma coluna "desaparecer".
+// Normaliza texto para comparação de cabeçalhos/valores/nomes: remove
+// caracteres invisíveis (zero-width space/joiner \u200B-\u200D, BOM
+// \uFEFF), troca NBSP por espaço normal, remove acentos, baixa para
+// minúsculas, apara espaços e colapsa espaços internos múltiplos.
+// CORREÇÃO CRÍTICA (unificação de membros de RH/Diretores): a versão
+// anterior só tratava acentos/maiúsculas/espaços nas PONTAS — um
+// \u200B/\uFEFF colado a meio do nome (comum em exports do Google
+// Forms/Sheets, invisível no ecrã) sobrevivia ao normKey() antigo e fazia
+// "Tânia Silva" (aba "Base Dados Departamentos") e "Tânia\u200B Silva"
+// (aba "Disponibilidade Entrevistas RH") gerarem duas CHAVES diferentes em
+// findMemberIndex — logo dois registos distintos do mesmo RH: um com
+// `departments` preenchido mas `availability: []`, outro com
+// `availability` preenchida mas `departments: []`. Resultado: a coluna RH
+// desse departamento aparecia "Sem alocação"/sem interseção de horários
+// para todos os candidatos desse departamento, mesmo com os dados certos
+// no Excel Mestre. Como normKey() é o ÚNICO ponto de comparação usado por
+// findMemberIndex/matchDept/matchCandidateIndex, corrigir aqui propaga a
+// correção a todos eles de uma vez.
 function normKey(s) {
   return String(s ?? "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\u00A0/g, " ")
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -1587,7 +1603,12 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   /* ---- A1. Base Dados Departamentos -> membros (Diretor/Supervisor/RH) ---- */
   let members = prevMembers.map((m) => ({ ...m }));
   const upsertMember = (name, role, dept) => {
-    name = String(name || "").trim();
+    // cleanCellText (não só .trim()) para remover \u200B/\uFEFF/NBSP que
+    // podem vir colados a meio do nome nos exports do Forms/Sheets — o
+    // NOME GUARDADO fica limpo para exibição; a CHAVE de comparação em
+    // findMemberIndex já é robusta a isto via normKey(), mas limpar aqui
+    // também evita arrastar o caracter invisível para o registo novo.
+    name = cleanCellText(name);
     if (!name) return;
     const idx = findMemberIndex(members, name);
     if (idx >= 0) {
@@ -1610,11 +1631,11 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     // coluna com lista separada por vírgulas — por isso lemos as duas
     // colunas de forma independente. Mantemos a coluna única "RH" como
     // alternativa de compatibilidade (formato antigo/manual).
-    const rh1 = String(get(row.obj, "membro rh 1", "membro de rh 1", "rh 1", "rh1") || "").trim();
-    const rh2 = String(get(row.obj, "membro rh 2", "membro de rh 2", "rh 2", "rh2") || "").trim();
+    const rh1 = cleanCellText(get(row.obj, "membro rh 1", "membro de rh 1", "rh 1", "rh1"));
+    const rh2 = cleanCellText(get(row.obj, "membro rh 2", "membro de rh 2", "rh 2", "rh2"));
     const rhCols = [rh1, rh2].filter(Boolean);
     const rhLegacy = String(get(row.obj, "rh", "membro rh", "membros rh", "membro de rh") || "")
-      .split(/[,;|]/).map((s) => s.trim()).filter(Boolean);
+      .split(/[,;|]/).map((s) => cleanCellText(s)).filter(Boolean);
     const rhNames = rhCols.length ? rhCols : rhLegacy;
     if (diretor) upsertMember(diretor, "Diretor", dept);
     if (supervisor) upsertMember(supervisor, "Supervisor", dept);
@@ -1628,7 +1649,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   /* ---- A4/A5/A6. Disponibilidades de RH/Diretores/Supervisores -> membros ---- */
   [raw.dispEntrevistasRH, raw.dispDinamicas, raw.dispEntrevistaFinal].forEach((tab) => {
     (tab?.rows || []).forEach((row) => {
-      const name = String(get(row.obj, "nome", "name") || "").trim();
+      const name = cleanCellText(get(row.obj, "nome", "name"));
       if (!name) return;
       const { slots } = extractAvailabilityFromRow(tab.header, row.obj);
       if (!slots.length) return;
@@ -1675,16 +1696,16 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   // UI. A app cresce automaticamente com o Excel: hoje 124 candidatos,
   // amanhã 200+, sem tocar em código nem poluir o ecrã com alertas.
   const candidatosValidos = (raw.candidatos?.rows || []).filter((row) => {
-    const name = String(get(
+    const name = cleanCellText(get(
       row.obj, "nome completo", "nome", "name", "nome do candidato", "candidato", "full name"
-    ) || "").trim();
+    ));
     return name.length > 0;
   });
 
   candidatosValidos.forEach((row) => {
-    const name = String(get(
+    const name = cleanCellText(get(
       row.obj, "nome completo", "nome", "name", "nome do candidato", "candidato", "full name"
-    ) || "").trim();
+    ));
     const dept1 = matchDept(get(row.obj, "primeira opcao", "primeira opção", "1a opcao", "1ª opção", "departamento", "departamento/cargo", "cargo", "cargo pretendido"));
     const dept2 = matchDept(get(row.obj, "segunda opcao", "segunda opção", "2a opcao", "2ª opção"));
     const estadoRaw = get(row.obj, "estado", "fase atual", "fase", "estado atual", "situacao", "situação");
@@ -1741,7 +1762,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   (raw.avaliacaoCV?.rows || []).forEach((row) => {
     const rawName = row.raw[colLetterToIndex(SYNC_CV_NAME_COLUMN)];
     if (isErrorOrEmptyValue(rawName)) return; // linha vazia ou erro de fórmula (#N/A, etc.) -> ignora silenciosamente
-    const name = String(rawName).trim();
+    const name = cleanCellText(rawName);
     // Salvaguarda extra: se por algum motivo a célula da Coluna B trouxer
     // um grau académico (ex. valor da Coluna C "Ano do Curso" desalinhado
     // por uma linha em branco/mesclada na folha), a linha é ignorada em
