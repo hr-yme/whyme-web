@@ -997,11 +997,16 @@ function fullGridRange(sheetName, grid) {
 
 // ---- 1.4: Deteção dos BLOCOS DE DIA ("Dia X") ----
 // Reconhece qualquer barra de cabeçalho de bloco com o padrão "Dia" +
-// número (ex. "Dia 1", "DIA 10", "Dia 3 - Quarta-feira"), em QUALQUER
-// linha/coluna da grelha — nunca linhas fixas como 4/31/54. Células
-// mescladas repetem o mesmo texto em colunas adjacentes da mesma linha;
-// por isso só se guarda a PRIMEIRA ocorrência por linha.
-const DIA_HEADER_RE = /\bdia\s*\d+\b/i;
+// (um número OU o texto literal "X"/"x") — ex. "Dia X", "DIA X",
+// "Dia 1", "dia 10", "Dia 3 - Quarta-feira" — em QUALQUER linha/coluna da
+// grelha — nunca linhas fixas como 4/31/54. CORREÇÃO: a versão anterior
+// só aceitava dígitos (\d+), pelo que folhas com o texto LITERAL "Dia X"
+// (placeholder de secção, sem número real) nunca eram reconhecidas e a
+// gravação era bloqueada por completo com "Não foi encontrada nenhuma
+// barra 'Dia N'". Células mescladas repetem o mesmo texto em colunas
+// adjacentes da mesma linha; por isso só se guarda a PRIMEIRA ocorrência
+// por linha.
+const DIA_HEADER_RE = /dia\s*[x\d]+/i;
 function detectDayBlocks(grid) {
   const seenRows = new Set();
   const raw = [];
@@ -1033,7 +1038,14 @@ function detectDayBlocks(grid) {
 // "Linha 7") — varre até DEPT_HEADER_SEARCH_ROWS linhas do bloco.
 const DEPT_HEADER_SEARCH_ROWS = 8;
 function detectDepartmentColumnsInBlock(grid, block) {
-  const limit = Math.min(block.startRow + DEPT_HEADER_SEARCH_ROWS, block.endRow, grid.length);
+  // Bloco sintético de fallback (sem barra "Dia X" — ver
+  // buildDynamicSheetMap): não há limite de "poucas linhas a seguir ao
+  // cabeçalho do bloco" porque não existe cabeçalho nenhum, por isso
+  // varre-se o bloco inteiro (a folha toda) em vez de só
+  // DEPT_HEADER_SEARCH_ROWS linhas.
+  const limit = block.headerRow === null
+    ? Math.min(block.endRow, grid.length)
+    : Math.min(block.startRow + DEPT_HEADER_SEARCH_ROWS, block.endRow, grid.length);
   for (let r = block.startRow; r < limit; r++) {
     const row = grid[r] || [];
     const found = {};
@@ -1104,30 +1116,53 @@ function detectTimeRowsInBlock(grid, block, fromRow) {
 //    gravação por completo — só ignora a célula/departamento em causa)
 function buildDynamicSheetMap(grid, sheetName) {
   const warnings = [];
-  const blocks = detectDayBlocks(grid);
+  let blocks = detectDayBlocks(grid);
+
+  // REQUISITO 2 (tratamento defensivo): se a barra "Dia X" não for
+  // encontrada em lado nenhum da folha, a gravação NUNCA fica bloqueada —
+  // cai-se para um único "bloco" sintético que cobre a folha inteira
+  // (sem separação por dia), onde departamentos/"Nome"/horários continuam
+  // a ser detetados normalmente e a gravação prossegue nas respetivas
+  // posições de Horário e Departamento. Fica só um aviso informativo (na
+  // consola e em `warnings`) a assinalar que a folha não tem blocos de
+  // dia reconhecíveis — nunca um erro que impeça a escrita.
+  let usingFallbackBlock = false;
   if (!blocks.length) {
-    throw new Error(`Não foi encontrada nenhuma barra "Dia N" na aba "${sheetName}" — confirma se a estrutura da folha ainda tem esses cabeçalhos de bloco.`);
+    usingFallbackBlock = true;
+    const msg = `Não foi encontrada nenhuma barra "Dia X"/"Dia N" na aba "${sheetName}" — a gravar sem separação por bloco de dia (todas as posições de Horário/Departamento continuam a ser detetadas normalmente).`;
+    warnings.push(msg);
+    console.warn(`[Gravação Google Sheets] ${msg}`);
+    blocks = [{ headerRow: null, headerCol: null, headerText: null, startRow: 0, endRow: grid.length }];
   }
+
   const cellByKey = new Map(); // `${day}|${startMin}|${dept}` -> {row,col}
   const dayHeaderByDay = new Map(); // day -> {row,col,text}
 
   blocks.forEach((block, i) => {
-    const day = DAYS[i];
-    if (!day) {
+    // Em modo de fallback (sem blocos "Dia X"), o único bloco sintético
+    // aplica-se a TODOS os dias da semana (Seg..Sex) em simultâneo —
+    // nunca sabemos, sem a barra de dia, a que dia da semana cada linha
+    // pertence, por isso a mesma estrutura detetada é usada para
+    // qualquer candidato, seja qual for o seu slot. Fora do fallback,
+    // continua 1 bloco = 1 dia, pela ordem em que aparecem na folha.
+    const daysForBlock = usingFallbackBlock ? DAYS : [DAYS[i]];
+    if (!usingFallbackBlock && !daysForBlock[0]) {
       warnings.push(`Bloco extra "${block.headerText}" (linha ${block.headerRow + 1}) ignorado — só há ${DAYS.length} dias configurados na app (Seg a Sex).`);
       return;
     }
-    dayHeaderByDay.set(day, { row: block.headerRow, col: block.headerCol, text: block.headerText });
+    if (!usingFallbackBlock) {
+      dayHeaderByDay.set(daysForBlock[0], { row: block.headerRow, col: block.headerCol, text: block.headerText });
+    }
 
     const deptInfo = detectDepartmentColumnsInBlock(grid, block);
     if (!deptInfo) {
-      warnings.push(`Bloco "${block.headerText}" (linha ${block.headerRow + 1}): não foi encontrada nenhuma linha de departamentos reconhecida.`);
+      warnings.push(`Bloco "${block.headerText ?? "(sem barra de dia)"}" (linha ${(block.headerRow ?? block.startRow) + 1}): não foi encontrada nenhuma linha de departamentos reconhecida.`);
       return;
     }
 
     const timeMap = detectTimeRowsInBlock(grid, block, deptInfo.deptHeaderRow + 1);
     if (!timeMap.size) {
-      warnings.push(`Bloco "${block.headerText}": não foram encontrados horários reconhecíveis na Coluna B.`);
+      warnings.push(`Bloco "${block.headerText ?? "(sem barra de dia)"}": não foram encontrados horários reconhecíveis na Coluna B.`);
     }
 
     const deptEntries = Object.entries(deptInfo.columns).sort((a, b) => a[1] - b[1]);
@@ -1135,21 +1170,25 @@ function buildDynamicSheetMap(grid, sheetName) {
       const nextCol = idx + 1 < deptEntries.length ? deptEntries[idx + 1][1] : undefined;
       const nomeCol = detectNomeColumn(grid, block, deptInfo.deptHeaderRow, col, nextCol);
       if (nomeCol === null) {
-        warnings.push(`Departamento "${dept}" no bloco "${block.headerText}": não foi encontrada a subcoluna "Nome".`);
+        warnings.push(`Departamento "${dept}" no bloco "${block.headerText ?? "(sem barra de dia)"}": não foi encontrada a subcoluna "Nome".`);
         return;
       }
       timeMap.forEach((row, startMin) => {
-        cellByKey.set(`${day}|${startMin}|${dept}`, { row, col: nomeCol });
+        daysForBlock.forEach((day) => {
+          cellByKey.set(`${day}|${startMin}|${dept}`, { row, col: nomeCol });
+        });
       });
     });
   });
 
   return {
     warnings,
+    usingFallbackBlock,
     cellFor(day, startMin, dept) { return cellByKey.get(`${day}|${startMin}|${dept}`) || null; },
     dayHeaderFor(day) { return dayHeaderByDay.get(day) || null; },
   };
 }
+
 
 // Mensagens de erro para operações de ESCRITA (batchUpdate/update) —
 // paralelas a translateSheetApiError, mas com wording de gravação/
@@ -1231,17 +1270,26 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
     });
   });
 
-  // PASSO 3 (requisito 1.4): atualiza as barras "Dia X" com o dia da
-  // semana correspondente — só quando o texto ainda não o tiver (nunca
-  // apaga/substitui texto de data já existente na barra).
+  // PASSO 3 (requisito 1): ao ENCONTRAR a barra "Dia X", substitui o seu
+  // texto pela data real do dia da entrevista a ser gravada (ex.
+  // "Quarta-feira, 10 de junho" — via weekdayDateLabel(), que usa a data
+  // já capturada de um Forms/Excel Mestre sincronizado, ou só o nome do
+  // dia da semana se essa data ainda não tiver sido lida de lado nenhum).
+  // Só escreve se o texto calculado for DIFERENTE do atual (evita
+  // reescrever a mesma célula sem necessidade em gravações repetidas).
+  // Em modo de fallback (sem blocos "Dia X" — ver buildDynamicSheetMap),
+  // dayHeaderFor() devolve sempre null para todos os dias, pelo que este
+  // passo é ignorado silenciosamente — o aviso já foi registado por
+  // buildDynamicSheetMap (consola + dynamicMap.warnings), nunca bloqueia
+  // a escrita das células de candidatos feita no PASSO 2 acima.
   DAYS.forEach((day) => {
     const header = dynamicMap.dayHeaderFor(day);
     if (!header) return;
-    const alreadyHasWeekday = DAY_WORD_PATTERNS.some(({ re }) => re.test(header.text));
-    if (alreadyHasWeekday) return;
+    const newText = weekdayDateLabel(day);
+    if (normKey(header.text) === normKey(newText)) return;
     data.push({
       range: `${sheetName}!${colIndexToLetter(header.col)}${header.row + 1}`,
-      values: [[`${header.text} — ${WEEKDAY_FULL_PT[day]}`]],
+      values: [[newText]],
     });
   });
 
@@ -1751,6 +1799,16 @@ function findDayHourHeaderRows(grid, searchLimit = 20) {
 // à medida que os cabeçalhos do Forms são lidos, e é depois consultado
 // para resolver as colunas do Excel Mestre que só têm a data.
 let DAY_NUMBER_TO_WEEKDAY = {};
+// Companheiro de DAY_NUMBER_TO_WEEKDAY: guarda, por dia da semana
+// canónico (Seg..Sex), o texto "N de <mês>" (ex. "10 de junho") extraído
+// do MESMO cabeçalho do Forms que já alimenta DAY_NUMBER_TO_WEEKDAY —
+// usado para escrever a barra "Dia X" da folha de saída com a data real
+// da entrevista (requisito "substituir o texto dessa célula pela data
+// real do dia da entrevista, ex: 'Quarta-feira, 10 de junho'" — ver
+// weekdayDateLabel()/exportBookingsToGoogleSheet). Fica vazio (sem
+// substituto de data) até o primeiro Forms/Excel Mestre com datas por
+// extenso ser sincronizado.
+let WEEKDAY_TO_DATE_LABEL = {};
 
 // Extrai o dia do mês (1-31) de um texto, tentando por ordem:
 //  1) "dia 10", "Dia 10"
@@ -1775,7 +1833,11 @@ function extractDayNumber(raw) {
 // da semana, sempre que um texto trouxer os dois em conjunto (é o caso dos
 // cabeçalhos do Forms). Chamada para TODOS os cabeçalhos antes de os
 // processar (ver extractAvailabilityFromRow), para que o mapa esteja
-// atualizado independentemente da ordem das colunas na folha.
+// atualizado independentemente da ordem das colunas na folha. Regista
+// também, no mesmo passo, o texto "N de <mês>" em WEEKDAY_TO_DATE_LABEL
+// (quando presente no cabeçalho), para reconstruir a data por extenso ao
+// escrever a barra "Dia X" da folha de saída.
+const DATE_LABEL_RE = /\b\d{1,2}\s*de\s*[a-zçãáéíóúâêôõ]+\b/i;
 function registerDayNumberMapping(text) {
   const s = String(text || "");
   let weekday = null;
@@ -1785,6 +1847,20 @@ function registerDayNumberMapping(text) {
   if (!weekday) return;
   const num = extractDayNumber(s);
   if (num !== null) DAY_NUMBER_TO_WEEKDAY[num] = weekday;
+  const dateMatch = s.match(DATE_LABEL_RE);
+  if (dateMatch) WEEKDAY_TO_DATE_LABEL[weekday] = dateMatch[0].trim();
+}
+
+// Constrói o texto da data por extenso a escrever na barra "Dia X" para
+// um dia da semana canónico (ex. "Quarta-feira, 10 de junho"). Usa
+// WEEKDAY_TO_DATE_LABEL quando já foi capturada uma data real de algum
+// Forms/Excel Mestre sincronizado; caso contrário, cai apenas no nome
+// completo do dia da semana (WEEKDAY_FULL_PT) — nunca inventa um número
+// de dia/mês que a app não tenha lido de nenhuma fonte real.
+function weekdayDateLabel(day) {
+  const full = WEEKDAY_FULL_PT[day] || day;
+  const dateLabel = WEEKDAY_TO_DATE_LABEL[day];
+  return dateLabel ? `${full}, ${dateLabel}` : full;
 }
 
 // Converte uma célula/token já isolado (um único dia) em intervalo(s)
