@@ -4,7 +4,7 @@ import {
   UsersRound, CalendarClock, LogOut, RefreshCw, Download,
   UploadCloud, Plus, X, Pencil, AlertTriangle, CheckCircle2, XCircle, Clock3,
   Search, Lock, ListChecks, LayoutGrid, CalendarDays, FileSpreadsheet,
-  FileCheck2, FileClock, Eye, EyeOff,
+  FileCheck2, FileClock, Eye, EyeOff, Undo2,
 } from "lucide-react";
 
 /* ============================================================================
@@ -489,23 +489,31 @@ const SYNC_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 em 2 minutos
 // já existentes na folha da YME, um por fase de entrevista, onde a app
 // escreve o Nome do candidato agendado na célula correspondente ao
 // dia/hora (linha) x departamento (coluna). Só cobrem as fases com botão
-// "Gravar na Folha Google" (Fase 2/Soft Skills e Fase 4/Hard Skills);
+// "Gravar no Google Sheets" (Fase 2/Soft Skills e Fase 4/Hard Skills);
 // a Fase 3 (Dinâmicas de Grupo) usa grupos, não um slot por candidato, e
 // fica fora deste mapeamento.
 const SYNC_OUTPUT_SHEET_NAMES = {
   fase1: "'Organização Entrevistas RH'",
   fase3: "'Organização Entrevista Final'",
 };
-// Linha (1-based) onde começa o cabeçalho de departamentos nas abas de
-// saída acima — linha 1 = "Dia", linha 2 = "Hora", coluna C em diante =
-// um departamento por coluna (na mesma ordem de DEPARTMENTS), e os dados
-// (Nome do candidato agendado) a partir da linha seguinte, uma linha por
-// slot oficial de SLOTS (mesma ordem Dia->Hora usada em toda a app).
-// AJUSTA ESTES 3 VALORES SE A ESTRUTURA REAL DA TUA FOLHA "ORGANIZAÇÃO
-// ENTREVISTAS RH"/"ORGANIZAÇÃO ENTREVISTA FINAL" DIFERIR (nº de linhas de
-// cabeçalho, coluna onde começa a Nome do 1º departamento).
-const SYNC_OUTPUT_HEADER_ROWS = 2;      // nº de linhas de cabeçalho antes dos dados
-const SYNC_OUTPUT_FIRST_DEPT_COL = "C"; // 1ª coluna de departamento (A=Dia, B=Hora)
+// CORREÇÃO CRÍTICA (deteção dinâmica): a versão anterior fixava a
+// estrutura da aba de saída em 2 constantes (linhas de cabeçalho fixas,
+// coluna fixa "C" do 1º departamento) — qualquer alteração futura à
+// folha (nova coluna, departamento reordenado, linha extra) partia
+// silenciosamente o mapeamento. Essas constantes foram substituídas
+// pela deteção dinâmica em runtime (ver buildDynamicSheetMap logo
+// abaixo, na secção "GRAVAÇÃO NO GOOGLE SHEETS"): a app lê sempre a
+// grelha real da folha antes de escrever e localiza os blocos "Dia X",
+// a linha de departamentos, a subcoluna "Nome" e a coluna de horários
+// (Coluna B) em tempo real — nunca por letra/linha fixa.
+
+// Nomes completos PT dos 5 dias úteis, na mesma ordem de DAYS — usados
+// para escrever a barra "Dia X" de cada bloco com o dia/data
+// correspondente às entrevistas agendadas nesse bloco (requisito 1.4).
+const WEEKDAY_FULL_PT = {
+  Seg: "Segunda-feira", Ter: "Terça-feira", Qua: "Quarta-feira",
+  Qui: "Quinta-feira", Sex: "Sexta-feira",
+};
 
 // A. Abas gerais de base de dados e disponibilidades (nomes exatos das abas com aspas simples para a API do Google).
 const SYNC_SHEET_NAMES = {
@@ -935,30 +943,251 @@ function translateSheetApiError(code, sheetName) {
 }
 
 // ============================================================================
+// GRAVAÇÃO NO GOOGLE SHEETS — escrita dos agendamentos gerados na aba de
+// saída ("Organização Entrevistas RH"/"Organização Entrevista Final"),
+// com DETEÇÃO 100% DINÂMICA da estrutura da folha (nunca colunas/linhas
+// fixas — ver requisito 1: a estrutura pode mudar no futuro) e um sistema
+// de segurança de Backup/Reverter (requisito 2): antes de qualquer
+// escrita, a grelha atual da aba é lida por inteiro e guardada como
+// snapshot, devolvido em toda gravação bem sucedida para quem chamar
+// poder oferecer "Reverter Última Gravação".
+// ============================================================================
+
+// Lê a aba de saída POR INTEIRO (todas as linhas/colunas com conteúdo),
+// sem qualquer range fixo — é sobre esta grelha bruta que toda a deteção
+// dinâmica (blocos de dia, departamentos, "Nome", horários) é feita, e é
+// também exatamente o snapshot guardado para o Reverter. Reaproveita os
+// mesmos códigos de erro (token_expired/permission_denied/etc.) de
+// fetchSheetTabApi, traduzidos por translateSheetApiError.
+async function fetchFullSheetGrid(accessToken, sheetId, sheetName) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetName)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error("network_error");
+  }
+  if (res.status === 401) throw new Error("token_expired");
+  if (res.status === 403) throw new Error("permission_denied");
+  if (res.status === 400 || res.status === 404) throw new Error("sheet_not_found");
+  if (!res.ok) throw new Error(`http_${res.status}`);
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error("read_error");
+  }
+  return data.values || [];
+}
+
+// Constrói o range A1 completo que cobre toda a grelha lida (ex.
+// "'Organização Entrevistas RH'!A1:P120") — usado tanto para o snapshot
+// de segurança como para o restauro exato no Reverter, porque escrever de
+// volta EXATAMENTE o mesmo range lido garante que nenhuma célula fica de
+// fora do restauro, mesmo que a escrita tenha tocado em várias colunas.
+function fullGridRange(sheetName, grid) {
+  const numRows = Math.max(grid.length, 1);
+  const numCols = Math.max(grid.reduce((max, row) => Math.max(max, (row || []).length), 0), 1);
+  const lastCol = colIndexToLetter(numCols - 1);
+  return `${sheetName}!A1:${lastCol}${numRows}`;
+}
+
+// ---- 1.4: Deteção dos BLOCOS DE DIA ("Dia X") ----
+// Reconhece qualquer barra de cabeçalho de bloco com o padrão "Dia" +
+// número (ex. "Dia 1", "DIA 10", "Dia 3 - Quarta-feira"), em QUALQUER
+// linha/coluna da grelha — nunca linhas fixas como 4/31/54. Células
+// mescladas repetem o mesmo texto em colunas adjacentes da mesma linha;
+// por isso só se guarda a PRIMEIRA ocorrência por linha.
+const DIA_HEADER_RE = /\bdia\s*\d+\b/i;
+function detectDayBlocks(grid) {
+  const seenRows = new Set();
+  const raw = [];
+  grid.forEach((row, rIdx) => {
+    (row || []).forEach((cell, cIdx) => {
+      const s = String(cell ?? "").trim();
+      if (s && DIA_HEADER_RE.test(s) && !seenRows.has(rIdx)) {
+        seenRows.add(rIdx);
+        raw.push({ headerRow: rIdx, headerCol: cIdx, headerText: s });
+      }
+    });
+  });
+  raw.sort((a, b) => a.headerRow - b.headerRow);
+  // O bloco de cada "Dia X" vai desde a sua própria linha até à linha do
+  // PRÓXIMO bloco (exclusive) — ou ao fim da grelha, para o último bloco.
+  return raw.map((b, i) => ({
+    ...b,
+    startRow: b.headerRow,
+    endRow: i + 1 < raw.length ? raw[i + 1].headerRow : grid.length,
+  }));
+}
+
+// ---- 1.1: Deteção dinâmica da linha de DEPARTAMENTOS dentro de um bloco ----
+// Procura, dentro das primeiras linhas do bloco (a seguir à barra "Dia
+// X"), a PRIMEIRA linha que contenha pelo menos um dos 6 nomes oficiais
+// de DEPARTMENTS (via matchDept — tolerante a acentos/maiúsculas) e
+// devolve, para essa linha, o índice de coluna de CADA departamento
+// encontrado. Nunca assume que essa linha está numa posição fixa (ex.
+// "Linha 7") — varre até DEPT_HEADER_SEARCH_ROWS linhas do bloco.
+const DEPT_HEADER_SEARCH_ROWS = 8;
+function detectDepartmentColumnsInBlock(grid, block) {
+  const limit = Math.min(block.startRow + DEPT_HEADER_SEARCH_ROWS, block.endRow, grid.length);
+  for (let r = block.startRow; r < limit; r++) {
+    const row = grid[r] || [];
+    const found = {};
+    row.forEach((cell, c) => {
+      const dept = matchDept(cell);
+      if (dept && found[dept] === undefined) found[dept] = c;
+    });
+    if (Object.keys(found).length) return { deptHeaderRow: r, columns: found };
+  }
+  return null;
+}
+
+// ---- 1.2: Deteção dinâmica da SUBCOLUNA "Nome" de um departamento ----
+// A partir da coluna onde o departamento foi encontrado, procura nas
+// linhas seguintes (subcabeçalho, tipicamente logo a seguir à linha de
+// departamentos — ex. Linha 8 ou 32, mas nunca fixa) a célula com o texto
+// "Nome", dentro do intervalo de colunas desse departamento (da sua
+// própria coluna até à coluna do departamento seguinte, exclusive — ou um
+// limite defensivo se for o último departamento do bloco). Se não
+// encontrar, devolve null — a app NUNCA assume/"adivinha" uma coluna
+// fixa, prefere ignorar essa célula e avisar (ver buildDynamicSheetMap).
+const NOME_SEARCH_ROWS = 6;
+const NOME_SEARCH_COL_FALLBACK_WIDTH = 8;
+function detectNomeColumn(grid, block, deptHeaderRow, deptCol, nextDeptCol) {
+  const rowLimit = Math.min(deptHeaderRow + NOME_SEARCH_ROWS, block.endRow, grid.length);
+  const colEnd = nextDeptCol !== undefined ? nextDeptCol : deptCol + NOME_SEARCH_COL_FALLBACK_WIDTH;
+  for (let r = deptHeaderRow; r < rowLimit; r++) {
+    const row = grid[r] || [];
+    for (let c = deptCol; c < colEnd && c < row.length; c++) {
+      if (normKey(row[c]).replace(/[^a-z]/g, "") === "nome") return c;
+    }
+  }
+  return null;
+}
+
+// ---- 1.3: Deteção dinâmica dos HORÁRIOS (Coluna B, dentro do bloco) ----
+// Percorre as linhas do bloco (a partir da linha de departamentos) à
+// procura, célula a célula da Coluna B (com a Coluna A como reserva, caso
+// a folha desloque a coluna de horários), de texto reconhecível por
+// parseTimeToMinutes ("09:00 - 09:30", "12:30-13:00", "9h-9h30", etc.) —
+// a MESMA função universal de horas já usada no resto da app, nunca uma
+// comparação de texto. Devolve um Map minutos-desde-a-meia-noite -> linha.
+function detectTimeRowsInBlock(grid, block, fromRow) {
+  const map = new Map();
+  for (let r = fromRow; r < block.endRow && r < grid.length; r++) {
+    const row = grid[r] || [];
+    const candidates = [row[1], row[0]]; // Coluna B primeiro (oficial), Coluna A como reserva
+    for (const cell of candidates) {
+      const s = String(cell ?? "").trim();
+      if (!s) continue;
+      const { inicio } = parseTimeToMinutes(s);
+      if (inicio !== null) { map.set(inicio, r); break; }
+    }
+  }
+  return map;
+}
+
+// ---- Orquestrador: constrói o mapa dinâmico completo da folha ----
+// Junta os 4 passos de deteção acima numa única estrutura, associando
+// cada bloco "Dia X" (pela ORDEM em que aparece na folha, de cima para
+// baixo) a um dos 5 dias úteis da app (Seg..Sex, na ordem de DAYS) — o
+// texto "Dia X" é só um índice sequencial do calendário de entrevistas,
+// nunca o nome do dia da semana em si (à semelhança do que o resto da app
+// já faz para o Excel Mestre — ver DAY_NUMBER_TO_WEEKDAY). Devolve:
+//  - cellFor(day, startMin, dept): célula {row, col} onde escrever o Nome
+//  - dayHeaderFor(day): célula {row, col, text} da barra "Dia X" do bloco
+//  - warnings: avisos de estrutura não reconhecida (nunca interrompe a
+//    gravação por completo — só ignora a célula/departamento em causa)
+function buildDynamicSheetMap(grid, sheetName) {
+  const warnings = [];
+  const blocks = detectDayBlocks(grid);
+  if (!blocks.length) {
+    throw new Error(`Não foi encontrada nenhuma barra "Dia N" na aba "${sheetName}" — confirma se a estrutura da folha ainda tem esses cabeçalhos de bloco.`);
+  }
+  const cellByKey = new Map(); // `${day}|${startMin}|${dept}` -> {row,col}
+  const dayHeaderByDay = new Map(); // day -> {row,col,text}
+
+  blocks.forEach((block, i) => {
+    const day = DAYS[i];
+    if (!day) {
+      warnings.push(`Bloco extra "${block.headerText}" (linha ${block.headerRow + 1}) ignorado — só há ${DAYS.length} dias configurados na app (Seg a Sex).`);
+      return;
+    }
+    dayHeaderByDay.set(day, { row: block.headerRow, col: block.headerCol, text: block.headerText });
+
+    const deptInfo = detectDepartmentColumnsInBlock(grid, block);
+    if (!deptInfo) {
+      warnings.push(`Bloco "${block.headerText}" (linha ${block.headerRow + 1}): não foi encontrada nenhuma linha de departamentos reconhecida.`);
+      return;
+    }
+
+    const timeMap = detectTimeRowsInBlock(grid, block, deptInfo.deptHeaderRow + 1);
+    if (!timeMap.size) {
+      warnings.push(`Bloco "${block.headerText}": não foram encontrados horários reconhecíveis na Coluna B.`);
+    }
+
+    const deptEntries = Object.entries(deptInfo.columns).sort((a, b) => a[1] - b[1]);
+    deptEntries.forEach(([dept, col], idx) => {
+      const nextCol = idx + 1 < deptEntries.length ? deptEntries[idx + 1][1] : undefined;
+      const nomeCol = detectNomeColumn(grid, block, deptInfo.deptHeaderRow, col, nextCol);
+      if (nomeCol === null) {
+        warnings.push(`Departamento "${dept}" no bloco "${block.headerText}": não foi encontrada a subcoluna "Nome".`);
+        return;
+      }
+      timeMap.forEach((row, startMin) => {
+        cellByKey.set(`${day}|${startMin}|${dept}`, { row, col: nomeCol });
+      });
+    });
+  });
+
+  return {
+    warnings,
+    cellFor(day, startMin, dept) { return cellByKey.get(`${day}|${startMin}|${dept}`) || null; },
+    dayHeaderFor(day) { return dayHeaderByDay.get(day) || null; },
+  };
+}
+
+// Mensagens de erro para operações de ESCRITA (batchUpdate/update) —
+// paralelas a translateSheetApiError, mas com wording de gravação/
+// permissão de Editor em vez de leitura.
+function translateSheetWriteError(code, sheetName, action = "gravar") {
+  if (code === "token_expired") return new Error(`A sessão Google expirou ao tentar ${action} na aba "${sheetName}". Autentica-te novamente e tenta outra vez.`);
+  if (code === "permission_denied") return new Error(`A tua conta Google não tem permissão de ESCRITA na aba "${sheetName}". Confirma que a folha foi partilhada com acesso de Editor (não só Leitor).`);
+  if (code === "sheet_not_found") return new Error(`Não foi possível ${action} — a aba "${sheetName}" ou o range calculado não foram encontrados.`);
+  if (code === "network_error") return new Error(`Não foi possível contactar a Google Sheets API ao tentar ${action}. Confirma a tua ligação à internet.`);
+  if (code === "read_error") return new Error(`Pedido de ${action} enviado, mas não foi possível confirmar a resposta da API.`);
+  if (code?.startsWith("http_")) return new Error(`A Google Sheets API respondeu com erro HTTP ${code.replace("http_", "")} ao tentar ${action} na aba "${sheetName}".`);
+  return new Error(`Não foi possível ${action} na aba "${sheetName}" (${code}).`);
+}
+
+// ============================================================================
 // FUNÇÃO PEDIDA: exportBookingsToGoogleSheet — escreve os agendamentos
-// gerados ("Agendado") de volta na folha privada da YME, no mapa de
-// horários por dia e departamento da aba de saída da fase em causa
-// ("Organização Entrevistas RH" para a Fase 2/Soft Skills, "Organização
-// Entrevista Final" para a Fase 4/Hard Skills — ver SYNC_OUTPUT_SHEET_NAMES).
+// gerados ("Agendado") de volta na folha privada da YME, na aba de saída
+// da fase em causa ("Organização Entrevistas RH" para a Fase 2/Soft
+// Skills, "Organização Entrevista Final" para a Fase 4/Hard Skills — ver
+// SYNC_OUTPUT_SHEET_NAMES), usando SEMPRE a deteção dinâmica acima —
+// nunca uma letra/linha fixa.
 //
-// Mapeamento célula <-> agendamento: cada slot oficial ("Seg 09:00", ...)
-// corresponde a UMA LINHA da aba de saída, pela mesma ordem de SLOTS,
-// começando logo a seguir às linhas de cabeçalho (SYNC_OUTPUT_HEADER_ROWS);
-// cada Departamento (na ordem fixa de DEPARTMENTS) corresponde a UMA
-// COLUNA, a partir de SYNC_OUTPUT_FIRST_DEPT_COL. Para cada booking com
-// status "Agendado", calcula-se a linha (pelo slot) e a coluna (pelo
-// departamento do candidato) e escreve-se o Nome do candidato nessa
-// célula — exatamente a coluna "Nome" do respetivo dia/horário/
-// departamento pedida.
+// Requisito 2 (Backup/Reverter): ANTES de qualquer escrita, lê a grelha
+// completa da aba de saída e guarda-a como snapshot — devolvido em
+// `result.snapshot` em toda chamada bem sucedida, para quem chamar poder
+// oferecer "Reverter Última Gravação" (ver revertSheetSnapshot mais
+// abaixo) e restaurar a folha EXATAMENTE como estava antes de gravar.
 //
 // A escrita é feita numa ÚNICA chamada à API (values:batchUpdate, POST),
-// com um "data[]" — uma entrada { range, values } por candidato agendado
-// — em vez de uma chamada por célula, para nunca esbarrar no limite de
-// pedidos por segundo da Google Sheets API com muitos candidatos.
+// com um "data[]" — uma entrada { range, values } por candidato agendado,
+// mais uma por barra "Dia X" atualizada com o dia da semana (requisito
+// 1.4) — em vez de uma chamada por célula, para nunca esbarrar no limite
+// de pedidos por segundo da Google Sheets API.
 //
-// Nunca sobrescreve outras células fora do mapa de horários (Diretor/RH,
+// Nunca sobrescreve outras células fora do mapa detetado (Diretor/RH,
 // notas, etc. ficam intactas): só escreve exatamente as células "Nome" do
-// dia/hora/departamento de cada candidato agendado.
+// dia/hora/departamento de cada candidato agendado, e as barras "Dia X"
+// que ainda não têm o nome do dia da semana.
 async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phaseKey, accessToken }) {
   if (!accessToken) {
     throw new Error("Sessão Google não está ativa. Autentica-te antes de gravar na folha.");
@@ -971,32 +1200,56 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
     throw new Error(`Não existe aba de saída configurada para a fase "${phaseKey}".`);
   }
 
-  const candById = (id) => candidates.find((c) => c.id === id);
-  const firstDeptColIdx = colLetterToIndex(SYNC_OUTPUT_FIRST_DEPT_COL);
+  // PASSO 1 (requisito 2 — Backup): lê a grelha ATUAL por inteiro, ANTES
+  // de qualquer escrita, e guarda-a como snapshot de segurança.
+  let grid;
+  try {
+    grid = await fetchFullSheetGrid(accessToken, sheetId, sheetName);
+  } catch (err) {
+    throw translateSheetApiError(err.message, sheetName);
+  }
+  const snapshot = { sheetId, sheetName, range: fullGridRange(sheetName, grid), values: grid, takenAt: Date.now() };
 
-  // Constrói uma entrada { range, values } por candidato "Agendado" —
-  // agendamentos sem slot ("Sem Horário Comum") ou manuais sem candidato
-  // válido são ignorados, nunca escritos como célula em branco (isso
-  // apagaria por engano um nome já lá escrito por outra sincronização).
+  // PASSO 2 (requisito 1 — deteção dinâmica): localiza blocos de dia,
+  // departamentos, subcoluna "Nome" e horários — nunca colunas fixas.
+  const dynamicMap = buildDynamicSheetMap(grid, sheetName);
+
+  const candById = (id) => candidates.find((c) => c.id === id);
   const data = [];
   const skipped = [];
   bookings.forEach((b) => {
     if (b.status !== "Agendado" || !b.slot) return;
     const cand = candById(b.candidateId);
-    if (!cand) { skipped.push(b.id); return; }
-    const slotRowOffset = SLOTS.indexOf(b.slot);
-    const deptColOffset = DEPARTMENTS.indexOf(cand.department);
-    if (slotRowOffset < 0 || deptColOffset < 0) { skipped.push(cand.name || b.id); return; }
-    const row = SYNC_OUTPUT_HEADER_ROWS + slotRowOffset + 1; // 1-based
-    const col = colIndexToLetter(firstDeptColIdx + deptColOffset);
+    if (!cand) { skipped.push({ ref: b.id, reason: "candidato não encontrado" }); return; }
+    const info = slotToMinutes(b.slot);
+    if (!info) { skipped.push({ ref: cand.name, reason: `slot "${b.slot}" inválido` }); return; }
+    const cell = dynamicMap.cellFor(info.day, info.startMin, cand.department);
+    if (!cell) { skipped.push({ ref: cand.name, reason: `célula "Nome" não localizada para "${cand.department}" / ${b.slot} na estrutura atual da folha` }); return; }
     data.push({
-      range: `${sheetName}!${col}${row}`,
+      range: `${sheetName}!${colIndexToLetter(cell.col)}${cell.row + 1}`,
       values: [[cand.name]],
     });
   });
 
+  // PASSO 3 (requisito 1.4): atualiza as barras "Dia X" com o dia da
+  // semana correspondente — só quando o texto ainda não o tiver (nunca
+  // apaga/substitui texto de data já existente na barra).
+  DAYS.forEach((day) => {
+    const header = dynamicMap.dayHeaderFor(day);
+    if (!header) return;
+    const alreadyHasWeekday = DAY_WORD_PATTERNS.some(({ re }) => re.test(header.text));
+    if (alreadyHasWeekday) return;
+    data.push({
+      range: `${sheetName}!${colIndexToLetter(header.col)}${header.row + 1}`,
+      values: [[`${header.text} — ${WEEKDAY_FULL_PT[day]}`]],
+    });
+  });
+
   if (!data.length) {
-    throw new Error("Nenhum agendamento com Estado \"Agendado\" para gravar (gera os agendamentos primeiro).");
+    const err = new Error("Nenhuma célula para gravar — confirma se há agendamentos \"Agendado\" e se a deteção dinâmica encontrou a estrutura da folha (ver avisos).");
+    err.warnings = dynamicMap.warnings;
+    err.snapshot = snapshot;
+    throw err;
   }
 
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`;
@@ -1004,36 +1257,76 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        valueInputOption: "USER_ENTERED",
-        data,
-      }),
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ valueInputOption: "USER_ENTERED", data }),
     });
   } catch {
-    throw new Error("Não foi possível contactar a Google Sheets API. Confirma a tua ligação à internet.");
+    const err = translateSheetWriteError("network_error", sheetName, "gravar");
+    err.snapshot = snapshot;
+    throw err;
   }
 
-  if (res.status === 401) throw new Error("A sessão Google expirou. Autentica-te novamente e tenta gravar outra vez.");
-  if (res.status === 403) throw new Error(`A tua conta Google não tem permissão de ESCRITA na folha. Confirma que foi partilhada com acesso de Editor (não só Leitor).`);
-  if (res.status === 400 || res.status === 404) throw new Error(`Não foi encontrada a aba "${sheetName}" nessa folha, ou o range calculado é inválido. Confirma o nome exato da aba e SYNC_OUTPUT_HEADER_ROWS/SYNC_OUTPUT_FIRST_DEPT_COL.`);
-  if (!res.ok) throw new Error(`A Google Sheets API respondeu com erro HTTP ${res.status} ao gravar.`);
+  if (!res.ok) {
+    const code = res.status === 401 ? "token_expired" : res.status === 403 ? "permission_denied" : (res.status === 400 || res.status === 404) ? "sheet_not_found" : `http_${res.status}`;
+    const err = translateSheetWriteError(code, sheetName, "gravar");
+    err.snapshot = snapshot;
+    throw err;
+  }
 
   let json;
   try {
     json = await res.json();
   } catch {
-    throw new Error("Gravação enviada, mas não foi possível confirmar a resposta da API.");
+    const err = new Error("Gravação enviada, mas não foi possível confirmar a resposta da API.");
+    err.snapshot = snapshot;
+    throw err;
   }
 
   return {
     cellsWritten: json.totalUpdatedCells ?? data.length,
     rowsWritten: json.totalUpdatedRows ?? data.length,
     skipped,
+    warnings: dynamicMap.warnings,
+    // Requisito 2: devolvido SEMPRE numa gravação bem sucedida, para que
+    // quem chamar possa guardar em state e oferecer "Reverter Última
+    // Gravação" (ver revertSheetSnapshot).
+    snapshot,
   };
+}
+
+// FUNÇÃO PEDIDA: revertSheetSnapshot — restaura a aba de saída EXATAMENTE
+// como estava antes da última gravação, reescrevendo (PUT
+// values/{range}) o mesmo range e os mesmos valores capturados pelo
+// snapshot de exportBookingsToGoogleSheet. Como o range cobre a grelha
+// INTEIRA lida antes de gravar, o restauro repõe também qualquer barra
+// "Dia X" entretanto atualizada — não só as células "Nome" tocadas.
+async function revertSheetSnapshot({ snapshot, accessToken }) {
+  if (!snapshot) {
+    throw new Error("Não há nenhuma gravação anterior para reverter nesta sessão.");
+  }
+  if (!accessToken) {
+    throw new Error("Sessão Google não está ativa. Autentica-te antes de reverter.");
+  }
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${snapshot.sheetId}/values/${encodeURIComponent(snapshot.range)}?valueInputOption=USER_ENTERED`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ range: snapshot.range, majorDimension: "ROWS", values: snapshot.values }),
+    });
+  } catch {
+    throw translateSheetWriteError("network_error", snapshot.sheetName, "reverter");
+  }
+  if (!res.ok) {
+    const code = res.status === 401 ? "token_expired" : res.status === 403 ? "permission_denied" : (res.status === 400 || res.status === 404) ? "sheet_not_found" : `http_${res.status}`;
+    throw translateSheetWriteError(code, snapshot.sheetName, "reverter");
+  }
+  try {
+    return await res.json();
+  } catch {
+    throw new Error("Reversão enviada, mas não foi possível confirmar a resposta da API.");
+  }
 }
 // ============================================================================
 
@@ -3348,6 +3641,15 @@ function InterviewPhasePage({
   // Estado da gravação no Google Sheets: "idle" | "saving" | "done" | "error".
   const [sheetSaveState, setSheetSaveState] = useState("idle");
   const [sheetSaveMessage, setSheetSaveMessage] = useState("");
+  // Requisito 2 (Backup/Reverter): snapshot da grelha da aba de saída
+  // capturado pela ÚLTIMA gravação bem sucedida nesta sessão (ver
+  // exportBookingsToGoogleSheet -> result.snapshot) — guardado em memória
+  // (state), nunca persistido. "Reverter Última Gravação" só fica ativo
+  // depois de haver uma gravação bem sucedida com snapshot guardado.
+  const [lastSnapshot, setLastSnapshot] = useState(null);
+  // Estado da reversão: "idle" | "reverting" | "done" | "error".
+  const [revertState, setRevertState] = useState("idle");
+  const [revertMessage, setRevertMessage] = useState("");
 
   const byId = (id) => members.find((m) => m.id === id);
   const candById = (id) => candidates.find((c) => c.id === id);
@@ -3426,15 +3728,23 @@ function InterviewPhasePage({
     downloadCSV(`${phaseKey}-agendamentos${deptSuffix}.csv`, [header, ...rows]);
   };
 
-  // "Gravar na Folha Google": envia os agendamentos "Agendado" DESTA fase
+  // "Gravar no Google Sheets": envia os agendamentos "Agendado" DESTA fase
   // (visibleBookings — respeita o filtro de departamento atual, tal como
   // o Exportar CSV) para a aba de saída correspondente
-  // (SYNC_OUTPUT_SHEET_NAMES[phaseKey]), via exportBookingsToGoogleSheet().
-  // Se a sessão Google entretanto expirou, tenta renovar o token em
-  // silêncio (onRequestToken) antes de desistir e mostrar erro.
+  // (SYNC_OUTPUT_SHEET_NAMES[phaseKey]), via exportBookingsToGoogleSheet()
+  // — que faz sempre a deteção dinâmica da estrutura da folha e devolve o
+  // snapshot de segurança capturado ANTES de escrever (requisito 2),
+  // guardado aqui para o botão "Reverter Última Gravação". Se a sessão
+  // Google entretanto expirou, tenta renovar o token em silêncio
+  // (onRequestToken) antes de desistir e mostrar erro.
   const saveToGoogleSheet = async () => {
     setSheetSaveState("saving");
     setSheetSaveMessage("A gravar...");
+    // Uma nova gravação torna o snapshot da reversão anterior obsoleto —
+    // limpa o estado do Reverter até esta gravação terminar (com sucesso,
+    // fica com o snapshot NOVO, capturado mesmo antes desta escrita).
+    setRevertState("idle");
+    setRevertMessage("");
     try {
       let token = accessToken;
       if (!token) {
@@ -3450,13 +3760,44 @@ function InterviewPhasePage({
         phaseKey,
         accessToken: token,
       });
+      setLastSnapshot(result.snapshot || null);
       setSheetSaveState("done");
-      setSheetSaveMessage(
-        `Gravação concluída com sucesso! ${result.rowsWritten} agendamento(s) escrito(s) em "${SYNC_OUTPUT_SHEET_NAMES[phaseKey]}".`
-      );
+      const warnSuffix = result.warnings?.length ? ` (${result.warnings.length} aviso(s) de estrutura — ver consola)` : "";
+      const skipSuffix = result.skipped?.length ? ` ${result.skipped.length} candidato(s) ignorado(s) sem célula correspondente.` : "";
+      setSheetSaveMessage(`Gravação Concluída! ${result.rowsWritten} célula(s) escrita(s) em "${SYNC_OUTPUT_SHEET_NAMES[phaseKey]}".${skipSuffix}${warnSuffix}`);
+      if (result.warnings?.length) console.warn(`[Gravar no Google Sheets] Avisos de estrutura em "${SYNC_OUTPUT_SHEET_NAMES[phaseKey]}":`, result.warnings);
     } catch (err) {
+      // Mesmo numa gravação falhada a meio, se já havia snapshot
+      // capturado (ver err.snapshot em exportBookingsToGoogleSheet), fica
+      // disponível para reverter por segurança.
+      if (err.snapshot) setLastSnapshot(err.snapshot);
       setSheetSaveState("error");
-      setSheetSaveMessage(err.message || "Não foi possível gravar na Folha Google.");
+      setSheetSaveMessage(err.message || "Não foi possível gravar no Google Sheets.");
+    }
+  };
+
+  // "Reverter Última Gravação": restaura a aba de saída EXATAMENTE como
+  // estava antes da última gravação bem sucedida (lastSnapshot), via
+  // revertSheetSnapshot(). Só fica ativo quando existe um snapshot desta
+  // sessão — a app nunca inventa um estado "anterior" sem o ter lido.
+  const revertLastSave = async () => {
+    if (!lastSnapshot) return;
+    setRevertState("reverting");
+    setRevertMessage("A reverter...");
+    try {
+      let token = accessToken;
+      if (!token) {
+        if (!onRequestToken) throw new Error("Sessão Google não está ativa. Autentica-te na aba \"Importar\" antes de reverter.");
+        const renewed = await onRequestToken({ silent: false });
+        token = renewed?.accessToken;
+        if (!token) throw new Error("Sessão Google não está ativa. Autentica-te na aba \"Importar\" antes de reverter.");
+      }
+      await revertSheetSnapshot({ snapshot: lastSnapshot, accessToken: token });
+      setRevertState("done");
+      setRevertMessage(`Restaurado com Sucesso! A aba "${lastSnapshot.sheetName}" foi reposta como estava antes da última gravação.`);
+    } catch (err) {
+      setRevertState("error");
+      setRevertMessage(err.message || "Não foi possível reverter a última gravação.");
     }
   };
 
@@ -3504,7 +3845,28 @@ function InterviewPhasePage({
             ) : (
               <UploadCloud size={14} />
             )}
-            Gravar na Folha Google
+            Gravar no Google Sheets
+          </button>
+          <button
+            onClick={revertLastSave}
+            disabled={!lastSnapshot || revertState === "reverting"}
+            className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2 disabled:opacity-40"
+            title={
+              lastSnapshot
+                ? `Restaura a aba "${lastSnapshot.sheetName}" exatamente como estava antes da última gravação (${new Date(lastSnapshot.takenAt).toLocaleTimeString("pt-PT")})`
+                : "Só fica ativo depois de uma gravação bem sucedida nesta sessão"
+            }
+          >
+            {revertState === "reverting" ? (
+              <RefreshCw size={14} className="animate-spin" />
+            ) : revertState === "done" ? (
+              <CheckCircle2 size={14} style={{ color: "#065f46" }} />
+            ) : revertState === "error" ? (
+              <XCircle size={14} style={{ color: "#c0227a" }} />
+            ) : (
+              <Undo2 size={14} />
+            )}
+            Reverter Última Gravação
           </button>
           <button onClick={() => onGenerate(departmentFilter)} className="yme-btn-primary flex items-center gap-1.5 text-sm rounded-lg px-3 py-2 font-medium">
             <RefreshCw size={14} /> Gerar Agendamentos Automaticamente
@@ -3514,7 +3876,7 @@ function InterviewPhasePage({
 
       {sheetSaveState !== "idle" && (
         <div
-          className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-6 text-xs leading-relaxed"
+          className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-3 text-xs leading-relaxed"
           style={
             sheetSaveState === "error"
               ? { backgroundColor: hexToRgba("#c0227a", 0.08), borderColor: hexToRgba("#c0227a", 0.3), color: COLORS.navy }
@@ -3531,6 +3893,28 @@ function InterviewPhasePage({
             <RefreshCw size={16} className="shrink-0 mt-0.5 animate-spin" />
           )}
           <p className="font-medium">{sheetSaveMessage}</p>
+        </div>
+      )}
+
+      {revertState !== "idle" && (
+        <div
+          className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-6 text-xs leading-relaxed"
+          style={
+            revertState === "error"
+              ? { backgroundColor: hexToRgba("#c0227a", 0.08), borderColor: hexToRgba("#c0227a", 0.3), color: COLORS.navy }
+              : revertState === "done"
+              ? { backgroundColor: "#bbf7d0", borderColor: "#065f46", color: "#065f46" }
+              : { backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.15), color: COLORS.navy }
+          }
+        >
+          {revertState === "error" ? (
+            <XCircle size={16} className="shrink-0 mt-0.5" style={{ color: "#c0227a" }} />
+          ) : revertState === "done" ? (
+            <CheckCircle2 size={16} className="shrink-0 mt-0.5" style={{ color: "#065f46" }} />
+          ) : (
+            <RefreshCw size={16} className="shrink-0 mt-0.5 animate-spin" />
+          )}
+          <p className="font-medium">{revertMessage}</p>
         </div>
       )}
 
