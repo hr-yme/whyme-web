@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-08-28-mrv-smart-schedule";
+const APP_BUILD = "build-2026-08-28-v3-fix-evaluator-parser";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = ["09:00", "10:30", "14:00", "15:30", "17:00"];
@@ -1186,77 +1186,59 @@ function mergeTwoRowHeader(dayRow, hourRow) {
 }
 
 // ----------------------------------------------------------------------
-// PARSER POSICIONAL FIXO DO EXCEL MESTRE DE AVALIADORES (Diretores/RH/
-// Direção) — a estrutura desta aba específica foi confirmada manualmente
-// pelo RH e é sempre a mesma, independentemente do conteúdo:
-//   Linha 7  (índice 6) = Dias   (ex. "Dia 10 - Quarta", "Dia 11 - Quinta")
-//   Linha 8  (índice 7) = Horas  (ex. "9-9:30", "9:30-10", "10 - 10:30")
-//   Linha 9+ (índice 8+), Coluna B (índice 1) = Nome do avaliador
-//   Células de dados = "Disponível" / "Indisponível"
-// Ao contrário de parseApiValues() (que ADIVINHA onde está o cabeçalho por
-// palavras-chave/heurísticas de densidade), esta função usa estes 3
-// apontadores fixos diretamente — mais robusto para ESTA aba específica.
-// Se a estrutura não bater (linhas 7/8 vazias, ou nenhum nome encontrado
-// na Coluna B a partir da linha 9), devolve `null` para o chamador poder
-// recorrer ao parser dinâmico (parseApiValues) como rede de segurança, em
-// vez de a sincronização falhar em silêncio.
+// PARSER DO EXCEL MESTRE DE AVALIADORES (Diretores/RH/Supervisores)
+// Localiza dinamicamente as linhas de Dia e de Hora e a coluna de Nomes
+// (Coluna A ou B), sem depender de índices fixos de linha.
 // ----------------------------------------------------------------------
-const MASTER_EXCEL_DAY_ROW = 6;        // Linha 7
-const MASTER_EXCEL_HOUR_ROW = 7;       // Linha 8
-const MASTER_EXCEL_NAME_COL = 1;       // Coluna B
-const MASTER_EXCEL_FIRST_DATA_ROW = 8; // Linha 9
 
-// Limpa o nome de um avaliador lido da Coluna B: remove cargo secundário
-// entre parênteses (ex. "Beatriz Garcia (CEO)" -> "Beatriz Garcia") — o
-// resto da app (Base Dados Departamentos, ORG, etc.) nunca inclui o cargo
-// no nome, por isso isto é o que permite o matching (findMemberIndex,
-// mais abaixo) encontrar a MESMA pessoa sem exigir igualdade exata.
+// Limpa o nome de um avaliador: remove cargo secundário entre parênteses
+// (ex. "Beatriz Garcia (CEO)" -> "Beatriz Garcia") — permitindo o matching
+// exato com findMemberIndex.
 function cleanEvaluatorName(raw) {
   return cleanCellText(raw).replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
 }
 
-// Lê a grelha bruta (array de arrays) desta aba usando os apontadores
-// fixos acima, devolvendo o mesmo formato { header, rows, headerIdx } que
-// parseApiValues() — para que todo o resto do código (extractAvailability-
-// FromRow, o merge com `members`, etc.) continue a funcionar sem alterações.
+// Lê a grelha bruta (array de arrays) das abas de disponibilidade de avaliadores
 function parseMasterExcel(grid) {
   const rows = grid || [];
-  const dayRow = rows[MASTER_EXCEL_DAY_ROW];
-  const hourRow = rows[MASTER_EXCEL_HOUR_ROW];
-  if (!dayRow || !hourRow) return null;
-  // Requisito 1: propaga a Linha 7 (dias) para a direita e combina com a
-  // Linha 8 (horas) — mergeTwoRowHeader já resolve o dia para a sua forma
-  // curta canónica antes de colar com a hora (ex. "Dia 10 - Quarta" +
-  // "9-9:30" -> "Qua 9-9:30"), evitando qualquer confusão entre o número
-  // do dia do mês e a hora em si.
+  if (!rows.length) return null;
+
+  // Localiza dinamicamente a linha de dias e a linha de horas
+  const dayRowIdx = rows.findIndex((r) => r && r.some((c) => /dia \d+/i.test(String(c)) || /segunda|ter[cç]a|quarta|quinta|sexta/i.test(normKey(c))));
+  if (dayRowIdx < 0) return null;
+  const hourRowIdx = rows.findIndex((r, idx) => idx > dayRowIdx && r && r.some((c) => /9-9:30|9:30-10|10 - 10:30|10:30 - 11/i.test(String(c))));
+  if (hourRowIdx < 0) return null;
+
+  const dayRow = rows[dayRowIdx];
+  const hourRow = rows[hourRowIdx];
   const header = mergeTwoRowHeader(dayRow, hourRow);
   if (!header.some((h) => h && normalizeDayOnlyHeader(h) !== null)) return null;
 
-  const dataRows = [];
-  for (let r = MASTER_EXCEL_FIRST_DATA_ROW; r < rows.length; r++) {
+  // Descobre dinamicamente em qual coluna (A=0 ou B=1) começam os nomes dos avaliadores
+  let nameColIdx = 0;
+  for (let r = hourRowIdx + 1; r < rows.length; r++) {
     const raw = rows[r] || [];
-    // Requisito 1 + 2: Coluna B = nome, a partir da Linha 9; ignora linhas
-    // em branco ou sem nome; limpa o cargo entre parênteses.
-    const name = cleanEvaluatorName(raw[MASTER_EXCEL_NAME_COL]);
+    if (cleanEvaluatorName(raw[0])) { nameColIdx = 0; break; }
+    if (cleanEvaluatorName(raw[1])) { nameColIdx = 1; break; }
+  }
+
+  const dataRows = [];
+  for (let r = hourRowIdx + 1; r < rows.length; r++) {
+    const raw = rows[r] || [];
+    const name = cleanEvaluatorName(raw[nameColIdx]);
     if (!name) continue;
     const obj = { Nome: name };
     header.forEach((h, i) => { if (h) obj[h] = raw[i] ?? ""; });
     dataRows.push({ obj, raw });
   }
   if (!dataRows.length) return null;
-  // Requisito 4 (debug): lista no consola (F12) cada avaliador encontrado
-  // e os horários já resolvidos (dia+hora oficiais), calculados aqui só
-  // para efeitos do log — extractAvailabilityFromRow() é chamada de novo,
-  // sem custo relevante, pelo código que efetivamente consome este
-  // resultado (merge com `members`). Isto é o que permite confirmar
-  // visualmente se Gustavo Dias, Mariana Lopes, Joana Pereira, etc.
-  // ficaram com horários reconhecidos, logo a seguir à leitura do ficheiro.
+
   const evaluatorsMap = dataRows.map(({ obj }) => ({
     nome: obj.Nome,
     horarios: extractAvailabilityFromRow(header, obj).slots,
   }));
   console.log("Avaliadores carregados:", evaluatorsMap);
-  return { header, rows: dataRows, headerIdx: MASTER_EXCEL_HOUR_ROW };
+  return { header, rows: dataRows, headerIdx: hourRowIdx };
 }
 
 // Deteta se uma linha da grelha se parece com uma linha de RÓTULOS DE HORA
