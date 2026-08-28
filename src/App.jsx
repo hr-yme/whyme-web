@@ -64,10 +64,13 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-08-28-v3-fix-evaluator-parser";
+const APP_BUILD = "build-2026-08-28-v5-full-30min-slots";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
-const TIMES = ["09:00", "10:30", "14:00", "15:30", "17:00"];
+const TIMES = [
+  "09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30",
+  "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30"
+];
 const SLOTS = DAYS.flatMap((d) => TIMES.map((t) => `${d} ${t}`));
 
 // Duração PADRÃO (fallback) de um slot de entrevista, em minutos — usada
@@ -1012,7 +1015,7 @@ const OFFICIAL_TIME_MINUTES = TIMES.map((t) => {
 // dos 5 horários oficiais — qualquer desvio, por mínimo que fosse, fazia a
 // coluna inteira ser ignorada. Agora usa-se a hora oficial mais próxima,
 // dentro desta margem.
-const SLOT_MATCH_TOLERANCE_MIN = 45;
+const SLOT_MATCH_TOLERANCE_MIN = 15;
 
 // Devolve o horário oficial (uma das strings de TIMES) mais próximo de
 // `minutes` (minutos desde a meia-noite), ou null se mesmo o mais próximo
@@ -2076,104 +2079,134 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
   }
 
   const poolToSchedule = pool.filter((c) => !kept.some((b) => b.candidateId === c.id));
-  // Otimização MRV (Most Constrained First): processa primeiro os candidatos com
-  // menor número de opções disponíveis, para que quem tem pouca flexibilidade fique
-  // com a sua vaga antes de ela ser ocupada por quem tem várias opções compatíveis.
-  const sortedPool = [...poolToSchedule].sort((a, b) => {
-    const aLen = (a.availability?.[availField] || []).length;
-    const bLen = (b.availability?.[availField] || []).length;
-    if (aLen === 0) return 1;
-    if (bLen === 0) return -1;
-    return aLen - bLen;
+  
+  // Agrupa os candidatos por departamento para otimização máxima independente por departamento
+  const byDept = {};
+  poolToSchedule.forEach((c) => {
+    const d = c.department || "Geral";
+    (byDept[d] || (byDept[d] = [])).push(c);
   });
 
   const newBookings = [];
-  sortedPool.forEach((c) => {
-    // Diretor por departamento — com FALLBACK GLOBAL: se não houver
-    // Diretor explicitamente associado a este departamento no Excel
-    // Mestre (mesmo já com a tolerância de deptMatches), usa qualquer
-    // Diretor disponível na organização como validador, em vez de deixar
-    // `diretor` por preencher e bloquear TODOS os candidatos desse
-    // departamento. `diretorIsFallback` fica registado para o diagnóstico
-    // poder distinguir os dois casos.
-    const diretorStrict = members.find((m) => m.role === "Diretor" && memberHasDept(m, c.department));
+
+  Object.keys(byDept).forEach((dept) => {
+    const deptPool = byDept[dept];
+    const diretorStrict = members.find((m) => m.role === "Diretor" && memberHasDept(m, dept));
     const diretor = diretorStrict || members.find((m) => m.role === "Diretor") || null;
     const diretorIsFallback = !diretorStrict && !!diretor;
-    const supervisor = staffKeys.includes("supervisorId") ? members.find((m) => m.role === "Supervisor" && memberHasDept(m, c.department)) : null;
+    const supervisor = staffKeys.includes("supervisorId") ? members.find((m) => m.role === "Supervisor" && memberHasDept(m, dept)) : null;
 
-    // PASSO 1 — ATRIBUIÇÃO DIRETA POR DEPARTAMENTO, independente do
-    // horário: primeiro decide-se QUEM é o RH responsável (rhForDepartment
-    // + round-robin), só depois é que se tenta cruzar horários. A coluna
-    // RH usa sempre `assignedRH`, mesmo que o cruzamento abaixo não
-    // encontre nenhum slot comum. Mesmo FALLBACK GLOBAL que o Diretor: se
-    // não houver nenhum RH explicitamente associado a este departamento,
-    // usa a equipa de RH inteira da organização como candidatos válidos,
-    // em vez de bloquear o agendamento por completo.
-    let rhList = rhForDepartment(members, c.department);
+    let rhList = rhForDepartment(members, dept);
     const rhIsFallback = !rhList.length;
     if (rhIsFallback) rhList = members.filter((m) => m.role === "RH");
-    const assignedRH = nextRoundRobinRH(c.department, rhList);
 
-    let found = null;
-    for (const slot of (c.availability?.[availField] || [])) {
-      if (!diretor || !hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) continue;
-      if (staffKeys.includes("supervisorId")) {
-        if (!supervisor || !hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) continue;
+    // Mapeia todas as opções válidas de cada candidato com a equipa avaliadora
+    const candidatesMeta = deptPool.map((c) => {
+      const validSlots = [];
+      const slots = c.availability?.[availField] || [];
+      slots.forEach((slot) => {
+        if (!diretor || !hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return;
+        if (staffKeys.includes("supervisorId")) {
+          if (!supervisor || !hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return;
+        }
+        const freeRH = rhList.filter((r) => hasSlot(minutesOf(r), slot) && !busy[r.id]?.has(slot));
+        if (freeRH.length) {
+          validSlots.push({ slot, freeRH });
+        }
+      });
+      return { candidate: c, validSlots, assignedRHDefault: nextRoundRobinRH(dept, rhList) };
+    });
+
+    // OTIMIZADOR DE EMPARELHAMENTO MÁXIMO (Algoritmo de Kuhn com caminhos de aumento):
+    // Reorganiza dinamicamente as escolhas para encontrar a combinação matematicamente
+    // ótima que maximiza o número total de candidatos com entrevista agendada.
+    const slotOwner = {}; // slotKey -> candIdx
+    const slotChosenRH = {}; // slotKey -> rh
+
+    function tryMatch(u, seen) {
+      const meta = candidatesMeta[u];
+      for (const sInfo of meta.validSlots) {
+        const slotKey = sInfo.slot;
+        if (!seen.has(slotKey)) {
+          seen.add(slotKey);
+          if (slotOwner[slotKey] === undefined || tryMatch(slotOwner[slotKey], seen)) {
+            slotOwner[slotKey] = u;
+            const prefRH = sInfo.freeRH.find(r => r.id === meta.assignedRHDefault?.id) || sInfo.freeRH[0];
+            slotChosenRH[slotKey] = prefRH;
+            return true;
+          }
+        }
       }
-      // PASSO 3 — FALLBACK DE DISPONIBILIDADE: tenta primeiro o RH
-      // atribuído pelo round-robin (`assignedRH`); só se ele não tiver
-      // este slot livre (ou estiver ocupado com outro candidato) é que se
-      // testam os restantes membros de RH do mesmo departamento (ou de
-      // toda a organização, se `rhIsFallback`), por ordem, antes de
-      // desistir deste slot e passar ao seguinte.
-      const rhCandidates = [assignedRH, ...rhList.filter((r) => r.id !== assignedRH?.id)].filter(Boolean);
-      const rh = rhCandidates.find((r) => hasSlot(minutesOf(r), slot) && !busy[r.id]?.has(slot));
-      if (rh) { found = { slot, diretor, rh, supervisor }; break; }
+      return false;
     }
 
-    if (found) {
-      const record = { id: uid("bk"), candidateId: c.id, slot: found.slot, diretorId: found.diretor.id, rhId: found.rh.id, status: "Agendado", manual: false };
-      if (staffKeys.includes("supervisorId")) record.supervisorId = found.supervisor.id;
-      staffKeys.forEach((k) => { const mid = record[k]; if (mid) { busy[mid] = busy[mid] || new Set(); busy[mid].add(found.slot); } });
-      newBookings.push(record);
-    } else {
-      // "Sem alocação" só deve aparecer quando NÃO EXISTE sequer 1 RH em
-      // toda a organização (rhList vazia -> assignedRH null, o que só
-      // acontece se `members` não tiver NENHUM role="RH"). Havendo
-      // qualquer RH (do departamento ou do fallback global), a coluna
-      // mostra sempre `assignedRH` — só o Horário fica por preencher e o
-      // Estado mantém "Sem Horário Comum".
-      const record = { id: uid("bk"), candidateId: c.id, slot: null, diretorId: diretor?.id || null, rhId: assignedRH?.id || null, status: "Sem Horário Comum", manual: false };
-      if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
-      // DIAGNÓSTICO (requisito 3): em vez de só "Sem Horário Comum" sem
-      // mais nenhuma pista, guarda no próprio registo qual foi exatamente
-      // o motivo — mostrado como tooltip no Estado (ver StatusBadge). A
-      // ordem dos testes segue a cadeia de dependências reais do
-      // cruzamento: primeiro se sequer existe Diretor/RH em TODA a
-      // organização, depois se algum deles tem disponibilidade nenhuma
-      // registada, e só por fim (o caso mais comum) se não há interseção
-      // de horários entre quem já existe — incluindo aviso quando foi
-      // preciso recorrer ao fallback global (departamento sem Diretor/RH
-      // próprio no Excel Mestre).
-      let reason;
-      if (!diretor) {
-        reason = `Nenhum(a) Diretor(a) registado no Excel Mestre (nenhum membro com role "Diretor").`;
-      } else if (!minutesOf(diretor).size) {
-        reason = diretorIsFallback
-          ? `Nenhum(a) Diretor(a) associado ao departamento "${c.department}" — usou-se ${diretor.name} (Diretor de outro departamento) como fallback, mas também sem horários registados no Excel Mestre.`
-          : `Diretor(a) ${diretor.name} sem horários registados no Excel Mestre.`;
-      } else if (!rhList.length) {
-        reason = `Nenhum Membro de RH registado no Excel Mestre (nenhum membro com role "RH").`;
-      } else if (!rhList.some((r) => minutesOf(r).size)) {
-        reason = rhIsFallback
-          ? `Nenhum Membro de RH associado ao departamento "${c.department}" — usou-se a equipa de RH de outros departamentos como fallback, mas também sem horários registados no Excel Mestre.`
-          : `Equipa de RH de "${c.department}" sem horários registados no Excel Mestre.`;
+    const sortedIndices = candidatesMeta
+      .map((m, i) => ({ i, len: m.validSlots.length }))
+      .sort((a, b) => (a.len === 0 ? 1 : b.len === 0 ? -1 : a.len - b.len))
+      .map(x => x.i);
+
+    sortedIndices.forEach((u) => {
+      if (candidatesMeta[u].validSlots.length > 0) {
+        tryMatch(u, new Set());
+      }
+    });
+
+    const candAssigned = {};
+    Object.keys(slotOwner).forEach((slotKey) => {
+      const u = slotOwner[slotKey];
+      candAssigned[u] = { slot: slotKey, rh: slotChosenRH[slotKey] };
+      if (diretor) { busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slotKey); }
+      if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slotKey); }
+      const rh = slotChosenRH[slotKey];
+      if (rh) { busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slotKey); }
+    });
+
+    candidatesMeta.forEach((meta, u) => {
+      const c = meta.candidate;
+      const match = candAssigned[u];
+      if (match) {
+        const record = {
+          id: uid("bk"),
+          candidateId: c.id,
+          slot: match.slot,
+          diretorId: diretor?.id || null,
+          rhId: match.rh?.id || null,
+          status: "Agendado",
+          manual: false
+        };
+        if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
+        newBookings.push(record);
       } else {
-        reason = `Sem interseção entre os horários de ${c.name} e a equipa (Diretor(a)/RH) ${diretorIsFallback || rhIsFallback ? "(via fallback global)" : `de "${c.department}"`}.`;
+        const record = {
+          id: uid("bk"),
+          candidateId: c.id,
+          slot: null,
+          diretorId: diretor?.id || null,
+          rhId: meta.assignedRHDefault?.id || null,
+          status: "Sem Horário Comum",
+          manual: false
+        };
+        if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
+        let reason;
+        if (!diretor) {
+          reason = `Nenhum(a) Diretor(a) registado no Excel Mestre (nenhum membro com role "Diretor").`;
+        } else if (!minutesOf(diretor).size) {
+          reason = diretorIsFallback
+            ? `Nenhum(a) Diretor(a) associado ao departamento "${c.department}" — usou-se ${diretor.name} (Diretor de outro departamento) como fallback, mas também sem horários registados no Excel Mestre.`
+            : `Diretor(a) ${diretor.name} sem horários registados no Excel Mestre.`;
+        } else if (!rhList.length) {
+          reason = `Nenhum Membro de RH registado no Excel Mestre (nenhum membro com role "RH").`;
+        } else if (!rhList.some((r) => minutesOf(r).size)) {
+          reason = rhIsFallback
+            ? `Nenhum Membro de RH associado ao departamento "${c.department}" — usou-se a equipa de RH de outros departamentos como fallback, mas também sem horários registados no Excel Mestre.`
+            : `Equipa de RH de "${c.department}" sem horários registados no Excel Mestre.`;
+        } else {
+          reason = `Sem interseção entre os horários de ${c.name} e a equipa (Diretor(a)/RH) ${diretorIsFallback || rhIsFallback ? "(via fallback global)" : `de "${c.department}"`}.`;
+        }
+        record.reason = reason;
+        newBookings.push(record);
       }
-      record.reason = reason;
-      newBookings.push(record);
-    }
+    });
   });
 
   // Mantém a ordem de apresentação original do pool
