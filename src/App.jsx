@@ -485,6 +485,28 @@ function getEliminationPhase(c) {
 const SYNC_URL_STORAGE_KEY = "yme_master_sheet_url";
 const SYNC_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 em 2 minutos
 
+// Abas de SAÍDA (escrita) — os "mapas de horários por dia e departamento"
+// já existentes na folha da YME, um por fase de entrevista, onde a app
+// escreve o Nome do candidato agendado na célula correspondente ao
+// dia/hora (linha) x departamento (coluna). Só cobrem as fases com botão
+// "Gravar na Folha Google" (Fase 2/Soft Skills e Fase 4/Hard Skills);
+// a Fase 3 (Dinâmicas de Grupo) usa grupos, não um slot por candidato, e
+// fica fora deste mapeamento.
+const SYNC_OUTPUT_SHEET_NAMES = {
+  fase1: "'Organização Entrevistas RH'",
+  fase3: "'Organização Entrevista Final'",
+};
+// Linha (1-based) onde começa o cabeçalho de departamentos nas abas de
+// saída acima — linha 1 = "Dia", linha 2 = "Hora", coluna C em diante =
+// um departamento por coluna (na mesma ordem de DEPARTMENTS), e os dados
+// (Nome do candidato agendado) a partir da linha seguinte, uma linha por
+// slot oficial de SLOTS (mesma ordem Dia->Hora usada em toda a app).
+// AJUSTA ESTES 3 VALORES SE A ESTRUTURA REAL DA TUA FOLHA "ORGANIZAÇÃO
+// ENTREVISTAS RH"/"ORGANIZAÇÃO ENTREVISTA FINAL" DIFERIR (nº de linhas de
+// cabeçalho, coluna onde começa a Nome do 1º departamento).
+const SYNC_OUTPUT_HEADER_ROWS = 2;      // nº de linhas de cabeçalho antes dos dados
+const SYNC_OUTPUT_FIRST_DEPT_COL = "C"; // 1ª coluna de departamento (A=Dia, B=Hora)
+
 // A. Abas gerais de base de dados e disponibilidades (nomes exatos das abas com aspas simples para a API do Google).
 const SYNC_SHEET_NAMES = {
   departamentos: "'Base Dados Departamentos'",
@@ -568,10 +590,17 @@ const GOOGLE_CLIENT_ID = "1073691932169-dl8eu8rlsknece09vv6d53hacgeo2h5r.apps.go
 
 
 
-// Âmbitos pedidos: leitura da folha (spreadsheets.readonly) + identidade
-// básica (openid/email/profile), só para mostrar "Sessão Ativa: conta@yme.pt"
-// na interface. Nunca é pedido acesso de escrita à folha.
-const GOOGLE_SHEETS_SCOPES = "openid email profile https://www.googleapis.com/auth/spreadsheets.readonly";
+// Âmbitos pedidos: acesso de LEITURA E ESCRITA à folha
+// (spreadsheets — sem ".readonly") + identidade básica (openid/email/
+// profile), só para mostrar "Sessão Ativa: conta@yme.pt" na interface.
+// CORREÇÃO: o âmbito ".readonly" já não chega — a funcionalidade "Gravar
+// na Folha Google" (exportBookingsToGoogleSheet) precisa de autorização
+// de ESCRITA (values:batchUpdate) na mesma folha "Organização Entrevistas
+// RH"/"Organização Entrevista Final". Esta constante é a referência única
+// do âmbito pedido ao utilizador — usada por useGoogleAuth() ao
+// inicializar o tokenClient, para nunca haver dois valores dessincroni-
+// zados (um "documentado" aqui e outro realmente pedido no initTokenClient).
+const GOOGLE_SHEETS_SCOPES = "openid email profile https://www.googleapis.com/auth/spreadsheets";
 
 function loadGoogleIdentityScript() {
   return new Promise((resolve, reject) => {
@@ -623,7 +652,7 @@ function useGoogleAuth() {
         }
         tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
           client_id: GOOGLE_CLIENT_ID,
-          scope: "https://www.googleapis.com/auth/spreadsheets",
+          scope: GOOGLE_SHEETS_SCOPES,
           callback: () => {}, // é substituído a cada pedido em requestToken()
         });
         setAuth((a) => ({ ...a, ready: true }));
@@ -709,6 +738,21 @@ function colLetterToIndex(letter) {
   const s = String(letter || "").trim().toUpperCase();
   for (let i = 0; i < s.length; i++) n = n * 26 + (s.charCodeAt(i) - 64);
   return n - 1;
+}
+
+// Inverso de colLetterToIndex(): índice de coluna 0-based -> letra (0->A,
+// 1->B, ..., 25->Z, 26->AA, ...) — necessário para calcular a célula exata
+// (ex. "D37") de cada agendamento ao escrever no Google Sheets, já que a
+// API não aceita coordenadas numéricas diretamente em notação A1.
+function colIndexToLetter(index) {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
 }
 
 function isPositiveMark(val) {
@@ -889,6 +933,109 @@ function translateSheetApiError(code, sheetName) {
   }
   return new Error(`Não foi possível ler a aba "${sheetName}" (${code}).`);
 }
+
+// ============================================================================
+// FUNÇÃO PEDIDA: exportBookingsToGoogleSheet — escreve os agendamentos
+// gerados ("Agendado") de volta na folha privada da YME, no mapa de
+// horários por dia e departamento da aba de saída da fase em causa
+// ("Organização Entrevistas RH" para a Fase 2/Soft Skills, "Organização
+// Entrevista Final" para a Fase 4/Hard Skills — ver SYNC_OUTPUT_SHEET_NAMES).
+//
+// Mapeamento célula <-> agendamento: cada slot oficial ("Seg 09:00", ...)
+// corresponde a UMA LINHA da aba de saída, pela mesma ordem de SLOTS,
+// começando logo a seguir às linhas de cabeçalho (SYNC_OUTPUT_HEADER_ROWS);
+// cada Departamento (na ordem fixa de DEPARTMENTS) corresponde a UMA
+// COLUNA, a partir de SYNC_OUTPUT_FIRST_DEPT_COL. Para cada booking com
+// status "Agendado", calcula-se a linha (pelo slot) e a coluna (pelo
+// departamento do candidato) e escreve-se o Nome do candidato nessa
+// célula — exatamente a coluna "Nome" do respetivo dia/horário/
+// departamento pedida.
+//
+// A escrita é feita numa ÚNICA chamada à API (values:batchUpdate, POST),
+// com um "data[]" — uma entrada { range, values } por candidato agendado
+// — em vez de uma chamada por célula, para nunca esbarrar no limite de
+// pedidos por segundo da Google Sheets API com muitos candidatos.
+//
+// Nunca sobrescreve outras células fora do mapa de horários (Diretor/RH,
+// notas, etc. ficam intactas): só escreve exatamente as células "Nome" do
+// dia/hora/departamento de cada candidato agendado.
+async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phaseKey, accessToken }) {
+  if (!accessToken) {
+    throw new Error("Sessão Google não está ativa. Autentica-te antes de gravar na folha.");
+  }
+  if (!sheetId) {
+    throw new Error("Link/ID da Folha Google Mestre não configurado (aba \"Importar\").");
+  }
+  const sheetName = SYNC_OUTPUT_SHEET_NAMES[phaseKey];
+  if (!sheetName) {
+    throw new Error(`Não existe aba de saída configurada para a fase "${phaseKey}".`);
+  }
+
+  const candById = (id) => candidates.find((c) => c.id === id);
+  const firstDeptColIdx = colLetterToIndex(SYNC_OUTPUT_FIRST_DEPT_COL);
+
+  // Constrói uma entrada { range, values } por candidato "Agendado" —
+  // agendamentos sem slot ("Sem Horário Comum") ou manuais sem candidato
+  // válido são ignorados, nunca escritos como célula em branco (isso
+  // apagaria por engano um nome já lá escrito por outra sincronização).
+  const data = [];
+  const skipped = [];
+  bookings.forEach((b) => {
+    if (b.status !== "Agendado" || !b.slot) return;
+    const cand = candById(b.candidateId);
+    if (!cand) { skipped.push(b.id); return; }
+    const slotRowOffset = SLOTS.indexOf(b.slot);
+    const deptColOffset = DEPARTMENTS.indexOf(cand.department);
+    if (slotRowOffset < 0 || deptColOffset < 0) { skipped.push(cand.name || b.id); return; }
+    const row = SYNC_OUTPUT_HEADER_ROWS + slotRowOffset + 1; // 1-based
+    const col = colIndexToLetter(firstDeptColIdx + deptColOffset);
+    data.push({
+      range: `${sheetName}!${col}${row}`,
+      values: [[cand.name]],
+    });
+  });
+
+  if (!data.length) {
+    throw new Error("Nenhum agendamento com Estado \"Agendado\" para gravar (gera os agendamentos primeiro).");
+  }
+
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        valueInputOption: "USER_ENTERED",
+        data,
+      }),
+    });
+  } catch {
+    throw new Error("Não foi possível contactar a Google Sheets API. Confirma a tua ligação à internet.");
+  }
+
+  if (res.status === 401) throw new Error("A sessão Google expirou. Autentica-te novamente e tenta gravar outra vez.");
+  if (res.status === 403) throw new Error(`A tua conta Google não tem permissão de ESCRITA na folha. Confirma que foi partilhada com acesso de Editor (não só Leitor).`);
+  if (res.status === 400 || res.status === 404) throw new Error(`Não foi encontrada a aba "${sheetName}" nessa folha, ou o range calculado é inválido. Confirma o nome exato da aba e SYNC_OUTPUT_HEADER_ROWS/SYNC_OUTPUT_FIRST_DEPT_COL.`);
+  if (!res.ok) throw new Error(`A Google Sheets API respondeu com erro HTTP ${res.status} ao gravar.`);
+
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    throw new Error("Gravação enviada, mas não foi possível confirmar a resposta da API.");
+  }
+
+  return {
+    cellsWritten: json.totalUpdatedCells ?? data.length,
+    rowsWritten: json.totalUpdatedRows ?? data.length,
+    skipped,
+  };
+}
+// ============================================================================
 
 // Normaliza um "token" de dia da semana para uma das 5 chaves canónicas de
 // ============================================================================
@@ -3185,6 +3332,12 @@ function InterviewPhasePage({
   title, subtitle, phaseKey, availField, formsField, prevStatusField,
   candidates, setCandidates, members, bookings, setBookings, onGenerate, columns, showCalendar,
   excludeTalentPool = false,
+  // Requisito "Gravar na Folha Google": credenciais/estado de sessão
+  // partilhados com a página de Importação (mesmo accessToken/sheetId da
+  // sincronização de leitura) — passados pelo componente-pai (ver
+  // <InterviewPhasePage ... /> mais abaixo). onRequestToken permite pedir
+  // (re)autenticação sem sair desta página, quando a sessão expirou.
+  sheetId = null, accessToken = null, onRequestToken = null,
 }) {
   const [editing, setEditing] = useState(null);
   const [view, setView] = useState("list");
@@ -3192,6 +3345,9 @@ function InterviewPhasePage({
   // esta fase — cada separador (Soft Skills, Hard Skills) tem o seu
   // próprio filtro, começando sempre em "Todos os Departamentos".
   const [departmentFilter, setDepartmentFilter] = useState(ALL_DEPARTMENTS_OPTION);
+  // Estado da gravação no Google Sheets: "idle" | "saving" | "done" | "error".
+  const [sheetSaveState, setSheetSaveState] = useState("idle");
+  const [sheetSaveMessage, setSheetSaveMessage] = useState("");
 
   const byId = (id) => members.find((m) => m.id === id);
   const candById = (id) => candidates.find((c) => c.id === id);
@@ -3270,6 +3426,40 @@ function InterviewPhasePage({
     downloadCSV(`${phaseKey}-agendamentos${deptSuffix}.csv`, [header, ...rows]);
   };
 
+  // "Gravar na Folha Google": envia os agendamentos "Agendado" DESTA fase
+  // (visibleBookings — respeita o filtro de departamento atual, tal como
+  // o Exportar CSV) para a aba de saída correspondente
+  // (SYNC_OUTPUT_SHEET_NAMES[phaseKey]), via exportBookingsToGoogleSheet().
+  // Se a sessão Google entretanto expirou, tenta renovar o token em
+  // silêncio (onRequestToken) antes de desistir e mostrar erro.
+  const saveToGoogleSheet = async () => {
+    setSheetSaveState("saving");
+    setSheetSaveMessage("A gravar...");
+    try {
+      let token = accessToken;
+      if (!token) {
+        if (!onRequestToken) throw new Error("Sessão Google não está ativa. Autentica-te na aba \"Importar\" antes de gravar.");
+        const renewed = await onRequestToken({ silent: false });
+        token = renewed?.accessToken;
+        if (!token) throw new Error("Sessão Google não está ativa. Autentica-te na aba \"Importar\" antes de gravar.");
+      }
+      const result = await exportBookingsToGoogleSheet({
+        bookings: visibleBookings,
+        candidates,
+        sheetId,
+        phaseKey,
+        accessToken: token,
+      });
+      setSheetSaveState("done");
+      setSheetSaveMessage(
+        `Gravação concluída com sucesso! ${result.rowsWritten} agendamento(s) escrito(s) em "${SYNC_OUTPUT_SHEET_NAMES[phaseKey]}".`
+      );
+    } catch (err) {
+      setSheetSaveState("error");
+      setSheetSaveMessage(err.message || "Não foi possível gravar na Folha Google.");
+    }
+  };
+
   return (
     <div className="p-8">
       <div className="flex items-start justify-between mb-6">
@@ -3299,11 +3489,50 @@ function InterviewPhasePage({
           <button onClick={exportCSV} className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2">
             <Download size={14} /> Exportar CSV
           </button>
+          <button
+            onClick={saveToGoogleSheet}
+            disabled={sheetSaveState === "saving"}
+            className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2 disabled:opacity-60"
+            title={`Grava os agendamentos "Agendado" na aba "${SYNC_OUTPUT_SHEET_NAMES[phaseKey] || "—"}" do Google Sheets`}
+          >
+            {sheetSaveState === "saving" ? (
+              <RefreshCw size={14} className="animate-spin" />
+            ) : sheetSaveState === "done" ? (
+              <CheckCircle2 size={14} style={{ color: "#065f46" }} />
+            ) : sheetSaveState === "error" ? (
+              <XCircle size={14} style={{ color: "#c0227a" }} />
+            ) : (
+              <UploadCloud size={14} />
+            )}
+            Gravar na Folha Google
+          </button>
           <button onClick={() => onGenerate(departmentFilter)} className="yme-btn-primary flex items-center gap-1.5 text-sm rounded-lg px-3 py-2 font-medium">
             <RefreshCw size={14} /> Gerar Agendamentos Automaticamente
           </button>
         </div>
       </div>
+
+      {sheetSaveState !== "idle" && (
+        <div
+          className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-6 text-xs leading-relaxed"
+          style={
+            sheetSaveState === "error"
+              ? { backgroundColor: hexToRgba("#c0227a", 0.08), borderColor: hexToRgba("#c0227a", 0.3), color: COLORS.navy }
+              : sheetSaveState === "done"
+              ? { backgroundColor: "#bbf7d0", borderColor: "#065f46", color: "#065f46" }
+              : { backgroundColor: COLORS.mint, borderColor: hexToRgba(COLORS.navy, 0.15), color: COLORS.navy }
+          }
+        >
+          {sheetSaveState === "error" ? (
+            <XCircle size={16} className="shrink-0 mt-0.5" style={{ color: "#c0227a" }} />
+          ) : sheetSaveState === "done" ? (
+            <CheckCircle2 size={16} className="shrink-0 mt-0.5" style={{ color: "#065f46" }} />
+          ) : (
+            <RefreshCw size={16} className="shrink-0 mt-0.5 animate-spin" />
+          )}
+          <p className="font-medium">{sheetSaveMessage}</p>
+        </div>
+      )}
 
       {visibleBookings.length > 0 && scheduled === 0 && (
         <div className="flex items-start gap-2.5 rounded-xl border px-4 py-3 mb-6" style={{ backgroundColor: hexToRgba("#c0227a", 0.08), borderColor: hexToRgba("#c0227a", 0.3) }}>
@@ -3944,6 +4173,7 @@ export default function App() {
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }]}
             showCalendar={false}
             excludeTalentPool
+            sheetId={extractSheetId(syncUrl)} accessToken={auth.accessToken} onRequestToken={requestToken}
           />
         )}
         {page === "fase2" && (
@@ -3963,6 +4193,7 @@ export default function App() {
             onGenerate={(dept) => setPhase3Bookings(regenerateForDepartment(phase3Pool, members, phase3Bookings, "fase3", ["diretorId", "rhId", "supervisorId"], dept))}
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }, { key: "supervisorId", label: "Supervisor" }]}
             showCalendar={true}
+            sheetId={extractSheetId(syncUrl)} accessToken={auth.accessToken} onRequestToken={requestToken}
           />
         )}
       </main>
