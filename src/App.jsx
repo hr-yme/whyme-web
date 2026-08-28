@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-08-19-rh-diag";
+const APP_BUILD = "build-2026-08-28-mrv-smart-schedule";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = ["09:00", "10:30", "14:00", "15:30", "17:00"];
@@ -516,6 +516,12 @@ const SYNC_DEPT_HEADER_HINTS = ["nome", "nome completo"];
 // confirmada da aba "Avaliação CV e Questões Abertas": cabeçalho na
 // LINHA 13 (índice 12), dados a começar estritamente na LINHA 14.
 const SYNC_FIXED_HEADER_IDX = { avaliacaoCV: 12 };
+// Abas de Disponibilidade de avaliadores (Diretores/RH/Direção) cuja
+// estrutura exata (Linha 7 = Dias, Linha 8 = Horas, Coluna B a partir da
+// Linha 9 = Nomes) foi confirmada manualmente — usam o parser posicional
+// fixo parseMasterExcel() em vez da deteção dinâmica por palavras-chave
+// (ver fetchSheetTabApi/readTab).
+const MASTER_EXCEL_LAYOUT_TABS = new Set(["dispEntrevistasRH", "dispDinamicas", "dispEntrevistaFinal"]);
 
 /* ----------------------------------------------------------------------
    Autenticação Google (OAuth 2.0 / Google Identity Services) + leitura
@@ -802,7 +808,13 @@ function parseApiValues(values, headerHints = [], fixedHeaderIdx = null) {
 // utilizador. encodeURIComponent no nome da aba é essencial: nomes como
 // "Base Dados Departamentos" têm espaços e, sem isto, o range fica
 // inválido/mal interpretado pela API.
-async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = [], fixedHeaderIdx = null) {
+// `useMasterExcelLayout`: quando true, tenta primeiro os apontadores fixos
+// de parseMasterExcel() (Linha 7 = Dias, Linha 8 = Horas, Coluna B a
+// partir da Linha 9 = Nomes) — usado nas 3 abas de Disponibilidade de
+// avaliadores, cuja estrutura exata foi confirmada manualmente pelo RH. Só
+// recorre ao parser dinâmico (parseApiValues, por palavras-chave/
+// heurísticas) se essa estrutura fixa não bater, como rede de segurança.
+async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = [], fixedHeaderIdx = null, useMasterExcelLayout = false) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetName)}`;
   let res;
   try {
@@ -826,6 +838,10 @@ async function fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints = [
     throw new Error("read_error");
   }
 
+  if (useMasterExcelLayout) {
+    const fixed = parseMasterExcel(data.values);
+    if (fixed) return fixed;
+  }
   return parseApiValues(data.values, headerHints, fixedHeaderIdx);
 }
 
@@ -1125,29 +1141,41 @@ function looksLikeDayLabelRow(row) {
 // do dia normalmente só aparece na PRIMEIRA das várias colunas de meia
 // hora desse dia (célula fundida/"merged cell" na folha original); as
 // colunas seguintes do mesmo dia chegam vazias da API/leitura.
-function forwardFillRow(row) {
+// `targetLength`, quando indicado, força a propagação até esse
+// comprimento mesmo que `row` seja mais curta — CORREÇÃO CRÍTICA: a API
+// do Google Sheets recorta cada linha no ÚLTIMO valor não vazio; se o
+// ÚLTIMO bloco de dia da Linha 7 não tiver mais nenhum texto a seguir
+// nessa linha (situação comum quando esse é o dia mais à direita da
+// grelha), a linha de dias fica mais CURTA do que a linha de horas (Linha
+// 8, que continua com dados bem mais à direita) — sem `targetLength`, as
+// colunas de hora além do fim da linha de dias ficavam sem nenhum dia
+// associado (era exatamente isto que fazia os últimos dias/colunas da
+// grelha aparecerem "sem horário", mesmo com as células preenchidas).
+function forwardFillRow(row, targetLength) {
+  const len = targetLength ?? (row ? row.length : 0);
   const filled = [];
   let last = "";
-  (row || []).forEach((v) => {
-    const s = String(v ?? "").trim();
+  for (let i = 0; i < len; i++) {
+    const s = String((row && row[i]) ?? "").trim();
     if (s) last = s;
     filled.push(last);
-  });
+  }
   return filled;
 }
 
-// Combina uma linha de DIAS (ex. "Dia 10 - Quarta", já com forward-fill)
-// com uma linha de HORAS (ex. "9-9:30") num único array de cabeçalhos —
-// um por coluna. IMPORTANTE: o dia é primeiro RESOLVIDO para a sua forma
-// curta canónica ("Qua") via normalizeDayOnlyHeader, em vez de manter o
-// texto original ("Dia 10 - Quarta") colado à hora — isto evita que o "10"
-// de "Dia 10" seja mais tarde confundido com uma hora solta quando o
+// Combina uma linha de DIAS (ex. "Dia 10 - Quarta", já com forward-fill
+// até ao comprimento da linha de horas — ver forwardFillRow) com uma
+// linha de HORAS (ex. "9-9:30") num único array de cabeçalhos — um por
+// coluna. IMPORTANTE: o dia é primeiro RESOLVIDO para a sua forma curta
+// canónica ("Qua") via normalizeDayOnlyHeader, em vez de manter o texto
+// original ("Dia 10 - Quarta") colado à hora — isto evita que o "10" de
+// "Dia 10" seja mais tarde confundido com uma hora solta quando o
 // cabeçalho combinado for reprocessado (ex. "Dia 10 - Quarta 9-9:30"
 // poderia, em teoria, ler "10" como hora; "Qua 9-9:30" não tem esse
 // problema, porque já não sobra nenhum dígito do dia do mês).
 function mergeTwoRowHeader(dayRow, hourRow) {
-  const days = forwardFillRow(dayRow);
-  return hourRow.map((h, i) => {
+  const days = forwardFillRow(dayRow, (hourRow || []).length);
+  return (hourRow || []).map((h, i) => {
     const hourText = String(h ?? "").trim();
     const dayLabel = days[i] || "";
     if (!dayLabel) return hourText;
@@ -1155,6 +1183,80 @@ function mergeTwoRowHeader(dayRow, hourRow) {
     if (!resolvedDay) return hourText ? `${dayLabel} ${hourText}`.trim() : dayLabel;
     return hourText ? `${resolvedDay} ${hourText}` : resolvedDay;
   });
+}
+
+// ----------------------------------------------------------------------
+// PARSER POSICIONAL FIXO DO EXCEL MESTRE DE AVALIADORES (Diretores/RH/
+// Direção) — a estrutura desta aba específica foi confirmada manualmente
+// pelo RH e é sempre a mesma, independentemente do conteúdo:
+//   Linha 7  (índice 6) = Dias   (ex. "Dia 10 - Quarta", "Dia 11 - Quinta")
+//   Linha 8  (índice 7) = Horas  (ex. "9-9:30", "9:30-10", "10 - 10:30")
+//   Linha 9+ (índice 8+), Coluna B (índice 1) = Nome do avaliador
+//   Células de dados = "Disponível" / "Indisponível"
+// Ao contrário de parseApiValues() (que ADIVINHA onde está o cabeçalho por
+// palavras-chave/heurísticas de densidade), esta função usa estes 3
+// apontadores fixos diretamente — mais robusto para ESTA aba específica.
+// Se a estrutura não bater (linhas 7/8 vazias, ou nenhum nome encontrado
+// na Coluna B a partir da linha 9), devolve `null` para o chamador poder
+// recorrer ao parser dinâmico (parseApiValues) como rede de segurança, em
+// vez de a sincronização falhar em silêncio.
+// ----------------------------------------------------------------------
+const MASTER_EXCEL_DAY_ROW = 6;        // Linha 7
+const MASTER_EXCEL_HOUR_ROW = 7;       // Linha 8
+const MASTER_EXCEL_NAME_COL = 1;       // Coluna B
+const MASTER_EXCEL_FIRST_DATA_ROW = 8; // Linha 9
+
+// Limpa o nome de um avaliador lido da Coluna B: remove cargo secundário
+// entre parênteses (ex. "Beatriz Garcia (CEO)" -> "Beatriz Garcia") — o
+// resto da app (Base Dados Departamentos, ORG, etc.) nunca inclui o cargo
+// no nome, por isso isto é o que permite o matching (findMemberIndex,
+// mais abaixo) encontrar a MESMA pessoa sem exigir igualdade exata.
+function cleanEvaluatorName(raw) {
+  return cleanCellText(raw).replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Lê a grelha bruta (array de arrays) desta aba usando os apontadores
+// fixos acima, devolvendo o mesmo formato { header, rows, headerIdx } que
+// parseApiValues() — para que todo o resto do código (extractAvailability-
+// FromRow, o merge com `members`, etc.) continue a funcionar sem alterações.
+function parseMasterExcel(grid) {
+  const rows = grid || [];
+  const dayRow = rows[MASTER_EXCEL_DAY_ROW];
+  const hourRow = rows[MASTER_EXCEL_HOUR_ROW];
+  if (!dayRow || !hourRow) return null;
+  // Requisito 1: propaga a Linha 7 (dias) para a direita e combina com a
+  // Linha 8 (horas) — mergeTwoRowHeader já resolve o dia para a sua forma
+  // curta canónica antes de colar com a hora (ex. "Dia 10 - Quarta" +
+  // "9-9:30" -> "Qua 9-9:30"), evitando qualquer confusão entre o número
+  // do dia do mês e a hora em si.
+  const header = mergeTwoRowHeader(dayRow, hourRow);
+  if (!header.some((h) => h && normalizeDayOnlyHeader(h) !== null)) return null;
+
+  const dataRows = [];
+  for (let r = MASTER_EXCEL_FIRST_DATA_ROW; r < rows.length; r++) {
+    const raw = rows[r] || [];
+    // Requisito 1 + 2: Coluna B = nome, a partir da Linha 9; ignora linhas
+    // em branco ou sem nome; limpa o cargo entre parênteses.
+    const name = cleanEvaluatorName(raw[MASTER_EXCEL_NAME_COL]);
+    if (!name) continue;
+    const obj = { Nome: name };
+    header.forEach((h, i) => { if (h) obj[h] = raw[i] ?? ""; });
+    dataRows.push({ obj, raw });
+  }
+  if (!dataRows.length) return null;
+  // Requisito 4 (debug): lista no consola (F12) cada avaliador encontrado
+  // e os horários já resolvidos (dia+hora oficiais), calculados aqui só
+  // para efeitos do log — extractAvailabilityFromRow() é chamada de novo,
+  // sem custo relevante, pelo código que efetivamente consome este
+  // resultado (merge com `members`). Isto é o que permite confirmar
+  // visualmente se Gustavo Dias, Mariana Lopes, Joana Pereira, etc.
+  // ficaram com horários reconhecidos, logo a seguir à leitura do ficheiro.
+  const evaluatorsMap = dataRows.map(({ obj }) => ({
+    nome: obj.Nome,
+    horarios: extractAvailabilityFromRow(header, obj).slots,
+  }));
+  console.log("Avaliadores carregados:", evaluatorsMap);
+  return { header, rows: dataRows, headerIdx: MASTER_EXCEL_HOUR_ROW };
 }
 
 // Deteta se uma linha da grelha se parece com uma linha de RÓTULOS DE HORA
@@ -1795,9 +1897,9 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
   }
 
   let tokenExpired = false;
-  const readTab = async (key, sheetName, headerHints = [], fixedHeaderIdx = null) => {
+  const readTab = async (key, sheetName, headerHints = [], fixedHeaderIdx = null, useMasterExcelLayout = false) => {
     try {
-      const data = await fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints, fixedHeaderIdx);
+      const data = await fetchSheetTabApi(accessToken, sheetId, sheetName, headerHints, fixedHeaderIdx, useMasterExcelLayout);
       return [key, data];
     } catch (err) {
       if (err.message === "token_expired") tokenExpired = true;
@@ -1808,7 +1910,9 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
   let generalResults, deptResults;
   try {
     [generalResults, deptResults] = await Promise.all([
-      Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) => readTab(key, sheetName, SYNC_HEADER_HINTS[key], SYNC_FIXED_HEADER_IDX[key]))),
+      Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) =>
+        readTab(key, sheetName, SYNC_HEADER_HINTS[key], SYNC_FIXED_HEADER_IDX[key], MASTER_EXCEL_LAYOUT_TABS.has(key))
+      )),
       Promise.all(DEPARTMENTS.map((dept) => readTab(dept, `'${dept}'`, SYNC_DEPT_HEADER_HINTS))),
     ]);
   } catch (fatalErr) {
@@ -1989,9 +2093,20 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     return rhList[i % rhList.length];
   }
 
-  const bookings = [...kept];
-  pool.forEach((c) => {
-    if (kept.some((b) => b.candidateId === c.id)) return;
+  const poolToSchedule = pool.filter((c) => !kept.some((b) => b.candidateId === c.id));
+  // Otimização MRV (Most Constrained First): processa primeiro os candidatos com
+  // menor número de opções disponíveis, para que quem tem pouca flexibilidade fique
+  // com a sua vaga antes de ela ser ocupada por quem tem várias opções compatíveis.
+  const sortedPool = [...poolToSchedule].sort((a, b) => {
+    const aLen = (a.availability?.[availField] || []).length;
+    const bLen = (b.availability?.[availField] || []).length;
+    if (aLen === 0) return 1;
+    if (bLen === 0) return -1;
+    return aLen - bLen;
+  });
+
+  const newBookings = [];
+  sortedPool.forEach((c) => {
     // Diretor por departamento — com FALLBACK GLOBAL: se não houver
     // Diretor explicitamente associado a este departamento no Excel
     // Mestre (mesmo já com a tolerância de deptMatches), usa qualquer
@@ -2018,7 +2133,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     const assignedRH = nextRoundRobinRH(c.department, rhList);
 
     let found = null;
-    for (const slot of c.availability[availField]) {
+    for (const slot of (c.availability?.[availField] || [])) {
       if (!diretor || !hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) continue;
       if (staffKeys.includes("supervisorId")) {
         if (!supervisor || !hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) continue;
@@ -2038,7 +2153,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       const record = { id: uid("bk"), candidateId: c.id, slot: found.slot, diretorId: found.diretor.id, rhId: found.rh.id, status: "Agendado", manual: false };
       if (staffKeys.includes("supervisorId")) record.supervisorId = found.supervisor.id;
       staffKeys.forEach((k) => { const mid = record[k]; if (mid) { busy[mid] = busy[mid] || new Set(); busy[mid].add(found.slot); } });
-      bookings.push(record);
+      newBookings.push(record);
     } else {
       // "Sem alocação" só deve aparecer quando NÃO EXISTE sequer 1 RH em
       // toda a organização (rhList vazia -> assignedRH null, o que só
@@ -2075,10 +2190,13 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
         reason = `Sem interseção entre os horários de ${c.name} e a equipa (Diretor(a)/RH) ${diretorIsFallback || rhIsFallback ? "(via fallback global)" : `de "${c.department}"`}.`;
       }
       record.reason = reason;
-      bookings.push(record);
+      newBookings.push(record);
     }
   });
-  return bookings;
+
+  // Mantém a ordem de apresentação original do pool
+  const orderMap = new Map(pool.map((c, i) => [c.id, i]));
+  return [...kept, ...newBookings].sort((a, b) => (orderMap.get(a.candidateId) ?? 9999) - (orderMap.get(b.candidateId) ?? 9999));
 }
 
 // Regenera o agendamento de UMA fase individual apenas para um
@@ -2562,15 +2680,15 @@ function ImportHubPage({
       const next = [...prev];
       wb.SheetNames.forEach((sheetName) => {
         // Lê a folha em modo GRELHA BRUTA (array de arrays, não já um
-        // objeto por linha) e passa pelo mesmo parseApiValues() usado na
-        // sincronização com o Google Sheets — CORREÇÃO: é isto que permite
-        // detetar e combinar um cabeçalho em DUAS linhas (dia numa linha,
-        // ex. "Dia 10 - Quarta", hora na seguinte, ex. "9-9:30"), que o
-        // antigo `XLSX.utils.sheet_to_json(ws, {defval:""})` (modo objeto,
-        // só considera 1 linha de cabeçalho) nunca conseguia reconhecer —
-        // cada coluna ficava só com a hora solta, sem dia nenhum associado.
+        // objeto por linha). Tenta primeiro os apontadores fixos de
+        // parseMasterExcel() (Linha 7 = Dias, Linha 8 = Horas, Coluna B a
+        // partir da Linha 9 = Nomes) — a estrutura exata confirmada pelo
+        // RH para o Excel Mestre de avaliadores — e só recorre ao parser
+        // dinâmico por palavras-chave (parseApiValues) se essa estrutura
+        // fixa não bater nesta folha (ex. for outra aba qualquer, tipo
+        // "Base Dados Departamentos", com um layout diferente).
         const rawGrid = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: "" });
-        const { rows } = parseApiValues(rawGrid, ["nome", "name"]);
+        const { rows } = parseMasterExcel(rawGrid) || parseApiValues(rawGrid, ["nome", "name"]);
         rows.forEach(({ obj: row }) => {
           const name = cleanCellText(get(row, "nome", "name"));
           if (!name) return;
