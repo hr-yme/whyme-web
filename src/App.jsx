@@ -1072,13 +1072,17 @@ function detectDayBlocks(grid, re = DIA_HEADER_RE) {
 }
 
 // ---- 1.1: Deteção dinâmica da linha de DEPARTAMENTOS dentro de um bloco ----
-// Procura, dentro das primeiras linhas do bloco (a seguir à barra "Dia
-// X"), a PRIMEIRA linha que contenha pelo menos um dos 6 nomes oficiais
-// de DEPARTMENTS (via matchDept — tolerante a acentos/maiúsculas) e
-// devolve, para essa linha, o índice de coluna de CADA departamento
-// encontrado. Nunca assume que essa linha está numa posição fixa (ex.
-// "Linha 7") — varre até DEPT_HEADER_SEARCH_ROWS linhas do bloco.
-const DEPT_HEADER_SEARCH_ROWS = 8;
+// Procura, dentro do bloco (a seguir à barra "Dia X"), a linha que
+// contenha MAIS nomes oficiais de DEPARTMENTS reconhecidos em simultâneo
+// (via matchDept — tolerante a acentos/maiúsculas) — não apenas a
+// primeira linha com 1 correspondência, para nunca ser enganada por um
+// departamento mencionado isoladamente noutro sítio do bloco (ex. numa
+// nota/legenda). Devolve, para essa linha, o índice de coluna de CADA
+// departamento encontrado. Nunca assume que essa linha está numa posição
+// fixa (ex. "Linha 7") — varre até DEPT_HEADER_SEARCH_ROWS linhas do
+// bloco (bastante generoso, para tolerar linhas em branco extra entre a
+// barra "Dia X" e a linha de departamentos).
+const DEPT_HEADER_SEARCH_ROWS = 20;
 function detectDepartmentColumnsInBlock(grid, block) {
   // Bloco sintético de fallback (sem barra "Dia X" — ver
   // buildDynamicSheetMap): não há limite de "poucas linhas a seguir ao
@@ -1088,6 +1092,7 @@ function detectDepartmentColumnsInBlock(grid, block) {
   const limit = block.headerRow === null
     ? Math.min(block.endRow, grid.length)
     : Math.min(block.startRow + DEPT_HEADER_SEARCH_ROWS, block.endRow, grid.length);
+  let best = null;
   for (let r = block.startRow; r < limit; r++) {
     const row = grid[r] || [];
     const found = {};
@@ -1095,36 +1100,74 @@ function detectDepartmentColumnsInBlock(grid, block) {
       const dept = matchDept(cell);
       if (dept && found[dept] === undefined) found[dept] = c;
     });
-    if (Object.keys(found).length) return { deptHeaderRow: r, columns: found };
+    const count = Object.keys(found).length;
+    if (count && (!best || count > best.count)) {
+      best = { deptHeaderRow: r, columns: found, count };
+      // Linha com os 6 departamentos todos reconhecidos: não há linha
+      // melhor possível, para de procurar já (poupa tempo em blocos
+      // grandes e evita continuar a varrer depois de já ter a certeza).
+      if (count >= DEPARTMENTS.length) break;
+    }
+  }
+  return best ? { deptHeaderRow: best.deptHeaderRow, columns: best.columns } : null;
+}
+
+// ---- 1.2: Deteção dinâmica da linha de SUBCABEÇALHOS (Realizada/Nome/
+// Local) e da SUBCOLUNA "Nome" de cada departamento ----
+// Estrutura confirmada: cada departamento tem 3 subcolunas fixas —
+// [Realizada, Nome, Local] — repetidas na MESMA linha de subcabeçalho
+// para todos os departamentos do bloco. Por isso a deteção é feita em 2
+// passos, cirurgicamente:
+//   1) detectSubheaderRow: encontra UMA ÚNICA linha, partilhada por todos
+//      os departamentos do bloco, que contenha pelo menos uma célula com
+//      o texto exato "Nome" — essa é a linha de subcabeçalhos. Procurada
+//      a partir da linha de departamentos até ao fim do bloco, sem
+//      limite artificial de poucas linhas (algumas folhas têm linhas em
+//      branco extra entre a linha de departamentos e a de subcabeçalhos).
+//   2) Para cada departamento, localiza a coluna exata de "Nome" NESSA
+//      MESMA linha, dentro do intervalo de colunas desse departamento
+//      (da sua própria coluna até à coluna do departamento seguinte,
+//      exclusive) — muito mais preciso do que voltar a procurar linha a
+//      linha por departamento, porque a linha já é conhecida e comum a
+//      todos.
+// Se a linha partilhada não for encontrada (folha com uma estrutura
+// diferente da esperada), cai-se para uma ESTRATÉGIA SECUNDÁRIA (ver
+// detectNomeColumnFallback) que volta a procurar "Nome" linha a linha,
+// departamento a departamento, tal como antes — nunca deixa de tentar.
+function detectSubheaderRow(grid, block, fromRow) {
+  const limit = Math.min(block.endRow, grid.length);
+  for (let r = fromRow; r < limit; r++) {
+    const row = grid[r] || [];
+    if (row.some((cell) => normKey(cell).replace(/[^a-z]/g, "") === "nome")) return r;
   }
   return null;
 }
-
-// ---- 1.2: Deteção dinâmica da SUBCOLUNA "Nome" de um departamento ----
-// A partir da coluna onde o departamento foi encontrado, procura nas
-// linhas seguintes (subcabeçalho, tipicamente logo a seguir à linha de
-// departamentos — ex. Linha 8 ou 32, mas nunca fixa) a célula com o texto
-// "Nome", dentro do intervalo de colunas desse departamento (da sua
-// própria coluna até à coluna do departamento seguinte, exclusive — ou um
-// limite defensivo se for o último departamento do bloco). Se não
-// encontrar, devolve null — a app NUNCA assume/"adivinha" uma coluna
-// fixa, prefere ignorar essa célula e avisar (ver buildDynamicSheetMap).
-const NOME_SEARCH_ROWS = 6;
+function findNomeColInRow(row, colStart, colEnd) {
+  for (let c = colStart; c < colEnd && c < row.length; c++) {
+    if (normKey(row[c]).replace(/[^a-z]/g, "") === "nome") return c;
+  }
+  return null;
+}
+// Estratégia SECUNDÁRIA (fallback): só usada se detectSubheaderRow não
+// encontrar nenhuma linha de subcabeçalho comum — repete a procura de
+// "Nome" linha a linha, mas só dentro da coluna deste departamento
+// específico, até NOME_SEARCH_ROWS linhas a seguir à linha de
+// departamentos.
+const NOME_SEARCH_ROWS = 10;
 const NOME_SEARCH_COL_FALLBACK_WIDTH = 8;
-function detectNomeColumn(grid, block, deptHeaderRow, deptCol, nextDeptCol) {
+function detectNomeColumnFallback(grid, block, deptHeaderRow, deptCol, nextDeptCol) {
   const rowLimit = Math.min(deptHeaderRow + NOME_SEARCH_ROWS, block.endRow, grid.length);
   const colEnd = nextDeptCol !== undefined ? nextDeptCol : deptCol + NOME_SEARCH_COL_FALLBACK_WIDTH;
   for (let r = deptHeaderRow; r < rowLimit; r++) {
-    const row = grid[r] || [];
-    for (let c = deptCol; c < colEnd && c < row.length; c++) {
-      if (normKey(row[c]).replace(/[^a-z]/g, "") === "nome") return c;
-    }
+    const nomeCol = findNomeColInRow(grid[r] || [], deptCol, colEnd);
+    if (nomeCol !== null) return nomeCol;
   }
   return null;
 }
 
 // ---- 1.3: Deteção dinâmica dos HORÁRIOS (Coluna B, dentro do bloco) ----
-// Percorre as linhas do bloco (a partir da linha de departamentos) à
+// Percorre as linhas do bloco (a partir da linha de subcabeçalhos, ou da
+// linha de departamentos se não houver subcabeçalho comum detetado) à
 // procura, célula a célula da Coluna B (com a Coluna A como reserva, caso
 // a folha desloque a coluna de horários), de texto reconhecível por
 // parseTimeToMinutes ("09:00 - 09:30", "12:30-13:00", "9h-9h30", etc.) —
@@ -1217,25 +1260,49 @@ function buildDynamicSheetMap(grid, sheetName) {
       return;
     }
 
-    const timeMap = detectTimeRowsInBlock(grid, block, deptInfo.deptHeaderRow + 1);
+    // ESTRATÉGIA PRINCIPAL (cirúrgica): 1 linha de subcabeçalhos
+    // (Realizada/Nome/Local) partilhada por TODOS os departamentos deste
+    // bloco, localizada uma única vez a partir da linha de departamentos.
+    const subheaderRow = detectSubheaderRow(grid, block, deptInfo.deptHeaderRow + 1);
+
+    const timeMap = detectTimeRowsInBlock(grid, block, (subheaderRow ?? deptInfo.deptHeaderRow) + 1);
     if (!timeMap.size) {
       warnings.push(`Bloco "${block.headerText ?? "(sem barra de dia)"}": não foram encontrados horários reconhecíveis na Coluna B.`);
     }
 
     const deptEntries = Object.entries(deptInfo.columns).sort((a, b) => a[1] - b[1]);
+    const debugCols = [];
     deptEntries.forEach(([dept, col], idx) => {
       const nextCol = idx + 1 < deptEntries.length ? deptEntries[idx + 1][1] : undefined;
-      const nomeCol = detectNomeColumn(grid, block, deptInfo.deptHeaderRow, col, nextCol);
+      // 1) Tenta a linha de subcabeçalho partilhada (rápido e preciso).
+      // 2) Se essa linha não existir, ou não tiver "Nome" nesta coluna em
+      //    concreto (ex. subcabeçalhos não perfeitamente alinhados),
+      //    cai para a estratégia SECUNDÁRIA: procura linha a linha, só
+      //    dentro da coluna deste departamento.
+      let nomeCol = subheaderRow !== null ? findNomeColInRow(grid[subheaderRow] || [], col, nextCol ?? col + NOME_SEARCH_COL_FALLBACK_WIDTH) : null;
+      if (nomeCol === null) nomeCol = detectNomeColumnFallback(grid, block, deptInfo.deptHeaderRow, col, nextCol);
       if (nomeCol === null) {
         warnings.push(`Departamento "${dept}" no bloco "${block.headerText ?? "(sem barra de dia)"}": não foi encontrada a subcoluna "Nome".`);
         return;
       }
+      debugCols.push({ departamento: dept, colunaDept: colIndexToLetter(col), colunaNome: colIndexToLetter(nomeCol), linhaSubcabecalho: subheaderRow !== null ? subheaderRow + 1 : "(fallback)" });
       timeMap.forEach((row, startMin) => {
         daysForBlock.forEach((day) => {
           cellByKey.set(`${day}|${startMin}|${dept}`, { row, col: nomeCol });
         });
       });
     });
+
+    // Diagnóstico detalhado por bloco — visível na consola do browser,
+    // útil para confirmar visualmente que a deteção apanhou a linha e as
+    // colunas certas sem teres de adivinhar a partir de mensagens soltas.
+    if (typeof console.groupCollapsed === "function") {
+      console.groupCollapsed(`[Gravação Google Sheets] Bloco "${block.headerText ?? "(sem barra de dia)"}" → dia(s) ${daysForBlock.join(", ")}`);
+      console.log("Linha de departamentos:", deptInfo.deptHeaderRow + 1, "| Linha de subcabeçalhos (Realizada/Nome/Local):", subheaderRow !== null ? subheaderRow + 1 : "não encontrada (usada estratégia secundária por departamento)");
+      console.log("Horários detetados na Coluna B:", timeMap.size);
+      console.table(debugCols);
+      console.groupEnd();
+    }
   });
 
   return {
@@ -1344,6 +1411,19 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
     });
   });
 
+  // Diagnóstico: sempre visível na consola, mostra exatamente quantos
+  // candidatos ficaram prontos a escrever vs. quantos foram ignorados e
+  // porquê — a forma mais rápida de confirmar, célula a célula, se a
+  // deteção dinâmica encontrou a estrutura certa antes de sequer chamar a
+  // API de escrita.
+  console.log(`[Gravação Google Sheets] Aba "${sheetName}": ${data.length} célula(s) de candidato pronta(s) a escrever, ${skipped.length} ignorada(s).`);
+  if (skipped.length && typeof console.table === "function") console.table(skipped);
+  // Guardado ANTES do PASSO 3 (que ainda vai acrescentar as barras de dia
+  // ao mesmo array `data`) — para o resultado final poder distinguir
+  // claramente "quantos candidatos ficaram escritos" de "quantas barras
+  // de dia foram atualizadas", em vez de um único total ambíguo.
+  const candidateCellsCount = data.length;
+
   // PASSO 3 (requisito 1 + 3, SEMPRE opcional/best-effort — nunca
   // bloqueia): ao ENCONTRAR uma barra de dia (Nível 1 preciso ou Nível 2
   // ultra-flexível — ver buildDynamicSheetMap), substitui o seu texto
@@ -1369,6 +1449,7 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
       values: [[newText]],
     });
   });
+  const dayHeaderCellsCount = data.length - candidateCellsCount;
 
   if (!data.length) {
     const err = new Error("Nenhuma célula para gravar — confirma se há agendamentos \"Agendado\" e se a deteção dinâmica encontrou a estrutura da folha (ver avisos).");
@@ -1410,6 +1491,11 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
   return {
     cellsWritten: json.totalUpdatedCells ?? data.length,
     rowsWritten: json.totalUpdatedRows ?? data.length,
+    // Contagens separadas (ver candidateCellsCount/dayHeaderCellsCount
+    // acima) — para nunca mais confundir "a barra de dia foi atualizada"
+    // com "os candidatos foram escritos": são dois totais independentes.
+    candidatesWritten: candidateCellsCount,
+    dayHeadersWritten: dayHeaderCellsCount,
     skipped,
     warnings: dynamicMap.warnings,
     usingFallbackBlock: dynamicMap.usingFallbackBlock,
@@ -3922,7 +4008,8 @@ function InterviewPhasePage({
       setSheetSaveState("done");
       const warnSuffix = result.warnings?.length ? ` (${result.warnings.length} aviso(s) de estrutura — ver consola)` : "";
       const skipSuffix = result.skipped?.length ? ` ${result.skipped.length} candidato(s) ignorado(s) sem célula correspondente.` : "";
-      setSheetSaveMessage(`Gravação Concluída! ${result.rowsWritten} célula(s) escrita(s) em "${result.sheetName || SYNC_OUTPUT_SHEET_NAMES[phaseKey]}".${skipSuffix}${warnSuffix}`);
+      const dayHeaderSuffix = result.dayHeadersWritten ? ` + ${result.dayHeadersWritten} barra(s) de dia atualizada(s).` : "";
+      setSheetSaveMessage(`Gravação Concluída! ${result.candidatesWritten} nome(s) de candidato escrito(s) em "${result.sheetName || SYNC_OUTPUT_SHEET_NAMES[phaseKey]}".${dayHeaderSuffix}${skipSuffix}${warnSuffix}`);
       if (result.warnings?.length) console.warn(`[Gravar no Google Sheets] Avisos de estrutura em "${result.sheetName || SYNC_OUTPUT_SHEET_NAMES[phaseKey]}":`, result.warnings);
     } catch (err) {
       // Mesmo numa gravação falhada a meio, se já havia snapshot
