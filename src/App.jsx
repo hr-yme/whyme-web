@@ -2555,6 +2555,24 @@ function hasSlot(minuteSet, slot) {
   const info = slotToMinutes(slot);
   return info ? minuteSet.has(`${info.day}|${info.startMin}`) : false;
 }
+// Slots imediatamente adjacentes (mesmo dia, ±SLOT_DURATION_MIN) a um slot
+// dado — usado pela REGRA DE OTIMIZAÇÃO DE AGENDA (entrevistas seguidas):
+// permite pontuar cada opção de horário por quão "colada" fica a outras
+// entrevistas já marcadas para o mesmo Diretor/Supervisor/RH, em vez de
+// deixar buracos vagos na agenda. Só devolve slots que realmente existem
+// na grelha oficial (SLOT_INFO) — nunca inventa um horário fora de TIMES.
+function adjacentSlots(slot) {
+  const info = SLOT_INFO[slot];
+  if (!info) return [];
+  const out = [];
+  [info.startMin - SLOT_DURATION_MIN, info.startMin + SLOT_DURATION_MIN].forEach((m) => {
+    const hh = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    const candidate = `${info.day} ${hh}:${mm}`;
+    if (SLOT_INFO[candidate]) out.push(candidate);
+  });
+  return out;
+}
 // Sequência oficial de slots de um dia, na ordem exata da grelha (TIMES) —
 // "o slot IMEDIATAMENTE A SEGUIR" de "Seg 09:30" é sempre o próximo desta
 // lista ("Seg 10:00"), respeitando naturalmente a pausa de almoço (que já
@@ -2579,27 +2597,6 @@ function slotSequenceForDay(day) {
 // desfaz a otimalidade do emparelhamento — só remove os "buracos vagos"
 // que sobrarem entre eles. Agendamentos MANUAIS nunca são deslocados (o
 // utilizador escolheu esse horário de propósito).
-// ============================================================================
-// EMPILHAMENTO CONTÍNUO 100% SEM BURACOS (requisitos "Back-to-Back" +
-// "Manutenção da Equipa de RH/Diretor"): depois do emparelhamento máximo
-// (algoritmo de Kuhn) já ter decidido QUEM fica com entrevista, esta
-// função reorganiza os HORÁRIOS e — quando necessário — o RH de cada
-// agendamento, avaliador a avaliador (Diretor — o âncora partilhado por
-// todo o departamento), agrupados por dia:
-//   - Percorre os agendamentos desse Diretor nesse dia por ordem
-//     cronológica e tenta EMPURRAR CADA UM para o slot válido MAIS CEDO
-//     possível a partir de onde ficou o anterior — zero buracos.
-//   - CORREÇÃO CRÍTICA: ao procurar esse slot mais cedo, já não fica
-//     preso ao RH originalmente atribuído (isso bloqueava a compactação
-//     sempre que esse RH em concreto não estivesse livre mais cedo, mesmo
-//     havendo outro RH livre) — agora escolhe, para cada slot candidato,
-//     QUALQUER RH do departamento (__rhPool) que esteja livre e
-//     disponível, preferindo sempre continuar com o MESMO RH da
-//     entrevista imediatamente anterior deste Diretor/dia (streakRH),
-//     para formar um bloco contínuo do mesmo avaliador em vez de alternar.
-// Nunca muda QUEM tem entrevista nem desfaz a otimalidade do
-// emparelhamento — só ajusta horário e/ou RH de agendamentos já
-// decididos. Agendamentos MANUAIS nunca são tocados.
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
@@ -2612,7 +2609,8 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
 
   // Conjunto GLOBAL de slots já ocupados por CADA avaliador (Diretor,
   // Supervisor, RH), a partir do estado FINAL de todos os agendamentos
-  // (mantidos + novos) — usado para nunca criar um conflito novo.
+  // (mantidos + novos) — usado para nunca criar um conflito novo ao mover
+  // um agendamento para mais cedo.
   const occupied = {}; // evaluatorId -> Set(slot)
   const markOccupied = (id, slot) => { if (id) (occupied[id] || (occupied[id] = new Set())).add(slot); };
   const unmarkOccupied = (id, slot) => { if (id) occupied[id]?.delete(slot); };
@@ -2626,7 +2624,7 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
 
   // Agrupa os agendamentos (só os novos — os manuais ficam sempre no
   // sítio) por (Diretor, dia): o Diretor é o avaliador partilhado por
-  // todo o departamento.
+  // todo o departamento, exatamente o "empilhamento para o Diretor" pedido.
   const byDiretorDay = new Map();
   newBookings.forEach((b) => {
     if (!b.slot || !b.diretorId || b.manual) return;
@@ -2642,51 +2640,32 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     group.sort((a, b) => (SLOT_INFO[a.slot]?.startMin ?? 0) - (SLOT_INFO[b.slot]?.startMin ?? 0));
 
     let pointerIdx = 0;
-    let streakRH = null; // RH da entrevista imediatamente anterior neste Diretor/dia
     group.forEach((b) => {
       const currentIdx = daySlots.indexOf(b.slot);
-      if (currentIdx < 0) { pointerIdx = 0; streakRH = null; return; }
-
-      // Liberta TEMPORARIAMENTE a própria célula (Diretor/Supervisor/RH)
-      // antes de procurar — senão a busca ficaria sempre bloqueada pela
-      // ocupação da PRÓPRIA reserva ao testar o seu slot atual.
-      unmarkOccupied(b.diretorId, b.slot);
-      unmarkOccupied(b.supervisorId, b.slot);
-      unmarkOccupied(b.rhId, b.slot);
-
+      if (currentIdx < 0) { pointerIdx = 0; return; }
       const cand = candidateById.get(b.candidateId);
       const candAvail = new Set(cand?.availability?.[b.__availField] || []);
-      const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
 
       let chosenIdx = currentIdx;
-      let chosenRH = b.rhId;
-      for (let i = pointerIdx; i <= currentIdx; i++) {
+      for (let i = pointerIdx; i < currentIdx; i++) {
         const testSlot = daySlots[i];
         if (!candAvail.has(testSlot)) continue;
         if (!hasSlot(evalMinutes(b.diretorId), testSlot) || isOccupied(b.diretorId, testSlot)) continue;
         if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), testSlot) || isOccupied(b.supervisorId, testSlot))) continue;
-        // REQUISITO 2 (manutenção da equipa de RH): prioridade máxima a
-        // continuar com o MESMO RH da entrevista anterior, se ainda
-        // estiver livre e disponível nesse slot — só troca de RH quando
-        // for mesmo necessário para fechar o buraco.
-        let pickedRH = null;
-        if (streakRH && rhPool.includes(streakRH) && hasSlot(evalMinutes(streakRH), testSlot) && !isOccupied(streakRH, testSlot)) {
-          pickedRH = streakRH;
-        } else {
-          pickedRH = rhPool.find((rid) => hasSlot(evalMinutes(rid), testSlot) && !isOccupied(rid, testSlot)) || null;
-        }
-        if (!pickedRH) continue;
+        if (b.rhId && (!hasSlot(evalMinutes(b.rhId), testSlot) || isOccupied(b.rhId, testSlot))) continue;
         chosenIdx = i;
-        chosenRH = pickedRH;
-        break; // o mais cedo possível — zero buracos
+        break; // o mais cedo possível — "bloco IMEDIATAMENTE a seguir" ao anterior
       }
 
-      b.slot = daySlots[chosenIdx];
-      b.rhId = chosenRH;
-      markOccupied(b.diretorId, b.slot);
-      markOccupied(b.supervisorId, b.slot);
-      markOccupied(b.rhId, b.slot);
-      streakRH = b.rhId;
+      if (chosenIdx !== currentIdx) {
+        unmarkOccupied(b.diretorId, b.slot);
+        unmarkOccupied(b.supervisorId, b.slot);
+        unmarkOccupied(b.rhId, b.slot);
+        b.slot = daySlots[chosenIdx];
+        markOccupied(b.diretorId, b.slot);
+        markOccupied(b.supervisorId, b.slot);
+        markOccupied(b.rhId, b.slot);
+      }
       pointerIdx = chosenIdx + 1;
     });
   });
@@ -2731,6 +2710,21 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     return set ? hasSlot(set, slot) : false;
   }
 
+  // PASSO 2 — DISTRIBUIÇÃO EQUITATIVA (ROUND-ROBIN) POR DEPARTAMENTO.
+  // Um índice rotativo por departamento (não uma contagem de carga): avança
+  // 1 posição por CADA candidato desse departamento, alternando estritamente
+  // RH A -> RH B -> RH A -> ... independentemente de haver ou não slot
+  // comum — é o que garante Candidato 1 -> RH A, Candidato 2 -> RH B,
+  // Candidato 3 -> RH A, tal como pedido.
+  const roundRobinIndex = {};
+  function nextRoundRobinRH(dept, rhList) {
+    if (!rhList.length) return null;
+    const key = deptKey(dept);
+    const i = roundRobinIndex[key] || 0;
+    roundRobinIndex[key] = (i + 1) % rhList.length;
+    return rhList[i % rhList.length];
+  }
+
   const poolToSchedule = pool.filter((c) => !kept.some((b) => b.candidateId === c.id));
   
   // Agrupa os candidatos por departamento para otimização máxima independente por departamento
@@ -2752,155 +2746,129 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     let rhList = rhForDepartment(members, dept);
     const rhIsFallback = !rhList.length;
     if (rhIsFallback) rhList = members.filter((m) => m.role === "RH");
-    // DIAGNÓSTICO: sempre visível na consola (F12), mostra exatamente
-    // quantos membros de RH foram encontrados para este departamento —
-    // se aparecer só 1 nome onde esperavas 2, o problema está na equipa
-    // de RH associada ao departamento (aba "Base Dados Departamentos"),
-    // não no algoritmo de agendamento.
-    console.log(`[Agendamento] Departamento "${dept}": ${deptPool.length} candidato(s), Diretor(a) = ${diretor?.name || "NENHUM"}, RH = [${rhList.map((r) => r.name).join(", ") || "NENHUM"}]${rhIsFallback ? " (fallback global — nenhum RH associado diretamente a este departamento)" : ""}`);
 
-    // ========================================================================
-    // ALGORITMO DE BLOCOS SEQUENCIAIS E DISTRIBUIÇÃO EQUITATIVA
-    // ========================================================================
-    // Substitui o emparelhamento de Kuhn por uma alocação DIRETA em blocos
-    // contínuos por membro de RH, seguindo estritamente a prioridade
-    // pedida: 1) sequência imediata (back-to-back) do mesmo RH; 2)
-    // equilíbrio de carga entre os RH do departamento; 3) "Incerteza" só
-    // como último recurso, quando não há nenhum slot "Disponível".
-    const assigned = new Map(); // candidateId -> { slot, rh }
-    const unassigned = new Set(deptPool.map((c) => c.id));
-    const candById = new Map(deptPool.map((c) => [c.id, c]));
-
-    if (diretor && rhList.length) {
-      // REQUISITO 2a — DISTRIBUIÇÃO EQUITATIVA: divide o total de
-      // candidatos do departamento em partes iguais entre os N membros de
-      // RH (o resto, se a divisão não for exata, vai para os primeiros da
-      // lista — ex. 5 candidatos / 2 RH = 3 + 2; 8/2 = 4+4; 7/2 = 4+3).
-      const n = rhList.length;
-      const total = deptPool.length;
-      const quotas = rhList.map((_, i) => Math.floor(total / n) + (i < total % n ? 1 : 0));
-      console.log(`[Agendamento] Quotas de "${dept}": ${rhList.map((r, i) => `${r.name}=${quotas[i]}`).join(", ")}`);
-
-      // CORREÇÃO CRÍTICA (bug da versão anterior): processar cada RH
-      // numa VARREDURA SEPARADA da grelha inteira podia, na prática,
-      // deixar um RH com 0 candidatos — se o primeiro RH da lista
-      // encontrasse disponibilidade cruzada espalhada por vários dias
-      // (não um bloco limpo), a sua varredura por vezes consumia
-      // combinações que o RH seguinte também precisava, sem nenhuma
-      // garantia de que sobrava algo para ele.
-      // NOVA ABORDAGEM — PASSAGEM ÚNICA COM "BALDE" DE RH ATUAL: percorre
-      // TODOS os slots por ordem cronológica (Seg 09:00 -> Sex 18:30) UMA
-      // SÓ VEZ. Em cada slot, tenta preencher com o RH ATUAL (começa no
-      // 1.º da lista); só passa para o RH seguinte quando a quota do
-      // atual estiver mesmo esgotada. Isto garante, por CONSTRUÇÃO — não
-      // por sorte de dados:
-      //  - o RH[0] fica sempre com os primeiros `quota[0]` slots
-      //    preenchidos (o bloco inicial: ex. Joana 09:30-11:30);
-      //  - o RH[1] fica com os `quota[1]` seguintes, só a partir de onde
-      //    o RH[0] parou (o bloco seguinte: ex. Helena a partir das
-      //    11:30) — NUNCA pode ficar a 0 s enquanto ainda há slots por
-      //    preencher, porque só se passa a ele quando o anterior já
-      //    esgotou a SUA quota, nunca antes disso.
-      //  - cada slot só é testado para o RH cuja vez é agora — é isto que
-      //    produz o bloco PRÓPRIO e contínuo por avaliador pedido, em vez
-      //    de alternância ou dispersão.
-      function evaluatorsOkAt(slot, rh, allowUncertain) {
-        if (!hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return false;
-        if (!allowUncertain && isMemberUncertain(diretor, slot)) return false;
-        if (supervisor) {
-          if (!hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return false;
-          if (!allowUncertain && isMemberUncertain(supervisor, slot)) return false;
+    // Mapeia todas as opções válidas de cada candidato com a equipa avaliadora
+    const candidatesMeta = deptPool.map((c) => {
+      const validSlots = [];
+      const slots = c.availability?.[availField] || [];
+      slots.forEach((slot) => {
+        if (!diretor || !hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return;
+        if (staffKeys.includes("supervisorId")) {
+          if (!supervisor || !hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return;
         }
-        if (!hasSlot(minutesOf(rh), slot) || busy[rh.id]?.has(slot)) return false;
-        if (!allowUncertain && isMemberUncertain(rh, slot)) return false;
-        return true;
-      }
-      // CORREÇÃO CRÍTICA (bug real — "1 candidato ficou sem horário"):
-      // a versão anterior escolhia sempre o PRIMEIRO candidato ainda não
-      // atribuído com disponibilidade nesse slot (ordem do pool). Isso
-      // deixava candidatos com disponibilidade muito reduzida (ex. só 1
-      // slot possível no total) ficarem sem nada, porque um candidato
-      // mais flexível (com dezenas de slots possíveis) "roubava-lhe" o
-      // único horário em comum só por vir primeiro na lista — mesmo esse
-      // candidato flexível tendo dezenas de outras hipóteses igualmente
-      // válidas para preencher a seguir. Agora escolhe, de entre os
-      // candidatos disponíveis NESSE slot exato, o que tiver MENOS opções
-      // no TOTAL (mais restrito) — reduz drasticamente o risco de alguém
-      // ficar "Sem Horário Comum" só por causa da ordem de processamento,
-      // sem sacrificar a continuidade (continua a preencher o slot atual,
-      // só muda QUEM o ocupa).
-      function pickCandidateAt(slot) {
-        let best = null;
-        let bestCount = Infinity;
-        for (const cid of unassigned) {
-          const c = candById.get(cid);
-          const avail = c.availability?.[availField] || [];
-          if (!avail.includes(slot)) continue;
-          if (avail.length < bestCount) { best = cid; bestCount = avail.length; }
+        const freeRH = rhList.filter((r) => hasSlot(minutesOf(r), slot) && !busy[r.id]?.has(slot));
+        if (freeRH.length) {
+          validSlots.push({ slot, freeRH });
         }
-        return best;
-      }
-      function commitAssignment(cid, slot, rh) {
-        assigned.set(cid, { slot, rh });
-        unassigned.delete(cid);
-        busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slot);
-        if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slot); }
-        busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slot);
-      }
+      });
+      return { candidate: c, validSlots, assignedRHDefault: nextRoundRobinRH(dept, rhList) };
+    });
 
-      // `remainingQuota` é mutada in-place — a MESMA instância é usada
-      // pelas 2 passagens (confirmado, depois Incerteza) e pelo fallback
-      // final, para as quotas nunca "reiniciarem" entre passagens.
-      const remainingQuota = quotas.slice();
-      function fillPass(allowUncertain) {
-        let rhIdx = 0;
-        while (rhIdx < rhList.length && remainingQuota[rhIdx] <= 0) rhIdx++;
-        for (let i = 0; i < SLOTS.length && rhIdx < rhList.length; i++) {
-          const slot = SLOTS[i];
-          const rh = rhList[rhIdx];
-          if (!evaluatorsOkAt(slot, rh, allowUncertain)) continue;
-          const cid = pickCandidateAt(slot);
-          if (!cid) continue;
-          commitAssignment(cid, slot, rh);
-          remainingQuota[rhIdx]--;
-          if (remainingQuota[rhIdx] <= 0) {
-            rhIdx++;
-            while (rhIdx < rhList.length && remainingQuota[rhIdx] <= 0) rhIdx++;
+    // REQUISITO 1 (Entrevistas Seguidas — otimização de agenda): antes do
+    // emparelhamento, ordena as opções de horário de CADA candidato para
+    // que o algoritmo de Kuhn abaixo tente primeiro as mais vantajosas —
+    // nunca restringe quais slots são válidos, só a ORDEM em que são
+    // tentados, por isso a garantia de emparelhamento MÁXIMO mantém-se
+    // sempre intacta (se a 1ª opção falhar, o algoritmo continua a tentar
+    // as seguintes normalmente).
+    //
+    // Ordem de prioridade pedida:
+    //   1.º slots "Disponível" que criam blocos SEGUIDOS (sem buracos)
+    //   2.º slots só "Disponível" (sem contiguidade)
+    //   3.º slots que envolvam "Incerteza" (nunca descartados — evita
+    //       deixar candidatos sem horário)
+    //   4.º "Indisponível" — já nem chega a `validSlots`, continua excluído.
+    //
+    // "certaintyRank" resolve o critério 1.º/2.º vs 3.º (0 = todos os
+    // avaliadores confirmados "Disponível" nesse slot; 1 = pelo menos um
+    // está só "Incerteza"). "contiguityScore" resolve o desempate dentro
+    // do mesmo certaintyRank, somando pontos por cada slot ADJACENTE
+    // (±30 min, mesmo dia) que já esteja ocupado pelo mesmo Diretor/
+    // Supervisor/RH — nesta ou em gerações anteriores (agendamentos
+    // manuais, ou departamentos já processados nesta mesma chamada) —
+    // ou que seja uma opção válida de OUTRO candidato deste mesmo
+    // departamento (que partilha o mesmo Diretor/Supervisor), o que tende
+    // a concentrar as entrevistas em blocos contíguos em vez de dispersas.
+    const slotPoolDensity = {}; // slot -> nº de candidatos deste departamento com esse slot como opção válida
+    candidatesMeta.forEach((m) => m.validSlots.forEach(({ slot }) => {
+      slotPoolDensity[slot] = (slotPoolDensity[slot] || 0) + 1;
+    }));
+
+    function certaintyRank(slot, freeRH) {
+      if (diretor && isMemberUncertain(diretor, slot)) return 1;
+      if (supervisor && isMemberUncertain(supervisor, slot)) return 1;
+      // Só penaliza o lado do RH se TODAS as opções de RH livres nesse
+      // slot forem incertas — se houver pelo menos um RH confirmado, o
+      // agendamento pode escolher esse e o slot mantém-se de confiança.
+      if (freeRH.length && freeRH.every((r) => isMemberUncertain(r, slot))) return 1;
+      return 0;
+    }
+    function contiguityScore(slot, freeRH) {
+      let score = 0;
+      adjacentSlots(slot).forEach((adj) => {
+        if (diretor && busy[diretor.id]?.has(adj)) score += 3;
+        if (supervisor && busy[supervisor.id]?.has(adj)) score += 3;
+        freeRH.forEach((r) => { if (busy[r.id]?.has(adj)) score += 2; });
+        score += (slotPoolDensity[adj] || 0) * 0.5;
+      });
+      return score;
+    }
+    candidatesMeta.forEach((m) => {
+      m.validSlots.sort((a, b) => {
+        const certA = certaintyRank(a.slot, a.freeRH);
+        const certB = certaintyRank(b.slot, b.freeRH);
+        if (certA !== certB) return certA - certB; // "Disponível" (0) antes de "Incerteza" (1)
+        return contiguityScore(b.slot, b.freeRH) - contiguityScore(a.slot, a.freeRH); // mais contíguo primeiro
+      });
+    });
+
+    // OTIMIZADOR DE EMPARELHAMENTO MÁXIMO (Algoritmo de Kuhn com caminhos de aumento):
+    // Reorganiza dinamicamente as escolhas para encontrar a combinação matematicamente
+    // ótima que maximiza o número total de candidatos com entrevista agendada.
+    const slotOwner = {}; // slotKey -> candIdx
+    const slotChosenRH = {}; // slotKey -> rh
+
+    function tryMatch(u, seen) {
+      const meta = candidatesMeta[u];
+      for (const sInfo of meta.validSlots) {
+        const slotKey = sInfo.slot;
+        if (!seen.has(slotKey)) {
+          seen.add(slotKey);
+          if (slotOwner[slotKey] === undefined || tryMatch(slotOwner[slotKey], seen)) {
+            slotOwner[slotKey] = u;
+            const prefRH = sInfo.freeRH.find(r => r.id === meta.assignedRHDefault?.id) || sInfo.freeRH[0];
+            slotChosenRH[slotKey] = prefRH;
+            return true;
           }
         }
       }
-      // REQUISITO 3 (prioridade "Incerteza" só como último recurso): 1ª
-      // passagem só com disponibilidade CONFIRMADA; 2ª (só preenche o que
-      // sobrar de quota) já aceita "Incerteza".
-      fillPass(false);
-      fillPass(true);
-
-      // GARANTIA FINAL (requisito 3 — zero "Sem Horário Comum"): se ainda
-      // sobrarem candidatos por agendar depois das duas passagens acima
-      // (ex. quota de um RH inatingível pela sua própria disponibilidade,
-      // mas outro RH com espaço genuíno para mais), tenta encaixá-los à
-      // mesma em QUALQUER RH livre — já sem respeitar a quota "ideal" —
-      // antes de desistir e assumir "Sem Horário Comum". Só fica mesmo
-      // por agendar quem não tiver NENHUMA interseção real de horários
-      // com Diretor+algum RH, confirmada ou incerta.
-      if (unassigned.size) {
-        [false, true].forEach((allowUncertain) => {
-          for (let i = 0; i < SLOTS.length && unassigned.size; i++) {
-            const slot = SLOTS[i];
-            for (const rh of rhList) {
-              if (!evaluatorsOkAt(slot, rh, allowUncertain)) continue;
-              const cid = pickCandidateAt(slot);
-              if (!cid) continue;
-              commitAssignment(cid, slot, rh);
-              break;
-            }
-          }
-        });
-      }
+      return false;
     }
 
-    deptPool.forEach((c) => {
-      const match = assigned.get(c.id);
+    const sortedIndices = candidatesMeta
+      .map((m, i) => ({ i, len: m.validSlots.length }))
+      .sort((a, b) => (a.len === 0 ? 1 : b.len === 0 ? -1 : a.len - b.len))
+      .map(x => x.i);
+
+    sortedIndices.forEach((u) => {
+      if (candidatesMeta[u].validSlots.length > 0) {
+        tryMatch(u, new Set());
+      }
+    });
+
+    const candAssigned = {};
+    Object.keys(slotOwner).forEach((slotKey) => {
+      const u = slotOwner[slotKey];
+      candAssigned[u] = { slot: slotKey, rh: slotChosenRH[slotKey] };
+      if (diretor) { busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slotKey); }
+      if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slotKey); }
+      const rh = slotChosenRH[slotKey];
+      if (rh) { busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slotKey); }
+    });
+
+    candidatesMeta.forEach((meta, u) => {
+      const c = meta.candidate;
+      const match = candAssigned[u];
       if (match) {
         const record = {
           id: uid("bk"),
@@ -2910,16 +2878,11 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
           rhId: match.rh?.id || null,
           status: "Agendado",
           manual: false,
-          // Campos TEMPORÁRIOS, usados só pelo empilhamento contínuo
-          // (compactContinuousSchedule) logo a seguir — removidos antes do
-          // return final, nunca ficam no registo definitivo:
-          // __availField: qual sub-campo de `candidate.availability`
-          //   consultar; __rhPool: TODOS os RH válidos para este
-          //   departamento (não só o já escolhido), para a compactação
-          //   poder trocar de RH quando isso ajudar a fechar um buraco ou
-          //   a continuar o bloco do mesmo RH.
+          // Campo TEMPORÁRIO, usado só pelo empilhamento contínuo
+          // (compactContinuousSchedule) logo a seguir, para saber qual
+          // sub-campo de `candidate.availability` consultar — removido
+          // antes do return final, nunca fica no registo definitivo.
           __availField: availField,
-          __rhPool: rhList.map((r) => r.id),
         };
         if (staffKeys.includes("supervisorId")) record.supervisorId = supervisor?.id || null;
         newBookings.push(record);
@@ -2929,7 +2892,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
           candidateId: c.id,
           slot: null,
           diretorId: diretor?.id || null,
-          rhId: rhList[0]?.id || null,
+          rhId: meta.assignedRHDefault?.id || null,
           status: "Sem Horário Comum",
           manual: false
         };
@@ -2962,7 +2925,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
   // consecutivas do mesmo avaliador — nunca muda quem fica com quem, nunca
   // reduz o nº de candidatos agendados.
   compactContinuousSchedule(newBookings, kept, members, pool);
-  newBookings.forEach((b) => { delete b.__availField; delete b.__rhPool; }); // campos temporários, nunca ficam no registo final
+  newBookings.forEach((b) => { delete b.__availField; }); // campo temporário, nunca fica no registo final
 
   // Mantém a ordem de apresentação original do pool
   const orderMap = new Map(pool.map((c, i) => [c.id, i]));
