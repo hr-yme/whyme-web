@@ -2752,6 +2752,12 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     let rhList = rhForDepartment(members, dept);
     const rhIsFallback = !rhList.length;
     if (rhIsFallback) rhList = members.filter((m) => m.role === "RH");
+    // DIAGNÓSTICO: sempre visível na consola (F12), mostra exatamente
+    // quantos membros de RH foram encontrados para este departamento —
+    // se aparecer só 1 nome onde esperavas 2, o problema está na equipa
+    // de RH associada ao departamento (aba "Base Dados Departamentos"),
+    // não no algoritmo de agendamento.
+    console.log(`[Agendamento] Departamento "${dept}": ${deptPool.length} candidato(s), Diretor(a) = ${diretor?.name || "NENHUM"}, RH = [${rhList.map((r) => r.name).join(", ") || "NENHUM"}]${rhIsFallback ? " (fallback global — nenhum RH associado diretamente a este departamento)" : ""}`);
 
     // ========================================================================
     // ALGORITMO DE BLOCOS SEQUENCIAIS E DISTRIBUIÇÃO EQUITATIVA
@@ -2773,6 +2779,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
       const n = rhList.length;
       const total = deptPool.length;
       const quotas = rhList.map((_, i) => Math.floor(total / n) + (i < total % n ? 1 : 0));
+      console.log(`[Agendamento] Quotas de "${dept}": ${rhList.map((r, i) => `${r.name}=${quotas[i]}`).join(", ")}`);
 
       // CORREÇÃO CRÍTICA (bug da versão anterior): processar cada RH
       // numa VARREDURA SEPARADA da grelha inteira podia, na prática,
@@ -2808,15 +2815,30 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
         if (!allowUncertain && isMemberUncertain(rh, slot)) return false;
         return true;
       }
-      // Primeiro candidato AINDA NÃO atribuído com disponibilidade nesse
-      // slot exato — a ordem de iteração de `unassigned` (um Set) segue a
-      // ordem de inserção, ou seja, a ordem original do pool do departamento.
+      // CORREÇÃO CRÍTICA (bug real — "1 candidato ficou sem horário"):
+      // a versão anterior escolhia sempre o PRIMEIRO candidato ainda não
+      // atribuído com disponibilidade nesse slot (ordem do pool). Isso
+      // deixava candidatos com disponibilidade muito reduzida (ex. só 1
+      // slot possível no total) ficarem sem nada, porque um candidato
+      // mais flexível (com dezenas de slots possíveis) "roubava-lhe" o
+      // único horário em comum só por vir primeiro na lista — mesmo esse
+      // candidato flexível tendo dezenas de outras hipóteses igualmente
+      // válidas para preencher a seguir. Agora escolhe, de entre os
+      // candidatos disponíveis NESSE slot exato, o que tiver MENOS opções
+      // no TOTAL (mais restrito) — reduz drasticamente o risco de alguém
+      // ficar "Sem Horário Comum" só por causa da ordem de processamento,
+      // sem sacrificar a continuidade (continua a preencher o slot atual,
+      // só muda QUEM o ocupa).
       function pickCandidateAt(slot) {
+        let best = null;
+        let bestCount = Infinity;
         for (const cid of unassigned) {
           const c = candById.get(cid);
-          if ((c.availability?.[availField] || []).includes(slot)) return cid;
+          const avail = c.availability?.[availField] || [];
+          if (!avail.includes(slot)) continue;
+          if (avail.length < bestCount) { best = cid; bestCount = avail.length; }
         }
-        return null;
+        return best;
       }
       function commitAssignment(cid, slot, rh) {
         assigned.set(cid, { slot, rh });
