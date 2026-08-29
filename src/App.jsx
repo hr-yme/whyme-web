@@ -2555,24 +2555,6 @@ function hasSlot(minuteSet, slot) {
   const info = slotToMinutes(slot);
   return info ? minuteSet.has(`${info.day}|${info.startMin}`) : false;
 }
-// Slots imediatamente adjacentes (mesmo dia, ±SLOT_DURATION_MIN) a um slot
-// dado — usado pela REGRA DE OTIMIZAÇÃO DE AGENDA (entrevistas seguidas):
-// permite pontuar cada opção de horário por quão "colada" fica a outras
-// entrevistas já marcadas para o mesmo Diretor/Supervisor/RH, em vez de
-// deixar buracos vagos na agenda. Só devolve slots que realmente existem
-// na grelha oficial (SLOT_INFO) — nunca inventa um horário fora de TIMES.
-function adjacentSlots(slot) {
-  const info = SLOT_INFO[slot];
-  if (!info) return [];
-  const out = [];
-  [info.startMin - SLOT_DURATION_MIN, info.startMin + SLOT_DURATION_MIN].forEach((m) => {
-    const hh = String(Math.floor(m / 60)).padStart(2, "0");
-    const mm = String(m % 60).padStart(2, "0");
-    const candidate = `${info.day} ${hh}:${mm}`;
-    if (SLOT_INFO[candidate]) out.push(candidate);
-  });
-  return out;
-}
 // Sequência oficial de slots de um dia, na ordem exata da grelha (TIMES) —
 // "o slot IMEDIATAMENTE A SEGUIR" de "Seg 09:30" é sempre o próximo desta
 // lista ("Seg 10:00"), respeitando naturalmente a pausa de almoço (que já
@@ -2749,21 +2731,6 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     return set ? hasSlot(set, slot) : false;
   }
 
-  // PASSO 2 — DISTRIBUIÇÃO EQUITATIVA (ROUND-ROBIN) POR DEPARTAMENTO.
-  // Um índice rotativo por departamento (não uma contagem de carga): avança
-  // 1 posição por CADA candidato desse departamento, alternando estritamente
-  // RH A -> RH B -> RH A -> ... independentemente de haver ou não slot
-  // comum — é o que garante Candidato 1 -> RH A, Candidato 2 -> RH B,
-  // Candidato 3 -> RH A, tal como pedido.
-  const roundRobinIndex = {};
-  function nextRoundRobinRH(dept, rhList) {
-    if (!rhList.length) return null;
-    const key = deptKey(dept);
-    const i = roundRobinIndex[key] || 0;
-    roundRobinIndex[key] = (i + 1) % rhList.length;
-    return rhList[i % rhList.length];
-  }
-
   const poolToSchedule = pool.filter((c) => !kept.some((b) => b.candidateId === c.id));
   
   // Agrupa os candidatos por departamento para otimização máxima independente por departamento
@@ -2786,128 +2753,111 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     const rhIsFallback = !rhList.length;
     if (rhIsFallback) rhList = members.filter((m) => m.role === "RH");
 
-    // Mapeia todas as opções válidas de cada candidato com a equipa avaliadora
-    const candidatesMeta = deptPool.map((c) => {
-      const validSlots = [];
-      const slots = c.availability?.[availField] || [];
-      slots.forEach((slot) => {
-        if (!diretor || !hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return;
-        if (staffKeys.includes("supervisorId")) {
-          if (!supervisor || !hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return;
-        }
-        const freeRH = rhList.filter((r) => hasSlot(minutesOf(r), slot) && !busy[r.id]?.has(slot));
-        if (freeRH.length) {
-          validSlots.push({ slot, freeRH });
-        }
-      });
-      return { candidate: c, validSlots, assignedRHDefault: nextRoundRobinRH(dept, rhList) };
-    });
+    // ========================================================================
+    // ALGORITMO DE BLOCOS SEQUENCIAIS E DISTRIBUIÇÃO EQUITATIVA
+    // ========================================================================
+    // Substitui o emparelhamento de Kuhn por uma alocação DIRETA em blocos
+    // contínuos por membro de RH, seguindo estritamente a prioridade
+    // pedida: 1) sequência imediata (back-to-back) do mesmo RH; 2)
+    // equilíbrio de carga entre os RH do departamento; 3) "Incerteza" só
+    // como último recurso, quando não há nenhum slot "Disponível".
+    const assigned = new Map(); // candidateId -> { slot, rh }
+    const unassigned = new Set(deptPool.map((c) => c.id));
+    const candById = new Map(deptPool.map((c) => [c.id, c]));
 
-    // REQUISITO 1 (Entrevistas Seguidas — otimização de agenda): antes do
-    // emparelhamento, ordena as opções de horário de CADA candidato para
-    // que o algoritmo de Kuhn abaixo tente primeiro as mais vantajosas —
-    // nunca restringe quais slots são válidos, só a ORDEM em que são
-    // tentados, por isso a garantia de emparelhamento MÁXIMO mantém-se
-    // sempre intacta (se a 1ª opção falhar, o algoritmo continua a tentar
-    // as seguintes normalmente).
-    //
-    // Ordem de prioridade pedida:
-    //   1.º slots "Disponível" que criam blocos SEGUIDOS (sem buracos)
-    //   2.º slots só "Disponível" (sem contiguidade)
-    //   3.º slots que envolvam "Incerteza" (nunca descartados — evita
-    //       deixar candidatos sem horário)
-    //   4.º "Indisponível" — já nem chega a `validSlots`, continua excluído.
-    //
-    // "certaintyRank" resolve o critério 1.º/2.º vs 3.º (0 = todos os
-    // avaliadores confirmados "Disponível" nesse slot; 1 = pelo menos um
-    // está só "Incerteza"). "contiguityScore" resolve o desempate dentro
-    // do mesmo certaintyRank, somando pontos por cada slot ADJACENTE
-    // (±30 min, mesmo dia) que já esteja ocupado pelo mesmo Diretor/
-    // Supervisor/RH — nesta ou em gerações anteriores (agendamentos
-    // manuais, ou departamentos já processados nesta mesma chamada) —
-    // ou que seja uma opção válida de OUTRO candidato deste mesmo
-    // departamento (que partilha o mesmo Diretor/Supervisor), o que tende
-    // a concentrar as entrevistas em blocos contíguos em vez de dispersas.
-    const slotPoolDensity = {}; // slot -> nº de candidatos deste departamento com esse slot como opção válida
-    candidatesMeta.forEach((m) => m.validSlots.forEach(({ slot }) => {
-      slotPoolDensity[slot] = (slotPoolDensity[slot] || 0) + 1;
-    }));
-
-    function certaintyRank(slot, freeRH) {
-      if (diretor && isMemberUncertain(diretor, slot)) return 1;
-      if (supervisor && isMemberUncertain(supervisor, slot)) return 1;
-      // Só penaliza o lado do RH se TODAS as opções de RH livres nesse
-      // slot forem incertas — se houver pelo menos um RH confirmado, o
-      // agendamento pode escolher esse e o slot mantém-se de confiança.
-      if (freeRH.length && freeRH.every((r) => isMemberUncertain(r, slot))) return 1;
-      return 0;
+    // Verifica se Diretor + Supervisor(se aplicável) + este RH estão todos
+    // livres E disponíveis nesse slot exato. `allowUncertain=false` exige
+    // que NENHUM deles esteja marcado "Incerteza" nesse slot (prioridade
+    // 1/2 — só "Disponível" confirmado); `allowUncertain=true` já aceita
+    // "Incerteza" (prioridade 3 — usado só depois de esgotar as opções
+    // confirmadas).
+    function evaluatorsOkAt(slot, rh, allowUncertain) {
+      if (!hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return false;
+      if (!allowUncertain && isMemberUncertain(diretor, slot)) return false;
+      if (supervisor) {
+        if (!hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return false;
+        if (!allowUncertain && isMemberUncertain(supervisor, slot)) return false;
+      }
+      if (!hasSlot(minutesOf(rh), slot) || busy[rh.id]?.has(slot)) return false;
+      if (!allowUncertain && isMemberUncertain(rh, slot)) return false;
+      return true;
     }
-    function contiguityScore(slot, freeRH) {
-      let score = 0;
-      adjacentSlots(slot).forEach((adj) => {
-        if (diretor && busy[diretor.id]?.has(adj)) score += 3;
-        if (supervisor && busy[supervisor.id]?.has(adj)) score += 3;
-        freeRH.forEach((r) => { if (busy[r.id]?.has(adj)) score += 2; });
-        score += (slotPoolDensity[adj] || 0) * 0.5;
-      });
-      return score;
+    // Primeiro candidato AINDA NÃO atribuído com disponibilidade nesse
+    // slot exato — a ordem de iteração de `unassigned` (um Set) segue a
+    // ordem de inserção, ou seja, a ordem original do pool do departamento.
+    function pickCandidateAt(slot) {
+      for (const cid of unassigned) {
+        const c = candById.get(cid);
+        if ((c.availability?.[availField] || []).includes(slot)) return cid;
+      }
+      return null;
     }
-    candidatesMeta.forEach((m) => {
-      m.validSlots.sort((a, b) => {
-        const certA = certaintyRank(a.slot, a.freeRH);
-        const certB = certaintyRank(b.slot, b.freeRH);
-        if (certA !== certB) return certA - certB; // "Disponível" (0) antes de "Incerteza" (1)
-        return contiguityScore(b.slot, b.freeRH) - contiguityScore(a.slot, a.freeRH); // mais contíguo primeiro
-      });
-    });
+    function commitAssignment(cid, slot, rh) {
+      assigned.set(cid, { slot, rh });
+      unassigned.delete(cid);
+      busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slot);
+      if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slot); }
+      busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slot);
+    }
 
-    // OTIMIZADOR DE EMPARELHAMENTO MÁXIMO (Algoritmo de Kuhn com caminhos de aumento):
-    // Reorganiza dinamicamente as escolhas para encontrar a combinação matematicamente
-    // ótima que maximiza o número total de candidatos com entrevista agendada.
-    const slotOwner = {}; // slotKey -> candIdx
-    const slotChosenRH = {}; // slotKey -> rh
+    if (diretor && rhList.length) {
+      // REQUISITO 2a — DISTRIBUIÇÃO EQUITATIVA: divide o total de
+      // candidatos do departamento em partes iguais entre os N membros de
+      // RH (o resto, se a divisão não for exata, vai para os primeiros da
+      // lista — ex. 5 candidatos / 2 RH = 3 + 2).
+      const n = rhList.length;
+      const total = deptPool.length;
+      const quotas = rhList.map((_, i) => Math.floor(total / n) + (i < total % n ? 1 : 0));
 
-    function tryMatch(u, seen) {
-      const meta = candidatesMeta[u];
-      for (const sInfo of meta.validSlots) {
-        const slotKey = sInfo.slot;
-        if (!seen.has(slotKey)) {
-          seen.add(slotKey);
-          if (slotOwner[slotKey] === undefined || tryMatch(slotOwner[slotKey], seen)) {
-            slotOwner[slotKey] = u;
-            const prefRH = sInfo.freeRH.find(r => r.id === meta.assignedRHDefault?.id) || sInfo.freeRH[0];
-            slotChosenRH[slotKey] = prefRH;
-            return true;
+      // REQUISITO 2b/2c/3 — TURNO CONTÍNUO INDIVIDUAL: para cada RH, em
+      // ordem, percorre a grelha de slots CRONOLOGICAMENTE (SLOTS já vem
+      // ordenada Seg->Sex, 09:00->18:30) e vai preenchendo a sua quota com
+      // o próximo candidato disponível em cada slot válido — como avança
+      // slot a slot sem saltar nenhum, o resultado é sempre um bloco
+      // contíguo sempre que a disponibilidade cruzada o permita (é
+      // exatamente "Membro A faz 09:00-10:00; Membro B assume 10:00-
+      // 11:00 a seguir", porque o Diretor fica ocupado durante o bloco de
+      // A e só liberta a partir daí para B). 1ª passagem só com
+      // disponibilidade confirmada; 2ª (só se sobrar quota) já aceita
+      // "Incerteza" — nunca ao contrário.
+      rhList.forEach((rh, rhIdx) => {
+        let remaining = quotas[rhIdx];
+        if (remaining <= 0) return;
+        [false, true].forEach((allowUncertain) => {
+          for (let i = 0; i < SLOTS.length && remaining > 0; i++) {
+            const slot = SLOTS[i];
+            if (!evaluatorsOkAt(slot, rh, allowUncertain)) continue;
+            const cid = pickCandidateAt(slot);
+            if (!cid) continue;
+            commitAssignment(cid, slot, rh);
+            remaining--;
           }
-        }
+        });
+      });
+
+      // FALLBACK final: se ainda sobrarem candidatos por agendar (quota de
+      // um RH inatingível pela sua própria disponibilidade, mas outro RH
+      // com espaço genuíno para mais), tenta encaixá-los em QUALQUER RH
+      // livre — nunca deixar alguém de fora só por causa da divisão
+      // equitativa se ainda houver uma hipótese real de agendamento.
+      if (unassigned.size) {
+        [false, true].forEach((allowUncertain) => {
+          for (let i = 0; i < SLOTS.length && unassigned.size; i++) {
+            const slot = SLOTS[i];
+            for (const rh of rhList) {
+              if (!evaluatorsOkAt(slot, rh, allowUncertain)) continue;
+              const cid = pickCandidateAt(slot);
+              if (!cid) continue;
+              commitAssignment(cid, slot, rh);
+              break;
+            }
+          }
+        });
       }
-      return false;
     }
 
-    const sortedIndices = candidatesMeta
-      .map((m, i) => ({ i, len: m.validSlots.length }))
-      .sort((a, b) => (a.len === 0 ? 1 : b.len === 0 ? -1 : a.len - b.len))
-      .map(x => x.i);
-
-    sortedIndices.forEach((u) => {
-      if (candidatesMeta[u].validSlots.length > 0) {
-        tryMatch(u, new Set());
-      }
-    });
-
-    const candAssigned = {};
-    Object.keys(slotOwner).forEach((slotKey) => {
-      const u = slotOwner[slotKey];
-      candAssigned[u] = { slot: slotKey, rh: slotChosenRH[slotKey] };
-      if (diretor) { busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slotKey); }
-      if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slotKey); }
-      const rh = slotChosenRH[slotKey];
-      if (rh) { busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slotKey); }
-    });
-
-    candidatesMeta.forEach((meta, u) => {
-      const c = meta.candidate;
-      const match = candAssigned[u];
+    deptPool.forEach((c) => {
+      const match = assigned.get(c.id);
       if (match) {
         const record = {
           id: uid("bk"),
@@ -2936,7 +2886,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
           candidateId: c.id,
           slot: null,
           diretorId: diretor?.id || null,
-          rhId: meta.assignedRHDefault?.id || null,
+          rhId: rhList[0]?.id || null,
           status: "Sem Horário Comum",
           manual: false
         };
