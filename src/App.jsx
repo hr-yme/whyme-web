@@ -789,6 +789,21 @@ function isAvailabilityPositiveMark(val) {
   const { inicio } = parseTimeToMinutes(cleaned);
   return inicio !== null;
 }
+// Deteção do estado "Incerteza" (requisito: disponibilidade de RH/
+// Diretores/Supervisores pode trazer "Incerteza" além de "Disponível"/
+// "Indisponível"). Reconhece variações comuns de texto/acentuação —
+// nunca deve ser confundido com uma marca positiva (isAvailabilityPositiveMark
+// é sempre verificada primeiro pelo chamador) nem com uma célula vazia.
+function isAvailabilityUncertainMark(val) {
+  const cleaned = cleanCellText(val);
+  if (!cleaned) return false;
+  const norm = normKey(cleaned).replace(/[^a-z0-9]/g, "");
+  return [
+    "incerteza", "incerto", "incerta", "talvez", "duvida", "duvidoso",
+    "naosei", "naotenhoacerteza", "semacerteza", "porconfirmar", "aconfirmar",
+    "indeciso", "indecisa", "possivelmente", "provavelmente",
+  ].includes(norm);
+}
 // "pending" = célula vazia (ainda sem decisão); "positive"/"negative" = célula preenchida.
 function cellStatus(val) {
   const s = String(val ?? "").trim();
@@ -1957,18 +1972,31 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
   header.forEach(registerDayNumberMapping);
 
   const slots = new Set();
+  // NOVO: slots marcados como "Incerteza" — ficam TAMBÉM em `slots` (nunca
+  // são descartados, requisito "não deve descartar o horário"), mas
+  // registados aqui à parte para o agendamento poder dar-lhes menor
+  // prioridade do que um "Disponível" confirmado (ver generateInterviewPhase).
+  const uncertainSlots = new Set();
   let hasUnrecognizedContent = false;
   // Intervalos {day,startMin,endMin} vindos de colunas "dia+intervalo no
   // cabeçalho, célula é só Disponível/Indisponível" (ver caso (a2) abaixo)
   // — acumulados à parte para serem fundidos numa só passagem no fim,
   // exatamente como os blocos de 30 min do Forms.
   const dayRangeRanges = [];
+  const dayRangeRangesUncertain = []; // NOVO: mesma ideia, para "Incerteza"
   header.forEach((h) => {
     // (a) cabeçalho é um slot exato ("Seg 09:00") marcado x/sim/true/1/☑/
-    //     disponível/check/a própria hora
+    //     disponível/check/a própria hora — ou "Incerteza" (conta como
+    //     disponível para efeitos de não descartar o horário, mas fica
+    //     também registado em uncertainSlots).
     const exactSlot = normalizeSlotString(h);
     if (exactSlot) {
-      if (isAvailabilityPositiveMark(rowObj[h])) slots.add(exactSlot);
+      if (isAvailabilityPositiveMark(rowObj[h])) {
+        slots.add(exactSlot);
+      } else if (isAvailabilityUncertainMark(rowObj[h])) {
+        slots.add(exactSlot);
+        uncertainSlots.add(exactSlot);
+      }
       // célula vazia ou negativa aqui é uma resposta normal de checkbox
       // (candidato não marcou ESTE slot específico) — não é conteúdo por
       // reconhecer, por isso nunca marca hasUnrecognizedContent.
@@ -1977,15 +2005,18 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
     // (a2) cabeçalho combina DIA + INTERVALO de horas (ex. "Qua 9-9:30",
     // resultado de mergeTwoRowHeader combinando "Dia 10 - Quarta" + "9-
     // 9:30"), e a célula é um marcador booleano "Disponível"/"Indisponível"
-    // — não texto livre com a hora (é essa a diferença para o caso (b)
-    // abaixo). Só entra aqui se o cabeçalho tiver um dia E um INTERVALO
-    // genuíno (2 horas, início < fim) — um único número solto (ex. o "10"
-    // de "dia 10 de junho") nunca ativa este caso, continua a cair no (b).
+    // (ou "Incerteza") — não texto livre com a hora (é essa a diferença
+    // para o caso (b) abaixo). Só entra aqui se o cabeçalho tiver um dia E
+    // um INTERVALO genuíno (2 horas, início < fim) — um único número solto
+    // (ex. o "10" de "dia 10 de junho") nunca ativa este caso, continua a
+    // cair no (b).
     const day = normalizeDayOnlyHeader(h);
     const range = day ? parseTimeToMinutes(h, { allowBareHour: true }) : null;
     if (day && range && range.inicio !== null && range.fim !== null && range.fim > range.inicio) {
       if (isAvailabilityPositiveMark(rowObj[h])) {
         dayRangeRanges.push({ day, startMin: range.inicio, endMin: range.fim });
+      } else if (isAvailabilityUncertainMark(rowObj[h])) {
+        dayRangeRangesUncertain.push({ day, startMin: range.inicio, endMin: range.fim });
       }
       // "Indisponível"/vazio/etc. aqui é só "não disponível NESTE bloco de
       // meia-hora" — normal, nunca é erro de formato.
@@ -2033,6 +2064,9 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
   // PADRÃO (SLOT_DURATION_MIN): esta é disponibilidade de Diretor/RH, não
   // ligada a nenhuma fase específica, por isso não usa `durationMin`.
   expandRangesToSlots(mergeRanges(dayRangeRanges), SLOT_DURATION_MIN).forEach((s) => slots.add(s));
+  // Mesma fusão para os intervalos "Incerteza" do caso (a2) — entram em
+  // `slots` (nunca descartados) e ficam também marcados em uncertainSlots.
+  expandRangesToSlots(mergeRanges(dayRangeRangesUncertain), SLOT_DURATION_MIN).forEach((s) => { slots.add(s); uncertainSlots.add(s); });
   const free = cleanCellText(get(rowObj, "disponibilidade", "horarios", "horários", "slots"));
   if (!isNoAvailabilityResponse(free)) {
     const { slots: found, parsedAnything } = parseAvailabilityCell(free, undefined, durationMin);
@@ -2041,6 +2075,10 @@ function extractAvailabilityFromRow(header, rowObj, durationMin = SLOT_DURATION_
   }
   return {
     slots: Array.from(slots).sort((a, b) => SLOTS.indexOf(a) - SLOTS.indexOf(b)),
+    // NOVO: subconjunto de `slots` marcado como "Incerteza" — usado só
+    // para ordenar preferências no agendamento (ver generateInterviewPhase),
+    // nunca para excluir horários.
+    uncertainSlots: Array.from(uncertainSlots),
     hasUnrecognizedContent,
   };
 }
@@ -2100,13 +2138,21 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     (tab?.rows || []).forEach((row) => {
       const name = cleanCellText(get(row.obj, "nome", "name"));
       if (!name) return;
-      const { slots } = extractAvailabilityFromRow(tab.header, row.obj);
+      const { slots, uncertainSlots } = extractAvailabilityFromRow(tab.header, row.obj);
       if (!slots.length) return;
       const idx = findMemberIndex(members, name);
       if (idx >= 0) {
-        members[idx] = { ...members[idx], availability: Array.from(new Set([...(members[idx].availability || []), ...slots])) };
+        members[idx] = {
+          ...members[idx],
+          availability: Array.from(new Set([...(members[idx].availability || []), ...slots])),
+          // NOVO (requisito "Incerteza"): subconjunto de `availability`
+          // marcado como incerto — nunca exclui o horário (já está em
+          // `availability`), só serve para o agendamento dar-lhe menor
+          // prioridade do que um "Disponível" confirmado.
+          availabilityUncertain: Array.from(new Set([...(members[idx].availabilityUncertain || []), ...uncertainSlots])),
+        };
       } else {
-        members.push({ id: uid("sync"), name, role: "RH", title: "Membro", departments: [], availability: slots });
+        members.push({ id: uid("sync"), name, role: "RH", title: "Membro", departments: [], availability: slots, availabilityUncertain: uncertainSlots });
       }
     });
   });
@@ -2509,6 +2555,24 @@ function hasSlot(minuteSet, slot) {
   const info = slotToMinutes(slot);
   return info ? minuteSet.has(`${info.day}|${info.startMin}`) : false;
 }
+// Slots imediatamente adjacentes (mesmo dia, ±SLOT_DURATION_MIN) a um slot
+// dado — usado pela REGRA DE OTIMIZAÇÃO DE AGENDA (entrevistas seguidas):
+// permite pontuar cada opção de horário por quão "colada" fica a outras
+// entrevistas já marcadas para o mesmo Diretor/Supervisor/RH, em vez de
+// deixar buracos vagos na agenda. Só devolve slots que realmente existem
+// na grelha oficial (SLOT_INFO) — nunca inventa um horário fora de TIMES.
+function adjacentSlots(slot) {
+  const info = SLOT_INFO[slot];
+  if (!info) return [];
+  const out = [];
+  [info.startMin - SLOT_DURATION_MIN, info.startMin + SLOT_DURATION_MIN].forEach((m) => {
+    const hh = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    const candidate = `${info.day} ${hh}:${mm}`;
+    if (SLOT_INFO[candidate]) out.push(candidate);
+  });
+  return out;
+}
 
 function generateInterviewPhase(pool, members, existingBookings, availField, staffKeys) {
   // staffKeys: array like ["diretorId","rhId"] or ["diretorId","rhId","supervisorId"]
@@ -2531,6 +2595,22 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     if (!member) return null;
     if (!minuteSetCache.has(member.id)) minuteSetCache.set(member.id, availabilityMinuteSet(member.availability));
     return minuteSetCache.get(member.id);
+  }
+  // NOVO (requisito "Incerteza"): mesma cache, mas só para o subconjunto
+  // de disponibilidade marcado como "Incerteza" — usada para saber, ao
+  // ordenar as opções de um candidato, se um dado avaliador está apenas
+  // "talvez disponível" nesse slot (nunca para excluir o slot; a exclusão
+  // continua a ser feita só por `minutesOf`, que já inclui os slots
+  // incertos como válidos).
+  const uncertainMinuteSetCache = new Map();
+  function uncertainMinutesOf(member) {
+    if (!member) return null;
+    if (!uncertainMinuteSetCache.has(member.id)) uncertainMinuteSetCache.set(member.id, availabilityMinuteSet(member.availabilityUncertain));
+    return uncertainMinuteSetCache.get(member.id);
+  }
+  function isMemberUncertain(member, slot) {
+    const set = uncertainMinutesOf(member);
+    return set ? hasSlot(set, slot) : false;
   }
 
   // PASSO 2 — DISTRIBUIÇÃO EQUITATIVA (ROUND-ROBIN) POR DEPARTAMENTO.
@@ -2585,6 +2665,64 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
         }
       });
       return { candidate: c, validSlots, assignedRHDefault: nextRoundRobinRH(dept, rhList) };
+    });
+
+    // REQUISITO 1 (Entrevistas Seguidas — otimização de agenda): antes do
+    // emparelhamento, ordena as opções de horário de CADA candidato para
+    // que o algoritmo de Kuhn abaixo tente primeiro as mais vantajosas —
+    // nunca restringe quais slots são válidos, só a ORDEM em que são
+    // tentados, por isso a garantia de emparelhamento MÁXIMO mantém-se
+    // sempre intacta (se a 1ª opção falhar, o algoritmo continua a tentar
+    // as seguintes normalmente).
+    //
+    // Ordem de prioridade pedida:
+    //   1.º slots "Disponível" que criam blocos SEGUIDOS (sem buracos)
+    //   2.º slots só "Disponível" (sem contiguidade)
+    //   3.º slots que envolvam "Incerteza" (nunca descartados — evita
+    //       deixar candidatos sem horário)
+    //   4.º "Indisponível" — já nem chega a `validSlots`, continua excluído.
+    //
+    // "certaintyRank" resolve o critério 1.º/2.º vs 3.º (0 = todos os
+    // avaliadores confirmados "Disponível" nesse slot; 1 = pelo menos um
+    // está só "Incerteza"). "contiguityScore" resolve o desempate dentro
+    // do mesmo certaintyRank, somando pontos por cada slot ADJACENTE
+    // (±30 min, mesmo dia) que já esteja ocupado pelo mesmo Diretor/
+    // Supervisor/RH — nesta ou em gerações anteriores (agendamentos
+    // manuais, ou departamentos já processados nesta mesma chamada) —
+    // ou que seja uma opção válida de OUTRO candidato deste mesmo
+    // departamento (que partilha o mesmo Diretor/Supervisor), o que tende
+    // a concentrar as entrevistas em blocos contíguos em vez de dispersas.
+    const slotPoolDensity = {}; // slot -> nº de candidatos deste departamento com esse slot como opção válida
+    candidatesMeta.forEach((m) => m.validSlots.forEach(({ slot }) => {
+      slotPoolDensity[slot] = (slotPoolDensity[slot] || 0) + 1;
+    }));
+
+    function certaintyRank(slot, freeRH) {
+      if (diretor && isMemberUncertain(diretor, slot)) return 1;
+      if (supervisor && isMemberUncertain(supervisor, slot)) return 1;
+      // Só penaliza o lado do RH se TODAS as opções de RH livres nesse
+      // slot forem incertas — se houver pelo menos um RH confirmado, o
+      // agendamento pode escolher esse e o slot mantém-se de confiança.
+      if (freeRH.length && freeRH.every((r) => isMemberUncertain(r, slot))) return 1;
+      return 0;
+    }
+    function contiguityScore(slot, freeRH) {
+      let score = 0;
+      adjacentSlots(slot).forEach((adj) => {
+        if (diretor && busy[diretor.id]?.has(adj)) score += 3;
+        if (supervisor && busy[supervisor.id]?.has(adj)) score += 3;
+        freeRH.forEach((r) => { if (busy[r.id]?.has(adj)) score += 2; });
+        score += (slotPoolDensity[adj] || 0) * 0.5;
+      });
+      return score;
+    }
+    candidatesMeta.forEach((m) => {
+      m.validSlots.sort((a, b) => {
+        const certA = certaintyRank(a.slot, a.freeRH);
+        const certB = certaintyRank(b.slot, b.freeRH);
+        if (certA !== certB) return certA - certB; // "Disponível" (0) antes de "Incerteza" (1)
+        return contiguityScore(b.slot, b.freeRH) - contiguityScore(a.slot, a.freeRH); // mais contíguo primeiro
+      });
     });
 
     // OTIMIZADOR DE EMPARELHAMENTO MÁXIMO (Algoritmo de Kuhn com caminhos de aumento):
@@ -3187,7 +3325,7 @@ function ImportHubPage({
           // Mesma correção: usa o parser tolerante (grelha OU texto livre,
           // com normalização de dia/hora) em vez de exigir texto livre no
           // formato exato "Seg 09:00|Ter 14:00".
-          const { slots: availRaw } = extractAvailabilityFromRow(Object.keys(row), row);
+          const { slots: availRaw, uncertainSlots: uncertainRaw } = extractAvailabilityFromRow(Object.keys(row), row);
           const idx = findMemberIndex(next, name);
           count++;
           if (idx >= 0) {
@@ -3196,9 +3334,14 @@ function ImportHubPage({
               role: role || next[idx].role,
               departments: deptsRaw.length ? deptsRaw : next[idx].departments,
               availability: availRaw.length ? availRaw : next[idx].availability,
+              // NOVO (requisito "Incerteza"): mesma lógica de substituição
+              // condicional da disponibilidade normal — só troca se este
+              // upload trouxe horários novos, para não apagar dados bons já
+              // lidos antes com um ficheiro vazio/sem esta info.
+              availabilityUncertain: availRaw.length ? uncertainRaw : next[idx].availabilityUncertain,
             };
           } else {
-            next.push({ id: uid("imp"), name, role: role || "RH", title: role || "Membro", departments: deptsRaw.length ? deptsRaw : [DEPARTMENTS[0]], availability: availRaw });
+            next.push({ id: uid("imp"), name, role: role || "RH", title: role || "Membro", departments: deptsRaw.length ? deptsRaw : [DEPARTMENTS[0]], availability: availRaw, availabilityUncertain: uncertainRaw });
           }
         });
       });
