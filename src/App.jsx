@@ -1023,65 +1023,65 @@ function fullGridRange(sheetName, grid) {
   return `${sheetName}!A1:${lastCol}${numRows}`;
 }
 
-// ---- 1.0: Deteção dos BLOCOS PELO DIA DO MÊS (nunca por dia da semana) ----
-// REGRA DE OURO: a app NUNCA mapeia por "Segunda/Terça/Quarta" nem por
-// ordem sequencial de blocos — mapeia EXCLUSIVAMENTE pelo DIA DO MÊS (10,
-// 11, 12, ...), lido diretamente da barra de cada bloco ("Dia 10", "Dia
-// 11", ...). Se uma barra ainda disser literalmente "Dia X" (placeholder
-// por preencher, sem número real), esse bloco é IGNORADO POR COMPLETO —
-// a app nunca escreve lá nada, só regista um aviso a pedir para a
-// atualizares manualmente na folha.
-// Deteta qualquer barra "Dia" + (número OU "X"/"x" literal) em qualquer
-// linha/coluna da grelha — nunca uma linha fixa (4/31/54). Para cada
-// barra encontrada, extrai o número do dia do mês via extractDayNumber()
-// (a MESMA função já usada no resto da app para ler "Dia 10"/"10 de
-// junho"/"10/06") — devolve null quando a barra é o placeholder "Dia X"
-// literal (sem nenhum dígito), o que marca o bloco como não-utilizável.
-const DAY_BAR_RE = /dia\s*[x\d]+/i;
-function detectDayBars(grid) {
-  const seenRows = new Set();
-  const raw = [];
-  grid.forEach((row, rIdx) => {
-    (row || []).forEach((cell, cIdx) => {
-      const s = String(cell ?? "").trim();
-      if (s && DAY_BAR_RE.test(s) && !seenRows.has(rIdx)) {
-        seenRows.add(rIdx);
-        raw.push({ headerRow: rIdx, headerCol: cIdx, headerText: s, dayNumber: extractDayNumber(s) });
-      }
-    });
-  });
-  raw.sort((a, b) => a.headerRow - b.headerRow);
-  // O bloco de cada barra vai desde a sua própria linha até à linha da
-  // PRÓXIMA barra (exclusive) — ou ao fim da grelha, para a última.
-  return raw.map((b, i) => ({
-    ...b,
-    startRow: b.headerRow,
-    endRow: i + 1 < raw.length ? raw[i + 1].headerRow : grid.length,
-  }));
-}
-// Localiza a linha de departamentos DENTRO do intervalo [startRow,endRow)
-// de um bloco já delimitado por uma barra "Dia N" — escolhe a linha com
-// MAIS departamentos reconhecidos em simultâneo (nunca a primeira com só
-// 1 correspondência), para nunca ser enganada por uma menção isolada a
-// um departamento noutro sítio do bloco.
-const DEPT_HEADER_SEARCH_ROWS = 20;
-function detectDepartmentColumnsInRange(grid, startRow, endRow) {
-  const limit = Math.min(startRow + DEPT_HEADER_SEARCH_ROWS, endRow, grid.length);
-  let best = null;
-  for (let r = startRow; r < limit; r++) {
-    const row = grid[r] || [];
+// ---- 1.0: Deteção dos BLOCOS VERTICAIS pela ORDEM em que aparecem —
+// 100% AGNÓSTICA A DIAS DA SEMANA E DATAS FIXAS ----
+// A app é reutilizada em recrutamentos futuros, em anos e meses
+// diferentes — por isso NUNCA depende de nomes de dias da semana
+// ("Segunda"/"Terça"/"Quarta"...) nem de datas fixas ("10 de junho") em
+// lado nenhum desta lógica. Opera unicamente por ORDINAL DE DIA DO
+// PROCESSO: 1.º Dia de Entrevistas, 2.º Dia, 3.º Dia, ... — e NÃO
+// procura, lê, valida nem edita qualquer texto de cabeçalho de dia
+// ("Dia X", barras escuras, etc.) — só a posição relativa dos blocos.
+// Os blocos são detetados unicamente pela REPETIÇÃO da linha de
+// departamentos ao longo da folha: cada vez que os departamentos voltam
+// a aparecer numa nova linha, é um novo bloco vertical de horários (1.º
+// bloco = 1.º Dia de Entrevistas, 2.º bloco = 2.º Dia, 3.º bloco = 3.º
+// Dia, ...), pela ORDEM em que aparecem de cima para baixo — nunca por
+// posição fixa de linha (a folha pode crescer/encolher em futuros
+// recrutamentos sem partir esta deteção).
+function detectDepartmentHeaderRows(grid) {
+  const candidates = [];
+  grid.forEach((row, r) => {
     const found = {};
-    row.forEach((cell, c) => {
+    (row || []).forEach((cell, c) => {
       const dept = matchDept(cell);
       if (dept && found[dept] === undefined) found[dept] = c;
     });
     const count = Object.keys(found).length;
-    if (count && (!best || count > best.count)) {
-      best = { deptHeaderRow: r, columns: found, count };
-      if (count >= DEPARTMENTS.length) break;
+    // Exige pelo menos 2 departamentos reconhecidos na mesma linha, para
+    // nunca confundir uma menção isolada a 1 departamento (ex. numa
+    // nota/legenda) com a verdadeira linha de cabeçalho do bloco.
+    if (count >= 2) candidates.push({ row: r, columns: found, count });
+  });
+  candidates.sort((a, b) => a.row - b.row);
+  // Deduplica linhas muito próximas umas das outras (ex. um cabeçalho
+  // mescladamente partido em 2 linhas seguidas por engano) — mantém só a
+  // de maior contagem de departamentos dentro de cada grupo próximo.
+  const deduped = [];
+  candidates.forEach((c) => {
+    const last = deduped[deduped.length - 1];
+    if (last && c.row - last.row <= 3) {
+      if (c.count > last.count) deduped[deduped.length - 1] = c;
+    } else {
+      deduped.push(c);
     }
-  }
-  return best ? { deptHeaderRow: best.deptHeaderRow, columns: best.columns } : null;
+  });
+  return deduped;
+}
+// Constrói os blocos a partir das linhas de departamentos detetadas: o
+// bloco N vai da sua própria linha de departamentos até à linha de
+// departamentos do bloco seguinte (exclusive), ou ao fim da grelha para
+// o último bloco — 1.º bloco = 1.º Dia de Entrevistas, 2.º bloco = 2.º
+// Dia, 3.º bloco = 3.º Dia, etc., só pela ORDEM em que aparecem na
+// folha, nunca por linhas fixas.
+function buildBlocksFromDeptRows(deptRows, grid) {
+  return deptRows.map((d, i) => ({
+    index: i,
+    deptHeaderRow: d.row,
+    columns: d.columns,
+    startRow: d.row,
+    endRow: i + 1 < deptRows.length ? deptRows[i + 1].row : grid.length,
+  }));
 }
 
 // ---- 1.2: Deteção dinâmica da linha de SUBCABEÇALHOS (Realizada/Nome/
@@ -1162,57 +1162,47 @@ function detectTimeRowsInBlock(grid, block, fromRow) {
 
 // ---- Orquestrador: constrói o mapa dinâmico completo da folha ----
 // Junta os passos de deteção acima numa única estrutura, associando cada
-// bloco ao seu DIA DO MÊS real (lido da própria barra "Dia N" — nunca a
-// um dia da semana, nem à ordem sequencial do bloco). Blocos cuja barra
-// ainda diz "Dia X" (sem número) são detetados mas NUNCA processados —
-// ver "REGRA DE OURO" acima. Devolve:
-//  - cellFor(dayNumber, startMin, dept): célula {row, col} onde escrever
-//    o Nome, para o bloco cujo dia do mês é `dayNumber`
-//  - validDayNumbers: lista dos dias do mês realmente utilizáveis
+// bloco de horários (detetado só pela repetição da linha de
+// departamentos — ver detectDepartmentHeaderRows/buildBlocksFromDeptRows
+// acima) ao seu ÍNDICE ORDINAL (0, 1, 2, ...), pela ORDEM em que aparece
+// na folha, de cima para baixo — NUNCA a um dia da semana, a uma data, ou
+// a qualquer texto de cabeçalho de dia, que esta função NUNCA lê, procura
+// nem valida. Devolve:
+//  - cellFor(blockIndex, startMin, dept): célula {row, col} onde escrever
+//    o Nome, para o bloco de ordem `blockIndex` (0 = 1.º Dia de
+//    Entrevistas, 1 = 2.º Dia, 2 = 3.º Dia, ...)
+//  - allCells: lista de TODAS as células "Nome" detetadas (em todos os
+//    blocos/departamentos/horários) — usada para limpar nomes antigos
+//    antes de escrever os novos (ver exportBookingsToGoogleSheet)
+//  - blocksCount: nº total de blocos de horários detetados na folha
 //  - warnings: avisos de estrutura não reconhecida (nunca interrompe a
 //    gravação por completo — só ignora a célula/departamento em causa)
 function buildDynamicSheetMap(grid, sheetName) {
   const warnings = [];
-  const bars = detectDayBars(grid);
-  if (!bars.length) {
-    const msg = `Não foi encontrada nenhuma barra "Dia N" (nem "Dia X") na aba "${sheetName}" — nenhuma célula de candidato pôde ser localizada por dia do mês.`;
+  const deptRows = detectDepartmentHeaderRows(grid);
+  if (!deptRows.length) {
+    const msg = `Não foi encontrada nenhuma linha de departamentos reconhecida na aba "${sheetName}" — nenhuma célula de candidato pôde ser localizada.`;
     warnings.push(msg);
     console.warn(`[Gravação Google Sheets] ${msg}`);
-    return { warnings, validDayNumbers: [], cellFor() { return null; } };
+    return { warnings, blocksCount: 0, allCells: [], cellFor() { return null; } };
   }
+  const blocks = buildBlocksFromDeptRows(deptRows, grid);
 
-  const cellByKey = new Map(); // `${dayNumber}|${startMin}|${dept}` -> {row,col}
-  const validDayNumbers = [];
+  const cellByKey = new Map(); // `${blockIndex}|${startMin}|${dept}` -> {row,col}
+  const allCells = []; // [{ blockIndex, startMin, dept, row, col }]
 
-  bars.forEach((bar) => {
-    // REGRA DE OURO: barra ainda com o placeholder literal "Dia X" (sem
-    // nenhum número de dia do mês extraído) — bloco IGNORADO POR
-    // COMPLETO, nunca se escreve nada aqui. Só um aviso informativo.
-    if (bar.dayNumber === null) {
-      const msg = `Bloco "${bar.headerText}" (linha ${bar.headerRow + 1}) IGNORADO — a barra ainda diz "Dia X" (placeholder, sem número de dia do mês real). Atualiza-a manualmente para "Dia 10"/"Dia 11"/etc. na folha antes de gravar aí.`;
-      warnings.push(msg);
-      console.warn(`[Gravação Google Sheets] ${msg}`);
-      return;
-    }
-    validDayNumbers.push(bar.dayNumber);
-
-    const deptInfo = detectDepartmentColumnsInRange(grid, bar.startRow, bar.endRow);
-    if (!deptInfo) {
-      warnings.push(`Bloco "Dia ${bar.dayNumber}" (linha ${bar.headerRow + 1}): não foi encontrada nenhuma linha de departamentos reconhecida.`);
-      return;
-    }
-
+  blocks.forEach((block) => {
     // ESTRATÉGIA PRINCIPAL (cirúrgica): 1 linha de subcabeçalhos
     // (Realizada/Nome/Local) partilhada por TODOS os departamentos deste
     // bloco, localizada uma única vez a partir da linha de departamentos.
-    const subheaderRow = detectSubheaderRow(grid, bar, deptInfo.deptHeaderRow + 1);
+    const subheaderRow = detectSubheaderRow(grid, block, block.deptHeaderRow + 1);
 
-    const timeMap = detectTimeRowsInBlock(grid, bar, (subheaderRow ?? deptInfo.deptHeaderRow) + 1);
+    const timeMap = detectTimeRowsInBlock(grid, block, (subheaderRow ?? block.deptHeaderRow) + 1);
     if (!timeMap.size) {
-      warnings.push(`Bloco "Dia ${bar.dayNumber}": não foram encontrados horários reconhecíveis na Coluna B.`);
+      warnings.push(`${block.index + 1}.º Dia de Entrevistas (bloco na linha de departamentos ${block.deptHeaderRow + 1}): não foram encontrados horários reconhecíveis na Coluna B.`);
     }
 
-    const deptEntries = Object.entries(deptInfo.columns).sort((a, b) => a[1] - b[1]);
+    const deptEntries = Object.entries(block.columns).sort((a, b) => a[1] - b[1]);
     const debugCols = [];
     deptEntries.forEach(([dept, col], idx) => {
       const nextCol = idx + 1 < deptEntries.length ? deptEntries[idx + 1][1] : undefined;
@@ -1222,14 +1212,15 @@ function buildDynamicSheetMap(grid, sheetName) {
       //    cai para a estratégia SECUNDÁRIA: procura linha a linha, só
       //    dentro da coluna deste departamento.
       let nomeCol = subheaderRow !== null ? findNomeColInRow(grid[subheaderRow] || [], col, nextCol ?? col + NOME_SEARCH_COL_FALLBACK_WIDTH) : null;
-      if (nomeCol === null) nomeCol = detectNomeColumnFallback(grid, bar, deptInfo.deptHeaderRow, col, nextCol);
+      if (nomeCol === null) nomeCol = detectNomeColumnFallback(grid, block, block.deptHeaderRow, col, nextCol);
       if (nomeCol === null) {
-        warnings.push(`Departamento "${dept}" no bloco "Dia ${bar.dayNumber}": não foi encontrada a subcoluna "Nome".`);
+        warnings.push(`Departamento "${dept}" no ${block.index + 1}.º Dia de Entrevistas: não foi encontrada a subcoluna "Nome".`);
         return;
       }
       debugCols.push({ departamento: dept, colunaDept: colIndexToLetter(col), colunaNome: colIndexToLetter(nomeCol), linhaSubcabecalho: subheaderRow !== null ? subheaderRow + 1 : "(fallback)" });
       timeMap.forEach((row, startMin) => {
-        cellByKey.set(`${bar.dayNumber}|${startMin}|${dept}`, { row, col: nomeCol });
+        cellByKey.set(`${block.index}|${startMin}|${dept}`, { row, col: nomeCol });
+        allCells.push({ blockIndex: block.index, startMin, dept, row, col: nomeCol });
       });
     });
 
@@ -1237,8 +1228,8 @@ function buildDynamicSheetMap(grid, sheetName) {
     // útil para confirmar visualmente que a deteção apanhou a linha e as
     // colunas certas sem teres de adivinhar a partir de mensagens soltas.
     if (typeof console.groupCollapsed === "function") {
-      console.groupCollapsed(`[Gravação Google Sheets] Bloco "Dia ${bar.dayNumber}" (barra "${bar.headerText}", linha ${bar.headerRow + 1})`);
-      console.log("Linha de departamentos:", deptInfo.deptHeaderRow + 1, "| Linha de subcabeçalhos (Realizada/Nome/Local):", subheaderRow !== null ? subheaderRow + 1 : "não encontrada (usada estratégia secundária por departamento)");
+      console.groupCollapsed(`[Gravação Google Sheets] ${block.index + 1}.º Dia de Entrevistas (linha de departamentos ${block.deptHeaderRow + 1})`);
+      console.log("Linha de subcabeçalhos (Realizada/Nome/Local):", subheaderRow !== null ? subheaderRow + 1 : "não encontrada (usada estratégia secundária por departamento)");
       console.log("Horários detetados na Coluna B:", timeMap.size);
       console.table(debugCols);
       console.groupEnd();
@@ -1247,8 +1238,9 @@ function buildDynamicSheetMap(grid, sheetName) {
 
   return {
     warnings,
-    validDayNumbers,
-    cellFor(dayNumber, startMin, dept) { return cellByKey.get(`${dayNumber}|${startMin}|${dept}`) || null; },
+    blocksCount: blocks.length,
+    allCells,
+    cellFor(blockIndex, startMin, dept) { return cellByKey.get(`${blockIndex}|${startMin}|${dept}`) || null; },
   };
 }
 
@@ -1275,25 +1267,23 @@ function translateSheetWriteError(code, sheetName, action = "gravar") {
 // um único candidato. A deteção de estrutura usa SEMPRE os algoritmos
 // dinâmicos acima — nunca uma letra/linha fixa.
 //
-// REGRA DE OURO — MAPEIA SEMPRE PELO DIA DO MÊS, NUNCA PELO DIA DA
-// SEMANA: esta função nunca compara "Segunda"/"Terça"/etc. com texto da
-// folha, e nunca usa a ORDEM sequencial dos blocos como substituto. Em
-// vez disso, cada bloco é identificado pelo número real do dia do mês
-// lido diretamente da sua barra ("Dia 10", "Dia 11", "Dia 12", ...) — ver
-// buildDynamicSheetMap/detectDayBars. Um bloco cuja barra ainda diga
-// literalmente "Dia X" (placeholder por preencher) é IGNORADO POR
-// COMPLETO: a app nunca escreve lá. Do lado do candidato, o dia do mês do
-// seu slot é obtido através do mapa DAY_NUMBER_TO_WEEKDAY já construído
-// pela app a partir dos cabeçalhos do Forms/Excel Mestre sincronizados
-// (que trazem "Quarta-feira, dia 10 de junho" — nome do dia + número
-// juntos) — nunca inventado nem adivinhado.
+// 100% AGNÓSTICA A ANOS/DATAS/DIAS DA SEMANA — a app é reutilizada em
+// recrutamentos futuros, em anos e meses diferentes: esta função NUNCA
+// compara "Segunda"/"Terça"/etc. nem qualquer data ("10 de junho") com
+// texto da folha, e NUNCA lê/procura/edita o texto das barras de
+// cabeçalho de dia ("Dia X" ou parecido) — só a POSIÇÃO RELATIVA dos
+// blocos verticais interessa. Cada candidato é mapeado pelo ORDINAL do
+// seu dia de entrevistas (1.º, 2.º, 3.º, ...) — calculado só a partir dos
+// próprios agendamentos "Agendado" (nunca de datas externas) — e esse
+// ordinal aponta diretamente para o bloco vertical de igual ordem,
+// detetado pela posição relativa das linhas de departamentos na folha
+// (ver buildDynamicSheetMap/detectDepartmentHeaderRows).
 //
 // Requisito (remoção da trava bloqueante): NADA nesta função lança
-// exceção por um bloco estar marcado "Dia X" ou por a estrutura de um
-// bloco em concreto não ser reconhecida — isso só gera avisos e ignora
-// esse bloco/departamento. A única coisa que pode impedir a gravação é
-// não conseguir aceder à folha em si (sessão/permissões/rede) ou não
-// haver NENHUMA célula de candidato para escrever.
+// exceção por a estrutura de um bloco em concreto não ser reconhecida —
+// isso só gera avisos e ignora esse bloco/departamento. A única coisa que
+// pode impedir a gravação é não conseguir aceder à folha em si
+// (sessão/permissões/rede) ou não haver NENHUMA célula para escrever.
 //
 // Requisito (Backup/Reverter): ANTES de qualquer escrita, lê a grelha
 // completa da aba de saída e guarda-a como snapshot — devolvido em
@@ -1301,13 +1291,19 @@ function translateSheetWriteError(code, sheetName, action = "gravar") {
 // oferecer "Reverter Última Gravação" (ver revertSheetSnapshot mais
 // abaixo) e restaurar a folha EXATAMENTE como estava antes de gravar.
 //
+// Requisito (limpeza prévia): antes de escrever os nomes novos, TODAS as
+// subcolunas "Nome" detetadas nos 3 (ou N) blocos são limpas — cada
+// célula "Nome" que não tiver um candidato "Agendado" nesta gravação
+// recebe uma string vazia, para nunca deixar nomes de uma gravação
+// anterior (de candidatos entretanto removidos/reagendados) esquecidos
+// na folha.
+//
 // A escrita é feita numa ÚNICA chamada à API (values:batchUpdate, POST),
-// com um "data[]" — uma entrada { range, values } por candidato agendado
-// — em vez de uma chamada por célula, para nunca esbarrar no limite de
-// pedidos por segundo da Google Sheets API. Nunca sobrescreve outras
-// células fora do mapa detetado (Diretor/RH, notas, barras de dia, etc.
-// ficam intactas): só escreve exatamente as células "Nome" do
-// horário/departamento de cada candidato agendado.
+// com um "data[]" — uma entrada { range, values } por CADA célula "Nome"
+// detetada (nome do candidato, ou "" para limpar) — em vez de uma chamada
+// por célula, para nunca esbarrar no limite de pedidos por segundo da
+// Google Sheets API. Nunca sobrescreve outras células fora do mapa
+// detetado (Diretor/RH, notas, barras de dia, etc. ficam intactas).
 async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phaseKey, accessToken }) {
   if (!accessToken) {
     throw new Error("Sessão Google não está ativa. Autentica-te antes de gravar na folha.");
@@ -1334,30 +1330,31 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
   }
   const snapshot = { sheetId, sheetName, range: fullGridRange(sheetName, grid), values: grid, takenAt: Date.now() };
 
-  // PASSO 2 (deteção dinâmica): localiza os blocos pela barra "Dia N"
-  // (ignorando os que ainda dizem "Dia X"), departamentos, subcoluna
-  // "Nome" e horários — nunca colunas fixas.
+  // PASSO 2 (deteção dinâmica): localiza os blocos pela posição relativa
+  // das linhas de departamentos (nunca por texto de dia), departamentos,
+  // subcoluna "Nome" e horários — nunca colunas fixas.
   const dynamicMap = buildDynamicSheetMap(grid, sheetName);
-  console.log(`[Gravação Google Sheets] Aba "${sheetName}": dia(s) do mês utilizáveis na folha (barra já preenchida, não "Dia X"): ${dynamicMap.validDayNumbers.length ? dynamicMap.validDayNumbers.join(", ") : "nenhum"}.`);
+  console.log(`[Gravação Google Sheets] Aba "${sheetName}": ${dynamicMap.blocksCount} bloco(s) vertical(is) detetado(s) (1.º Dia de Entrevistas, 2.º Dia, ...), ${dynamicMap.allCells.length} célula(s) "Nome" no total.`);
 
-  // PASSO 3 — MAPEAMENTO PELO DIA DO MÊS (nunca pelo dia da semana nem
-  // pela ordem dos blocos): para cada candidato, o dia da semana do slot
-  // ("Qua", "Qui", "Sex") é convertido no dia do mês real (10, 11, 12...)
-  // através de DAY_NUMBER_TO_WEEKDAY (construído a partir dos cabeçalhos
-  // do Forms/Excel Mestre já sincronizados — nunca inventado aqui).
-  function dayNumberForWeekday(day) {
-    for (const [num, wd] of Object.entries(DAY_NUMBER_TO_WEEKDAY)) {
-      if (wd === day) return Number(num);
-    }
-    return null;
-  }
-  if (!Object.keys(DAY_NUMBER_TO_WEEKDAY).length) {
-    const msg = `A app ainda não tem nenhuma correspondência dia-do-mês <-> dia-da-semana (ex. "10 -> Qua") lida de nenhum Forms/Excel Mestre sincronizado — sincroniza primeiro a aba de Disponibilidade correspondente (que traz "Quarta-feira, dia 10 de junho" no cabeçalho) para a gravação conseguir mapear os candidatos ao dia do mês certo.`;
-    console.warn(`[Gravação Google Sheets] ${msg}`);
-  }
+  // PASSO 3 — MAPEAMENTO POR ORDINAL DE DIA DO PROCESSO (nunca por dia da
+  // semana, nunca por data): entre os candidatos "Agendado", calcula-se a
+  // lista de "dias" internos distintos que realmente aparecem, ordenada
+  // pela chave interna da app (Seg<Ter<Qua<Qui<Sex — usada SÓ como
+  // critério de ordenação determinístico, nunca comparada com texto da
+  // folha nem com nenhuma data real). O 1.º dessa lista é o 1.º Dia de
+  // Entrevistas do processo (-> bloco 0 na folha), o 2.º é o 2.º Dia
+  // (-> bloco 1), e assim sucessivamente.
+  const orderedDays = DAYS.filter((d) => bookings.some((b) => b.status === "Agendado" && b.slot?.startsWith(`${d} `)));
+  const dayToOrdinal = new Map(orderedDays.map((d, i) => [d, i]));
+  console.log(`[Gravação Google Sheets] ${orderedDays.length} dia(s) de entrevistas distintos entre os agendamentos, mapeados por ORDINAL do processo (1.º -> bloco 1, 2.º -> bloco 2, ...) — nunca por dia da semana nem por data.`);
 
   const candById = (id) => candidates.find((c) => c.id === id);
-  const data = [];
+
+  // Constrói primeiro o NOME (ou vazio) de CADA célula "Nome" detetada —
+  // isto é o que garante a limpeza automática de nomes antigos: todas as
+  // células do mapa dinâmico entram no lote, e só ficam com um nome as
+  // que tiverem mesmo um candidato "Agendado" nessa posição exata.
+  const nameByCellKey = new Map(); // `${blockIndex}|${startMin}|${dept}` -> nome
   const skipped = [];
   bookings.forEach((b) => {
     if (b.status !== "Agendado" || !b.slot) return;
@@ -1365,26 +1362,35 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
     if (!cand) { skipped.push({ ref: b.id, reason: "candidato não encontrado" }); return; }
     const info = slotToMinutes(b.slot);
     if (!info) { skipped.push({ ref: cand.name, reason: `slot "${b.slot}" inválido` }); return; }
-    const dayNumber = dayNumberForWeekday(info.day);
-    if (dayNumber === null) { skipped.push({ ref: cand.name, reason: `não foi possível determinar o DIA DO MÊS para o slot "${b.slot}" (falta sincronizar um Forms/Excel Mestre com a data por extenso desse dia)` }); return; }
-    const cell = dynamicMap.cellFor(dayNumber, info.startMin, cand.department);
-    if (!cell) { skipped.push({ ref: cand.name, reason: `célula "Nome" não localizada para "${cand.department}" / ${b.slot} (Dia ${dayNumber}) — confirma se a barra "Dia ${dayNumber}" existe na folha e já não diz "Dia X"` }); return; }
-    data.push({
-      range: `${sheetName}!${colIndexToLetter(cell.col)}${cell.row + 1}`,
-      values: [[cand.name]],
-    });
+    const ordinal = dayToOrdinal.get(info.day);
+    if (ordinal === undefined) { skipped.push({ ref: cand.name, reason: `não foi possível determinar o ordinal do dia de entrevistas para o slot "${b.slot}"` }); return; }
+    if (ordinal >= dynamicMap.blocksCount) { skipped.push({ ref: cand.name, reason: `a folha só tem ${dynamicMap.blocksCount} bloco(s) vertical(is) detetado(s), mas este candidato precisaria do ${ordinal + 1}.º Dia de Entrevistas` }); return; }
+    const cell = dynamicMap.cellFor(ordinal, info.startMin, cand.department);
+    if (!cell) { skipped.push({ ref: cand.name, reason: `célula "Nome" não localizada para "${cand.department}" / ${b.slot} (${ordinal + 1}.º Dia de Entrevistas) na estrutura atual da folha` }); return; }
+    nameByCellKey.set(`${ordinal}|${info.startMin}|${cand.department}`, cand.name);
   });
+
+  // PASSO 4 (limpeza + escrita numa só passagem): percorre TODAS as
+  // células "Nome" detetadas pelo mapa dinâmico — cada uma recebe o nome
+  // do candidato agendado nessa posição, ou "" (célula limpa) se não
+  // houver nenhum. Assim nenhuma célula "Nome" fica de fora: as de
+  // gravações anteriores sem candidato novo são sempre repostas a vazio.
+  const data = dynamicMap.allCells.map((c) => ({
+    range: `${sheetName}!${colIndexToLetter(c.col)}${c.row + 1}`,
+    values: [[nameByCellKey.get(`${c.blockIndex}|${c.startMin}|${c.dept}`) || ""]],
+  }));
+  const candidatesWrittenCount = nameByCellKey.size;
 
   // Diagnóstico: sempre visível na consola, mostra exatamente quantos
   // candidatos ficaram prontos a escrever vs. quantos foram ignorados e
   // porquê — a forma mais rápida de confirmar, célula a célula, se a
   // deteção dinâmica encontrou a estrutura certa antes de sequer chamar a
   // API de escrita.
-  console.log(`[Gravação Google Sheets] Aba "${sheetName}": ${data.length} célula(s) de candidato pronta(s) a escrever, ${skipped.length} ignorada(s).`);
+  console.log(`[Gravação Google Sheets] Aba "${sheetName}": ${candidatesWrittenCount} nome(s) de candidato pronto(s) a escrever, ${data.length} célula(s) "Nome" no total a atualizar (incluindo limpeza), ${skipped.length} candidato(s) ignorado(s).`);
   if (skipped.length && typeof console.table === "function") console.table(skipped);
 
   if (!data.length) {
-    const err = new Error("Nenhuma célula para gravar — confirma se há agendamentos \"Agendado\", se as barras \"Dia N\" já têm o número real do dia do mês (não \"Dia X\"), e se há correspondência dia-do-mês/dia-da-semana sincronizada (ver avisos).");
+    const err = new Error("Nenhuma célula \"Nome\" foi detetada na folha para gravar — confirma se a deteção dinâmica encontrou a estrutura de departamentos/horários (ver avisos).");
     err.warnings = dynamicMap.warnings;
     err.snapshot = snapshot;
     throw err;
@@ -1423,10 +1429,10 @@ async function exportBookingsToGoogleSheet({ bookings, candidates, sheetId, phas
   return {
     cellsWritten: json.totalUpdatedCells ?? data.length,
     rowsWritten: json.totalUpdatedRows ?? data.length,
-    candidatesWritten: data.length,
+    candidatesWritten: candidatesWrittenCount,
     skipped,
     warnings: dynamicMap.warnings,
-    validDayNumbers: dynamicMap.validDayNumbers,
+    blocksCount: dynamicMap.blocksCount,
     // Nome REAL da aba onde se escreveu (pode diferir do 1º candidato de
     // SYNC_OUTPUT_SHEET_NAME_CANDIDATES — ver requisito 3).
     sheetName,
@@ -3907,7 +3913,7 @@ function InterviewPhasePage({
       setSheetSaveState("done");
       const warnSuffix = result.warnings?.length ? ` (${result.warnings.length} aviso(s) de estrutura — ver consola)` : "";
       const skipSuffix = result.skipped?.length ? ` ${result.skipped.length} candidato(s) ignorado(s) sem célula correspondente.` : "";
-      setSheetSaveMessage(`Gravação Concluída! ${result.candidatesWritten} nome(s) de candidato escrito(s) em "${result.sheetName || SYNC_OUTPUT_SHEET_NAMES[phaseKey]}" (dia(s) do mês utilizados: ${result.validDayNumbers?.length ? result.validDayNumbers.join(", ") : "nenhum"}).${skipSuffix}${warnSuffix}`);
+      setSheetSaveMessage(`Gravação Concluída! ${result.candidatesWritten} nome(s) de candidato escrito(s) em "${result.sheetName || SYNC_OUTPUT_SHEET_NAMES[phaseKey]}" (${result.blocksCount} bloco(s) vertical(is) detetado(s) — 1.º/2.º/3.º Dia de Entrevistas).${skipSuffix}${warnSuffix}`);
       if (result.warnings?.length) console.warn(`[Gravar no Google Sheets] Avisos de estrutura em "${result.sheetName || SYNC_OUTPUT_SHEET_NAMES[phaseKey]}":`, result.warnings);
     } catch (err) {
       // Mesmo numa gravação falhada a meio, se já havia snapshot
