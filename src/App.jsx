@@ -2583,33 +2583,17 @@ function slotSequenceForDay(day) {
 }
 
 // ============================================================================
-// CORREÇÃO PEDIDA — só estes 2 pontos, sem tocar em mais nada do resto do
-// ficheiro: (1) fecha os buracos de 30 min entre entrevistas sempre que a
-// disponibilidade cruzada o permitir; (2) agrupa as entrevistas de CADA
-// membro de RH num bloco contínuo em vez de alternarem candidato a
-// candidato — mantendo o número total de cada RH igual/aproximado ao que
-// o emparelhamento (Kuhn + round-robin) já tinha decidido, só muda a
-// ORDEM/POSIÇÃO de quem faz o quê, nunca quantos cada um faz.
+// AJUSTES PEDIDOS (2), sem tocar em mais nada do resto do ficheiro:
+// (1) Divisão inteligente por DIAS INTEIROS — quando a disponibilidade dos
+//     RH de um departamento for complementar por dia (RH A só numa data,
+//     RH B totalmente livre noutra), o dia inteiro passa a ficar com UM
+//     só RH em vez de os dois ficarem misturados no mesmo dia.
+// (2) Zero buracos garantidos — cálculo estrito do próximo slot
+//     consecutivo (startMin + 30 min), sem qualquer folga.
 //
 // Corre DEPOIS do emparelhamento máximo já ter decidido QUEM tem
 // entrevista — nunca muda isso, nunca reduz o nº de candidatos agendados,
 // nunca toca em agendamentos manuais.
-//
-// Como funciona, por Diretor + dia (o Diretor é o avaliador partilhado
-// por todo o departamento):
-//   1) Ordena os agendamentos desse Diretor/dia cronologicamente.
-//   2) Regista, ANTES de mexer em nada, quantas entrevistas cada RH já
-//      tinha neste Diretor/dia (a quota que o emparelhamento + round-
-//      robin já tinham decidido) e a ordem em que apareceram — isto vira
-//      o "bloco alvo" de cada RH: primeiro preenche a quota do 1.º RH,
-//      só depois passa ao 2.º, e assim sucessivamente. Transforma
-//      "A, B, A, B, A, B" em "A, A, A, B, B, B" SEM mudar quantos cada
-//      um fica no total.
-//   3) Ao mesmo tempo, para cada agendamento, procura o slot válido MAIS
-//      CEDO possível a partir de onde ficou o anterior (nunca só o RH
-//      originalmente atribuído — QUALQUER RH do departamento, para nunca
-//      ficar preso a fechar um buraco só porque esse RH em concreto não
-//      estava livre mais cedo).
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
@@ -2626,7 +2610,6 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
   const occupied = {}; // evaluatorId -> Set(slot)
   const markOccupied = (id, slot) => { if (id) (occupied[id] || (occupied[id] = new Set())).add(slot); };
   const unmarkOccupied = (id, slot) => { if (id) occupied[id]?.delete(slot); };
-  const isOccupied = (id, slot) => !!(id && occupied[id]?.has(slot));
   [...kept, ...newBookings].forEach((b) => {
     if (!b.slot) return;
     markOccupied(b.diretorId, b.slot);
@@ -2645,81 +2628,133 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     byDiretorDay.get(key).push(b);
   });
 
-  byDiretorDay.forEach((group, key) => {
-    const day = key.split("|")[1];
+  // Tenta colocar TODOS os agendamentos de um grupo (Diretor+dia), usando
+  // só os RH de `rhCandidates`, dando prioridade ao "alvo" atual de
+  // `quotaTargetOrder`/`quotaRemaining` (mesma lógica de bloco por quota
+  // de antes) — devolve o PLANO completo {booking,slot,rh}, sem mutar
+  // nenhum estado real (só um "sandbox" local), para poder ser testado
+  // em modo de simulação antes de se aplicar de facto.
+  //   strict=true  -> se um agendamento não encaixar em NENHUM slot válido
+  //                   com estes RH, a tentativa INTEIRA falha (devolve
+  //                   null) — usado para testar "este RH sozinho cobre o
+  //                   dia todo?".
+  //   strict=false -> se não encontrar melhoria, mantém a posição/RH
+  //                   ATUAIS desse agendamento (já eram válidos antes) —
+  //                   nunca falha, é o comportamento normal de fallback.
+  function tryPlaceGroup(group, day, rhCandidates, quotaTargetOrder, quotaRemaining, strict) {
     const daySlots = slotSequenceForDay(day);
-    group.sort((a, b) => (SLOT_INFO[a.slot]?.startMin ?? 0) - (SLOT_INFO[b.slot]?.startMin ?? 0));
-
-    // CORREÇÃO (manter o número igual/aproximado por RH): antes de tocar
-    // em qualquer horário, regista quantas entrevistas cada RH já tinha
-    // NESTE grupo (o total que o emparelhamento + round-robin já tinha
-    // decidido) e a ordem em que cada RH apareceu pela primeira vez. Isto
-    // vira o "alvo" do bloco de cada um — a compactação só reorganiza a
-    // POSIÇÃO das entrevistas em blocos contínuos por essa ordem, nunca
-    // deixa um RH ficar com mais nem menos do que já tinha.
-    const quotaByRH = {};
-    const rhOrder = [];
+    // Sandbox local: clona a ocupação real e liberta as células que este
+    // PRÓPRIO grupo já ocupava, para simular a partir de "slots livres".
+    const sandbox = {};
+    Object.keys(occupied).forEach((id) => { sandbox[id] = new Set(occupied[id]); });
     group.forEach((b) => {
-      if (!b.rhId) return;
-      quotaByRH[b.rhId] = (quotaByRH[b.rhId] || 0) + 1;
-      if (!rhOrder.includes(b.rhId)) rhOrder.push(b.rhId);
+      if (!b.slot) return;
+      sandbox[b.diretorId]?.delete(b.slot);
+      if (b.supervisorId) sandbox[b.supervisorId]?.delete(b.slot);
+      sandbox[b.rhId]?.delete(b.slot);
     });
-    const remainingForRH = { ...quotaByRH };
+    const sandboxOccupied = (id, slot) => !!(id && sandbox[id]?.has(slot));
+    const sandboxMark = (id, slot) => { if (id) (sandbox[id] || (sandbox[id] = new Set())).add(slot); };
 
+    const remaining = { ...quotaRemaining };
+    const plan = [];
     let pointerIdx = 0;
-    let rhOrderIdx = 0; // índice do RH "alvo" atual dentro de rhOrder
-    group.forEach((b) => {
+    let rhOrderIdx = 0;
+    for (const b of group) {
       const currentIdx = daySlots.indexOf(b.slot);
-      if (currentIdx < 0) { pointerIdx = 0; return; }
-
-      // Liberta TEMPORARIAMENTE a própria célula (Diretor/Supervisor/RH)
-      // antes de procurar — senão a busca ficaria sempre bloqueada pela
-      // ocupação da PRÓPRIA reserva ao testar o seu slot atual.
-      unmarkOccupied(b.diretorId, b.slot);
-      unmarkOccupied(b.supervisorId, b.slot);
-      unmarkOccupied(b.rhId, b.slot);
-
+      if (currentIdx < 0) return strict ? null : plan.concat([{ booking: b, slot: b.slot, rh: b.rhId }]);
       const cand = candidateById.get(b.candidateId);
       const candAvail = new Set(cand?.availability?.[b.__availField] || []);
-      const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
-      // Avança o "alvo" enquanto o RH atual já tiver esgotado a sua quota
-      // NESTE grupo (mesmo nº de entrevistas que já tinha antes) — é isto
-      // que produz o bloco A,A,A,B,B,B em vez de alternar.
-      while (rhOrderIdx < rhOrder.length && (remainingForRH[rhOrder[rhOrderIdx]] || 0) <= 0) rhOrderIdx++;
-      const targetRH = rhOrderIdx < rhOrder.length ? rhOrder[rhOrderIdx] : null;
+      while (rhOrderIdx < quotaTargetOrder.length && (remaining[quotaTargetOrder[rhOrderIdx]] || 0) <= 0) rhOrderIdx++;
+      const targetRH = rhOrderIdx < quotaTargetOrder.length ? quotaTargetOrder[rhOrderIdx] : null;
 
-      let chosenIdx = currentIdx;
-      let chosenRH = b.rhId;
+      let chosenIdx = null;
+      let chosenRH = null;
+      // CÁLCULO ESTRITO DO PRÓXIMO SLOT CONSECUTIVO (requisito 2): a busca
+      // percorre daySlots (a sequência oficial startMin, startMin+30,
+      // startMin+60, ...) 1 posição de cada vez a partir de `pointerIdx`
+      // — nunca salta nenhuma, por isso o resultado é sempre o slot
+      // imediatamente a seguir ao anterior, sem folga nenhuma.
       for (let i = pointerIdx; i <= currentIdx; i++) {
         const testSlot = daySlots[i];
         if (!candAvail.has(testSlot)) continue;
-        if (!hasSlot(evalMinutes(b.diretorId), testSlot) || isOccupied(b.diretorId, testSlot)) continue;
-        if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), testSlot) || isOccupied(b.supervisorId, testSlot))) continue;
-        // Prioridade máxima ao RH "alvo" deste bloco (mantém a quota
-        // original) — só usa outro RH do pool se o alvo não estiver
-        // mesmo livre/disponível nesse slot, para nunca deixar um buraco
-        // por teimosia em manter a quota à risca.
+        if (!hasSlot(evalMinutes(b.diretorId), testSlot) || sandboxOccupied(b.diretorId, testSlot)) continue;
+        if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), testSlot) || sandboxOccupied(b.supervisorId, testSlot))) continue;
         let pickedRH = null;
-        if (targetRH && rhPool.includes(targetRH) && hasSlot(evalMinutes(targetRH), testSlot) && !isOccupied(targetRH, testSlot)) {
+        if (targetRH && rhCandidates.includes(targetRH) && hasSlot(evalMinutes(targetRH), testSlot) && !sandboxOccupied(targetRH, testSlot)) {
           pickedRH = targetRH;
         } else {
-          pickedRH = rhPool.find((rid) => hasSlot(evalMinutes(rid), testSlot) && !isOccupied(rid, testSlot)) || null;
+          pickedRH = rhCandidates.find((rid) => hasSlot(evalMinutes(rid), testSlot) && !sandboxOccupied(rid, testSlot)) || null;
         }
         if (!pickedRH) continue;
         chosenIdx = i;
         chosenRH = pickedRH;
         break; // o mais cedo possível — zero buracos
       }
+      if (chosenIdx === null) {
+        if (strict) return null; // este(s) RH não conseguem cobrir o grupo inteiro
+        chosenIdx = currentIdx;  // mantém a posição/RH atuais (já válidos)
+        chosenRH = b.rhId;
+      }
+      plan.push({ booking: b, slot: daySlots[chosenIdx], rh: chosenRH });
+      sandboxMark(b.diretorId, daySlots[chosenIdx]);
+      if (b.supervisorId) sandboxMark(b.supervisorId, daySlots[chosenIdx]);
+      sandboxMark(chosenRH, daySlots[chosenIdx]);
+      if (remaining[chosenRH] !== undefined) remaining[chosenRH]--;
+      pointerIdx = chosenIdx + 1;
+    }
+    return plan;
+  }
 
-      b.slot = daySlots[chosenIdx];
-      b.rhId = chosenRH;
+  function commitPlan(plan) {
+    plan.forEach(({ booking: b, slot, rh }) => {
+      unmarkOccupied(b.diretorId, b.slot);
+      unmarkOccupied(b.supervisorId, b.slot);
+      unmarkOccupied(b.rhId, b.slot);
+      b.slot = slot;
+      b.rhId = rh;
       markOccupied(b.diretorId, b.slot);
       markOccupied(b.supervisorId, b.slot);
       markOccupied(b.rhId, b.slot);
-      if (remainingForRH[chosenRH] !== undefined) remainingForRH[chosenRH]--;
-      else remainingForRH[chosenRH] = 0; // RH usado que não estava na quota original (fallback de disponibilidade)
-      pointerIdx = chosenIdx + 1;
     });
+  }
+
+  byDiretorDay.forEach((group, key) => {
+    const day = key.split("|")[1];
+    group.sort((a, b) => (SLOT_INFO[a.slot]?.startMin ?? 0) - (SLOT_INFO[b.slot]?.startMin ?? 0));
+
+    const rhPoolForGroup = (group[0]?.__rhPool && group[0].__rhPool.length)
+      ? group[0].__rhPool
+      : Array.from(new Set(group.map((b) => b.rhId).filter(Boolean)));
+
+    // Quantas entrevistas cada RH já tinha NESTE dia (a quota que o
+    // emparelhamento + round-robin já tinham decidido) — por ordem
+    // decrescente de contagem (quem já tinha mais fica em 1.º).
+    const originalCounts = {};
+    group.forEach((b) => { if (b.rhId) originalCounts[b.rhId] = (originalCounts[b.rhId] || 0) + 1; });
+    const originalRHOrder = Object.keys(originalCounts).sort((a, b) => originalCounts[b] - originalCounts[a]);
+
+    // REQUISITO 1 (Divisão por dias inteiros): se este dia já usa MAIS DE
+    // 1 RH, tenta primeiro consolidar o DIA INTEIRO num único RH — testa
+    // cada RH (começando pelo que já tinha mais reservas nesse dia) e só
+    // consolida se esse RH sozinho conseguir mesmo cobrir TODOS os
+    // candidatos desse dia, respeitando a disponibilidade real de todos
+    // (Diretor/Supervisor/RH/candidato) — nunca força, só aplica quando é
+    // genuinamente possível.
+    let finalPlan = null;
+    if (originalRHOrder.length > 1) {
+      for (const candidateRH of originalRHOrder) {
+        const plan = tryPlaceGroup(group, day, [candidateRH], [candidateRH], { [candidateRH]: group.length }, true);
+        if (plan) { finalPlan = plan; break; }
+      }
+    }
+    // Se não for possível consolidar o dia inteiro (ou já era só 1 RH),
+    // cai para a distribuição mista normal — mantém a quota original de
+    // cada RH, só reorganiza a posição em blocos contínuos.
+    if (!finalPlan) {
+      finalPlan = tryPlaceGroup(group, day, rhPoolForGroup, originalRHOrder, originalCounts, false);
+    }
+    commitPlan(finalPlan);
   });
 }
 
