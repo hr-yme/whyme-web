@@ -2765,81 +2765,102 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
     const unassigned = new Set(deptPool.map((c) => c.id));
     const candById = new Map(deptPool.map((c) => [c.id, c]));
 
-    // Verifica se Diretor + Supervisor(se aplicável) + este RH estão todos
-    // livres E disponíveis nesse slot exato. `allowUncertain=false` exige
-    // que NENHUM deles esteja marcado "Incerteza" nesse slot (prioridade
-    // 1/2 — só "Disponível" confirmado); `allowUncertain=true` já aceita
-    // "Incerteza" (prioridade 3 — usado só depois de esgotar as opções
-    // confirmadas).
-    function evaluatorsOkAt(slot, rh, allowUncertain) {
-      if (!hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return false;
-      if (!allowUncertain && isMemberUncertain(diretor, slot)) return false;
-      if (supervisor) {
-        if (!hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return false;
-        if (!allowUncertain && isMemberUncertain(supervisor, slot)) return false;
-      }
-      if (!hasSlot(minutesOf(rh), slot) || busy[rh.id]?.has(slot)) return false;
-      if (!allowUncertain && isMemberUncertain(rh, slot)) return false;
-      return true;
-    }
-    // Primeiro candidato AINDA NÃO atribuído com disponibilidade nesse
-    // slot exato — a ordem de iteração de `unassigned` (um Set) segue a
-    // ordem de inserção, ou seja, a ordem original do pool do departamento.
-    function pickCandidateAt(slot) {
-      for (const cid of unassigned) {
-        const c = candById.get(cid);
-        if ((c.availability?.[availField] || []).includes(slot)) return cid;
-      }
-      return null;
-    }
-    function commitAssignment(cid, slot, rh) {
-      assigned.set(cid, { slot, rh });
-      unassigned.delete(cid);
-      busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slot);
-      if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slot); }
-      busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slot);
-    }
-
     if (diretor && rhList.length) {
       // REQUISITO 2a — DISTRIBUIÇÃO EQUITATIVA: divide o total de
       // candidatos do departamento em partes iguais entre os N membros de
       // RH (o resto, se a divisão não for exata, vai para os primeiros da
-      // lista — ex. 5 candidatos / 2 RH = 3 + 2).
+      // lista — ex. 5 candidatos / 2 RH = 3 + 2; 8/2 = 4+4; 7/2 = 4+3).
       const n = rhList.length;
       const total = deptPool.length;
       const quotas = rhList.map((_, i) => Math.floor(total / n) + (i < total % n ? 1 : 0));
 
-      // REQUISITO 2b/2c/3 — TURNO CONTÍNUO INDIVIDUAL: para cada RH, em
-      // ordem, percorre a grelha de slots CRONOLOGICAMENTE (SLOTS já vem
-      // ordenada Seg->Sex, 09:00->18:30) e vai preenchendo a sua quota com
-      // o próximo candidato disponível em cada slot válido — como avança
-      // slot a slot sem saltar nenhum, o resultado é sempre um bloco
-      // contíguo sempre que a disponibilidade cruzada o permita (é
-      // exatamente "Membro A faz 09:00-10:00; Membro B assume 10:00-
-      // 11:00 a seguir", porque o Diretor fica ocupado durante o bloco de
-      // A e só liberta a partir daí para B). 1ª passagem só com
-      // disponibilidade confirmada; 2ª (só se sobrar quota) já aceita
-      // "Incerteza" — nunca ao contrário.
-      rhList.forEach((rh, rhIdx) => {
-        let remaining = quotas[rhIdx];
-        if (remaining <= 0) return;
-        [false, true].forEach((allowUncertain) => {
-          for (let i = 0; i < SLOTS.length && remaining > 0; i++) {
-            const slot = SLOTS[i];
-            if (!evaluatorsOkAt(slot, rh, allowUncertain)) continue;
-            const cid = pickCandidateAt(slot);
-            if (!cid) continue;
-            commitAssignment(cid, slot, rh);
-            remaining--;
-          }
-        });
-      });
+      // CORREÇÃO CRÍTICA (bug da versão anterior): processar cada RH
+      // numa VARREDURA SEPARADA da grelha inteira podia, na prática,
+      // deixar um RH com 0 candidatos — se o primeiro RH da lista
+      // encontrasse disponibilidade cruzada espalhada por vários dias
+      // (não um bloco limpo), a sua varredura por vezes consumia
+      // combinações que o RH seguinte também precisava, sem nenhuma
+      // garantia de que sobrava algo para ele.
+      // NOVA ABORDAGEM — PASSAGEM ÚNICA COM "BALDE" DE RH ATUAL: percorre
+      // TODOS os slots por ordem cronológica (Seg 09:00 -> Sex 18:30) UMA
+      // SÓ VEZ. Em cada slot, tenta preencher com o RH ATUAL (começa no
+      // 1.º da lista); só passa para o RH seguinte quando a quota do
+      // atual estiver mesmo esgotada. Isto garante, por CONSTRUÇÃO — não
+      // por sorte de dados:
+      //  - o RH[0] fica sempre com os primeiros `quota[0]` slots
+      //    preenchidos (o bloco inicial: ex. Joana 09:30-11:30);
+      //  - o RH[1] fica com os `quota[1]` seguintes, só a partir de onde
+      //    o RH[0] parou (o bloco seguinte: ex. Helena a partir das
+      //    11:30) — NUNCA pode ficar a 0 s enquanto ainda há slots por
+      //    preencher, porque só se passa a ele quando o anterior já
+      //    esgotou a SUA quota, nunca antes disso.
+      //  - cada slot só é testado para o RH cuja vez é agora — é isto que
+      //    produz o bloco PRÓPRIO e contínuo por avaliador pedido, em vez
+      //    de alternância ou dispersão.
+      function evaluatorsOkAt(slot, rh, allowUncertain) {
+        if (!hasSlot(minutesOf(diretor), slot) || busy[diretor.id]?.has(slot)) return false;
+        if (!allowUncertain && isMemberUncertain(diretor, slot)) return false;
+        if (supervisor) {
+          if (!hasSlot(minutesOf(supervisor), slot) || busy[supervisor.id]?.has(slot)) return false;
+          if (!allowUncertain && isMemberUncertain(supervisor, slot)) return false;
+        }
+        if (!hasSlot(minutesOf(rh), slot) || busy[rh.id]?.has(slot)) return false;
+        if (!allowUncertain && isMemberUncertain(rh, slot)) return false;
+        return true;
+      }
+      // Primeiro candidato AINDA NÃO atribuído com disponibilidade nesse
+      // slot exato — a ordem de iteração de `unassigned` (um Set) segue a
+      // ordem de inserção, ou seja, a ordem original do pool do departamento.
+      function pickCandidateAt(slot) {
+        for (const cid of unassigned) {
+          const c = candById.get(cid);
+          if ((c.availability?.[availField] || []).includes(slot)) return cid;
+        }
+        return null;
+      }
+      function commitAssignment(cid, slot, rh) {
+        assigned.set(cid, { slot, rh });
+        unassigned.delete(cid);
+        busy[diretor.id] = busy[diretor.id] || new Set(); busy[diretor.id].add(slot);
+        if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(slot); }
+        busy[rh.id] = busy[rh.id] || new Set(); busy[rh.id].add(slot);
+      }
 
-      // FALLBACK final: se ainda sobrarem candidatos por agendar (quota de
-      // um RH inatingível pela sua própria disponibilidade, mas outro RH
-      // com espaço genuíno para mais), tenta encaixá-los em QUALQUER RH
-      // livre — nunca deixar alguém de fora só por causa da divisão
-      // equitativa se ainda houver uma hipótese real de agendamento.
+      // `remainingQuota` é mutada in-place — a MESMA instância é usada
+      // pelas 2 passagens (confirmado, depois Incerteza) e pelo fallback
+      // final, para as quotas nunca "reiniciarem" entre passagens.
+      const remainingQuota = quotas.slice();
+      function fillPass(allowUncertain) {
+        let rhIdx = 0;
+        while (rhIdx < rhList.length && remainingQuota[rhIdx] <= 0) rhIdx++;
+        for (let i = 0; i < SLOTS.length && rhIdx < rhList.length; i++) {
+          const slot = SLOTS[i];
+          const rh = rhList[rhIdx];
+          if (!evaluatorsOkAt(slot, rh, allowUncertain)) continue;
+          const cid = pickCandidateAt(slot);
+          if (!cid) continue;
+          commitAssignment(cid, slot, rh);
+          remainingQuota[rhIdx]--;
+          if (remainingQuota[rhIdx] <= 0) {
+            rhIdx++;
+            while (rhIdx < rhList.length && remainingQuota[rhIdx] <= 0) rhIdx++;
+          }
+        }
+      }
+      // REQUISITO 3 (prioridade "Incerteza" só como último recurso): 1ª
+      // passagem só com disponibilidade CONFIRMADA; 2ª (só preenche o que
+      // sobrar de quota) já aceita "Incerteza".
+      fillPass(false);
+      fillPass(true);
+
+      // GARANTIA FINAL (requisito 3 — zero "Sem Horário Comum"): se ainda
+      // sobrarem candidatos por agendar depois das duas passagens acima
+      // (ex. quota de um RH inatingível pela sua própria disponibilidade,
+      // mas outro RH com espaço genuíno para mais), tenta encaixá-los à
+      // mesma em QUALQUER RH livre — já sem respeitar a quota "ideal" —
+      // antes de desistir e assumir "Sem Horário Comum". Só fica mesmo
+      // por agendar quem não tiver NENHUMA interseção real de horários
+      // com Diretor+algum RH, confirmada ou incerta.
       if (unassigned.size) {
         [false, true].forEach((allowUncertain) => {
           for (let i = 0; i < SLOTS.length && unassigned.size; i++) {
