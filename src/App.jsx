@@ -2759,6 +2759,66 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
   });
 }
 
+// ============================================================================
+// FERRAMENTA DE VALIDAÇÃO DA GRELHA CONTÍNUA — cumpre à letra o pedido de
+// "gerar OU validar slots encadeados de 30 min, sem qualquer buffer": corre
+// no fim de generateInterviewPhase (só diagnóstico, nunca altera nada) e
+// percorre, para cada Diretor/dia com entrevistas marcadas, a grelha
+// oficial ENTRE a 1.ª e a última entrevista desse Diretor nesse dia. Para
+// cada slot vazio nesse intervalo, distingue:
+//   - buraco JUSTIFICADO: o próprio Diretor não está disponível ali
+//     (rule 3 do pedido) — ignorado, é o comportamento correto;
+//   - buraco NÃO justificado: existe pelo menos um candidato ainda por
+//     agendar (deste mesmo pool) cuja disponibilidade cobre esse slot —
+//     nesse caso, escreve um aviso em console.warn com o Diretor/slot em
+//     causa, para ser possível identificar de imediato, com dados reais,
+//     se alguma vez voltar a acontecer (a compactação acima já garante
+//     que isto não deve ocorrer, mas esta auditoria é a forma de o
+//     confirmar/depurar sem ter de inspecionar a agenda à mão).
+function auditContinuityGaps(finalBookings, members, pool, availField) {
+  const memberById = new Map(members.map((m) => [m.id, m]));
+  const evalMinuteCache = new Map();
+  function evalMinutes(id) {
+    if (!id) return null;
+    if (!evalMinuteCache.has(id)) evalMinuteCache.set(id, availabilityMinuteSet(memberById.get(id)?.availability));
+    return evalMinuteCache.get(id);
+  }
+
+  const scheduledCandidateIds = new Set(finalBookings.filter((b) => b.slot).map((b) => b.candidateId));
+  const unscheduled = pool.filter((c) => !scheduledCandidateIds.has(c.id));
+
+  const byDiretorDay = new Map();
+  finalBookings.forEach((b) => {
+    if (!b.slot || !b.diretorId) return;
+    const day = b.slot.split(" ")[0];
+    const key = `${b.diretorId}|${day}`;
+    if (!byDiretorDay.has(key)) byDiretorDay.set(key, []);
+    byDiretorDay.get(key).push(b);
+  });
+
+  const problems = [];
+  byDiretorDay.forEach((group, key) => {
+    const [diretorId, day] = key.split("|");
+    const daySlots = slotSequenceForDay(day);
+    const bookedSlots = new Set(group.map((b) => b.slot));
+    const starts = group.map((b) => SLOT_INFO[b.slot]?.startMin ?? 0);
+    const minB = Math.min(...starts);
+    const maxB = Math.max(...starts);
+    daySlots.forEach((slot) => {
+      const info = SLOT_INFO[slot];
+      if (!info || info.startMin < minB || info.startMin > maxB) return; // fora do intervalo deste Diretor/dia
+      if (bookedSlots.has(slot)) return;
+      if (!hasSlot(evalMinutes(diretorId), slot)) return; // buraco justificado: Diretor indisponível
+      const couldFill = unscheduled.some((c) => (c.availability?.[availField] || []).includes(slot));
+      if (couldFill) problems.push({ diretorId, slot });
+    });
+  });
+  if (problems.length && typeof console !== "undefined") {
+    console.warn(`[auditContinuityGaps] ${problems.length} buraco(s) possivelmente evitável(eis) em "${availField}":`, problems);
+  }
+  return problems;
+}
+
 function generateInterviewPhase(pool, members, existingBookings, availField, staffKeys) {
   // staffKeys: array like ["diretorId","rhId"] or ["diretorId","rhId","supervisorId"]
   const busy = {};
@@ -3011,6 +3071,7 @@ function generateInterviewPhase(pool, members, existingBookings, availField, sta
   // nunca muda quem tem entrevista, só reorganiza horário/RH dos que já
   // foram agendados acima.
   compactContinuousSchedule(newBookings, kept, members, pool);
+  auditContinuityGaps([...kept, ...newBookings], members, pool, availField); // diagnóstico — nunca altera o resultado
   newBookings.forEach((b) => { delete b.__availField; delete b.__rhPool; }); // campos temporários, nunca ficam no registo final
 
   // Mantém a ordem de apresentação original do pool
