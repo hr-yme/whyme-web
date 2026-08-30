@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-08-28-v5-full-30min-slots";
+const APP_BUILD = "build-2026-08-30-v6-continuity-audit";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
