@@ -2593,23 +2593,32 @@ function slotSequenceForDay(day) {
 //
 // Corre DEPOIS do emparelhamento máximo já ter decidido QUEM tem
 // entrevista — nunca muda isso, nunca reduz o nº de candidatos agendados,
-// nunca toca em agendamentos manuais.
+// nunca toca em agendamentos manuais (esses continuam a marcar `occupied`
+// e funcionam como "pontos fixos" — é aí, e só aí, que uma pausa real deve
+// aparecer, tal como um evaliador sem disponibilidade nesse bloco).
 //
-// Como funciona, por Diretor + dia (o Diretor é o avaliador partilhado
-// por todo o departamento):
-//   1) Ordena os agendamentos desse Diretor/dia cronologicamente.
-//   2) Regista, ANTES de mexer em nada, quantas entrevistas cada RH já
-//      tinha neste Diretor/dia (a quota que o emparelhamento + round-
-//      robin já tinham decidido) e a ordem em que apareceram — isto vira
-//      o "bloco alvo" de cada RH: primeiro preenche a quota do 1.º RH,
-//      só depois passa ao 2.º, e assim sucessivamente. Transforma
-//      "A, B, A, B, A, B" em "A, A, A, B, B, B" SEM mudar quantos cada
-//      um fica no total.
-//   3) Ao mesmo tempo, para cada agendamento, procura o slot válido MAIS
-//      CEDO possível a partir de onde ficou o anterior (nunca só o RH
-//      originalmente atribuído — QUALQUER RH do departamento, para nunca
-//      ficar preso a fechar um buraco só porque esse RH em concreto não
-//      estava livre mais cedo).
+// CORREÇÃO DE FUNDO (era aqui o desvio dos buracos de 30 min): a versão
+// anterior processava as entrevistas de cada Diretor/dia pela ORDEM DO
+// SEU HORÁRIO ORIGINAL e só deixava cada uma mover-se para trás até à sua
+// PRÓPRIA posição original (nunca depois dela). Ou seja: se a 1.ª
+// entrevista a ser processada não conseguia ocupar as 9h30 (por não ter
+// disponibilidade nesse slot em concreto), esse espaço ficava perdido
+// para sempre — mesmo que outra entrevista, processada a seguir mas
+// originalmente marcada para mais tarde (ex. 11h00), estivesse
+// perfeitamente disponível às 9h30. O algoritmo só empurrava para trás,
+// nunca reatribuía o slot livre a quem realmente o podia ocupar.
+//
+// A versão abaixo resolve isto invertendo a ordem de varrimento: em vez
+// de "cada entrevista procura o seu lugar", percorre-se a grelha oficial
+// do dia slot a slot, do início ao fim, e para CADA slot procura-se
+// QUALQUER entrevista deste Diretor/dia ainda por posicionar que caiba
+// ali (candidato + Diretor + Supervisor + RH todos disponíveis nesse
+// exato slot). Um slot só fica por preencher quando NENHUMA entrevista
+// pendente consegue mesmo ocupá-lo — nunca por limitação do próprio
+// algoritmo. O agrupamento por RH em bloco contínuo mantém-se: a cada
+// slot dá-se prioridade ao RH "alvo" do bloco atual (mesma lógica de
+// quota de antes) e só se recorre a outro RH do pool se o alvo não
+// couber ali, para nunca desperdiçar um slot só para preservar a ordem.
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
@@ -2635,7 +2644,8 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
   });
 
   // Agrupa os agendamentos (só os novos — os manuais ficam sempre no
-  // sítio) por (Diretor, dia).
+  // sítio, e continuam a "ocupar" a agenda via `occupied` acima) por
+  // (Diretor, dia).
   const byDiretorDay = new Map();
   newBookings.forEach((b) => {
     if (!b.slot || !b.diretorId || b.manual) return;
@@ -2646,79 +2656,105 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
   });
 
   byDiretorDay.forEach((group, key) => {
-    const day = key.split("|")[1];
+    const [diretorId, day] = key.split("|");
     const daySlots = slotSequenceForDay(day);
-    group.sort((a, b) => (SLOT_INFO[a.slot]?.startMin ?? 0) - (SLOT_INFO[b.slot]?.startMin ?? 0));
 
-    // CORREÇÃO (manter o número igual/aproximado por RH): antes de tocar
-    // em qualquer horário, regista quantas entrevistas cada RH já tinha
-    // NESTE grupo (o total que o emparelhamento + round-robin já tinha
-    // decidido) e a ordem em que cada RH apareceu pela primeira vez. Isto
-    // vira o "alvo" do bloco de cada um — a compactação só reorganiza a
-    // POSIÇÃO das entrevistas em blocos contínuos por essa ordem, nunca
-    // deixa um RH ficar com mais nem menos do que já tinha.
-    const quotaByRH = {};
-    const rhOrder = [];
+    // Ordem cronológica original — só usada para (a) calcular a quota-
+    // alvo de cada RH e (b) desempatar de forma estável quando mais do
+    // que uma entrevista pendente cabe no mesmo slot.
+    const chronological = [...group].sort((a, b) => (SLOT_INFO[a.slot]?.startMin ?? 0) - (SLOT_INFO[b.slot]?.startMin ?? 0));
+
+    // Liberta TEMPORARIAMENTE todos os slots deste grupo — vão ser
+    // reatribuídos do zero pelo varrimento abaixo, em vez de cada um só
+    // poder mover-se para a sua própria posição original.
     group.forEach((b) => {
-      if (!b.rhId) return;
-      quotaByRH[b.rhId] = (quotaByRH[b.rhId] || 0) + 1;
-      if (!rhOrder.includes(b.rhId)) rhOrder.push(b.rhId);
-    });
-    const remainingForRH = { ...quotaByRH };
-
-    let pointerIdx = 0;
-    let rhOrderIdx = 0; // índice do RH "alvo" atual dentro de rhOrder
-    group.forEach((b) => {
-      const currentIdx = daySlots.indexOf(b.slot);
-      if (currentIdx < 0) { pointerIdx = 0; return; }
-
-      // Liberta TEMPORARIAMENTE a própria célula (Diretor/Supervisor/RH)
-      // antes de procurar — senão a busca ficaria sempre bloqueada pela
-      // ocupação da PRÓPRIA reserva ao testar o seu slot atual.
-      unmarkOccupied(b.diretorId, b.slot);
+      unmarkOccupied(diretorId, b.slot);
       unmarkOccupied(b.supervisorId, b.slot);
       unmarkOccupied(b.rhId, b.slot);
+    });
 
-      const cand = candidateById.get(b.candidateId);
-      const candAvail = new Set(cand?.availability?.[b.__availField] || []);
-      const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
-      // Avança o "alvo" enquanto o RH atual já tiver esgotado a sua quota
-      // NESTE grupo (mesmo nº de entrevistas que já tinha antes) — é isto
-      // que produz o bloco A,A,A,B,B,B em vez de alternar.
+    // "Bloco alvo" de cada RH — mesma ideia de antes: quantas entrevistas
+    // cada RH já tinha neste Diretor/dia (decidido pelo emparelhamento +
+    // round-robin) e a ordem em que apareceram pela primeira vez. Serve
+    // só para PRIORIZAR o RH a manter durante o varrimento — nunca força
+    // um slot a ficar vazio para respeitar a quota à risca.
+    const rhOrder = [];
+    const remainingForRH = {};
+    chronological.forEach((b) => {
+      if (!b.rhId) return;
+      remainingForRH[b.rhId] = (remainingForRH[b.rhId] || 0) + 1;
+      if (!rhOrder.includes(b.rhId)) rhOrder.push(b.rhId);
+    });
+    let rhOrderIdx = 0;
+
+    const pending = new Set(group);
+
+    // VARRIMENTO PRINCIPAL: percorre a grelha oficial do dia do início ao
+    // fim (09:00 → ... → 18:30, já sem nenhum slot a meio do almoço — por
+    // isso essa pausa nunca é tratada como "buraco" artificial). Para
+    // cada slot, tenta encontrar qualquer entrevista pendente que caiba
+    // ali; se nenhuma couber, o slot fica mesmo vazio (indisponibilidade
+    // real) e passa-se ao seguinte.
+    daySlots.forEach((slot) => {
+      if (pending.size === 0) return;
+      if (!hasSlot(evalMinutes(diretorId), slot) || isOccupied(diretorId, slot)) return;
+
       while (rhOrderIdx < rhOrder.length && (remainingForRH[rhOrder[rhOrderIdx]] || 0) <= 0) rhOrderIdx++;
       const targetRH = rhOrderIdx < rhOrder.length ? rhOrder[rhOrderIdx] : null;
 
-      let chosenIdx = currentIdx;
-      let chosenRH = b.rhId;
-      for (let i = pointerIdx; i <= currentIdx; i++) {
-        const testSlot = daySlots[i];
-        if (!candAvail.has(testSlot)) continue;
-        if (!hasSlot(evalMinutes(b.diretorId), testSlot) || isOccupied(b.diretorId, testSlot)) continue;
-        if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), testSlot) || isOccupied(b.supervisorId, testSlot))) continue;
-        // Prioridade máxima ao RH "alvo" deste bloco (mantém a quota
-        // original) — só usa outro RH do pool se o alvo não estiver
-        // mesmo livre/disponível nesse slot, para nunca deixar um buraco
-        // por teimosia em manter a quota à risca.
-        let pickedRH = null;
-        if (targetRH && rhPool.includes(targetRH) && hasSlot(evalMinutes(targetRH), testSlot) && !isOccupied(targetRH, testSlot)) {
-          pickedRH = targetRH;
-        } else {
-          pickedRH = rhPool.find((rid) => hasSlot(evalMinutes(rid), testSlot) && !isOccupied(rid, testSlot)) || null;
+      let chosen = null;
+      let chosenRH = null;
+      // 1.ª passagem: só aceita entrevistas cujo RH-alvo do bloco atual
+      // consiga este slot (mantém o agrupamento contínuo por RH). Se
+      // nenhuma servir, 2.ª passagem: aceita qualquer pendente que caiba,
+      // com qualquer RH livre do seu pool — nunca se desperdiça um slot
+      // só para preservar a ordem dos RH.
+      for (const preferTarget of [true, false]) {
+        for (const b of chronological) {
+          if (!pending.has(b)) continue;
+          if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
+          const cand = candidateById.get(b.candidateId);
+          const candAvail = cand?.availability?.[b.__availField] || [];
+          if (!candAvail.includes(slot)) continue;
+          const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
+          let pickedRH = null;
+          if (preferTarget) {
+            if (targetRH && rhPool.includes(targetRH) && hasSlot(evalMinutes(targetRH), slot) && !isOccupied(targetRH, slot)) {
+              pickedRH = targetRH;
+            }
+          } else {
+            pickedRH = rhPool.find((rid) => hasSlot(evalMinutes(rid), slot) && !isOccupied(rid, slot)) || null;
+          }
+          if (!pickedRH) continue;
+          chosen = b;
+          chosenRH = pickedRH;
+          break;
         }
-        if (!pickedRH) continue;
-        chosenIdx = i;
-        chosenRH = pickedRH;
-        break; // o mais cedo possível — zero buracos
+        if (chosen) break;
       }
 
-      b.slot = daySlots[chosenIdx];
-      b.rhId = chosenRH;
-      markOccupied(b.diretorId, b.slot);
-      markOccupied(b.supervisorId, b.slot);
-      markOccupied(b.rhId, b.slot);
+      if (!chosen) return; // ninguém pendente cabe aqui — buraco legítimo (sem disponibilidade real)
+
+      chosen.slot = slot;
+      chosen.rhId = chosenRH;
+      markOccupied(diretorId, slot);
+      markOccupied(chosen.supervisorId, slot);
+      markOccupied(chosenRH, slot);
       if (remainingForRH[chosenRH] !== undefined) remainingForRH[chosenRH]--;
       else remainingForRH[chosenRH] = 0; // RH usado que não estava na quota original (fallback de disponibilidade)
-      pointerIdx = chosenIdx + 1;
+      pending.delete(chosen);
+    });
+
+    // Salvaguarda: nenhuma entrevista deste grupo pode desaparecer. Se
+    // sobrar alguma pendente (caso extremo: um colega "ocupou" no
+    // varrimento o único RH livre no único slot onde esta ainda cabia),
+    // devolve-a ao seu slot/RH originais — que continuam garantidamente
+    // válidos, porque foi ali que o emparelhamento máximo a colocou antes
+    // desta função correr.
+    pending.forEach((b) => {
+      markOccupied(diretorId, b.slot);
+      markOccupied(b.supervisorId, b.slot);
+      markOccupied(b.rhId, b.slot);
     });
   });
 }
