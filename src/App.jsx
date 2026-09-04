@@ -1522,6 +1522,22 @@ function nearestOfficialTime(minutes) {
 function normalizeSlotString(raw) {
   const s = String(raw || "").trim();
   if (!s) return null;
+  // CORREÇÃO (horários certos sempre em falta): se o cabeçalho contiver um
+  // INTERVALO de duas horas (ex. "9-9:30", "10:30-11" — o formato real das
+  // colunas de disponibilidade de Diretor/RH no Excel Mestre), isto NÃO é
+  // um "slot exato" — é o caso (a2), tratado à parte em
+  // extractAvailabilityFromRow. Deteta-se isso em modo "solto"
+  // (allowBareHour:true), que reconhece corretamente AMBOS os números do
+  // intervalo. A versão ESTRITA usada a seguir (parseTimeToMinutes(s), sem
+  // allowBareHour) só reconhece o número do intervalo que tiver ":"/"h" a
+  // seguir — para "9-9:30" isso é só o "9:30", nunca o "9" solto — pelo que,
+  // sem esta verificação, "9-9:30" (que devia ser o slot 09:00) e
+  // "9:30-10" (que devia ser o slot 09:30) colapsavam os DOIS no mesmo
+  // slot "09:30", e o "return" abaixo nunca deixava o caso (a2) corrigir
+  // isto — daí Diretores/RH ficarem sempre sem disponibilidade nas horas
+  // certas (09:00, 10:00, ...), só nas meias-horas.
+  const looseCheck = parseTimeToMinutes(s, { allowBareHour: true });
+  if (looseCheck.fim !== null) return null;
   const { inicio } = parseTimeToMinutes(s);
   const time = nearestOfficialTime(inicio);
   if (!time) return null;
