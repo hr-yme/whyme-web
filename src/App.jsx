@@ -2661,8 +2661,8 @@ function slotSequenceForDay(day) {
 // passa mesmo para quem tem menos entrevistas, mesmo que isso signifique
 // abrir um novo bloco/dia para esse RH. Os valores dos bónus são
 // facilmente ajustáveis conforme o que parecer mais justo na prática.
-const CONTINUE_BONUS = 3; // "vale a pena" continuar com o mesmo RH até ~3 entrevistas de diferença
-const SAME_DAY_BONUS = 1; // retomar o mesmo RH depois de um buraco grande (ex. almoço) pesa menos
+const CONTINUE_BONUS = 2; // "vale a pena" continuar com o mesmo RH até ~2 entrevistas de diferença
+const SAME_DAY_BONUS = 0; // retomar o mesmo RH depois de um buraco grande (ex. almoço) já não pesa por si só — só o bónus de continuidade direta (CONTINUE_BONUS) é que ainda favorece manter o mesmo RH
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
