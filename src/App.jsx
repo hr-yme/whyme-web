@@ -2646,13 +2646,28 @@ function slotSequenceForDay(day) {
 //       enquanto o bloco atual ainda for possível.
 //   2.º Só quando o bloco tem mesmo de terminar (o RH em curso fica
 //       indisponível, ocupado, ou não sobra nenhum candidato que ele
-//       possa atender neste slot) é que se abre um NOVO bloco — e aí,
-//       entre os RH do pool que conseguem atender algum pendente agora,
-//       escolhe-se o que tem MENOS entrevistas atribuídas até ao momento
-//       (contagem `rhLoadCount`, global a toda a geração desta fase —
-//       todos os Diretores/dias já processados contam), para o total de
-//       cada RH ir ficando aproximadamente equivalente ao longo do dia
-//       todo, sem nunca sacrificar um bloco em curso para isso.
+//       possa atender neste slot) é que se abre um NOVO bloco.
+//
+//   Além disso, "continuar com o mesmo RH" (ponto 1.º) NUNCA é
+//   interrompido só porque um slot a meio ficou vazio (ex. o Diretor
+//   ficou indisponível ali, ou nenhum candidato pendente calhava nesse
+//   slot em concreto) — `lastRH` mantém-se de pé até ao fim do dia desse
+//   Diretor, para que, por ex., um RH que fez 10h30 e 11h continue
+//   preferido às 12h mesmo que as 11h30 tenham ficado vazias no meio,
+//   em vez de "passar a vez" ao outro RH só por causa desse buraco.
+//
+//   Só quando o bloco tem MESMO de abrir de novo com outra pessoa
+//   (`lastRH` não consegue) é que se escolhe entre os RH do pool — e essa
+//   escolha passa a ter 3 critérios, por esta ordem:
+//     1.º Preferir um RH que já esteja a trabalhar NESSE MESMO DIA (nem
+//         que seja com outro Diretor/bloco já processado) — reduz o nº de
+//         dias diferentes em que cada RH tem de vir só por 1-2
+//         entrevistas soltas, que é o que mais importa evitar.
+//     2.º Entre os que ainda não têm nada nesse dia, preferir quem tem
+//         MENOS dias distintos usados até agora (`rhDayCount`) — para não
+//         ir sempre "estrear" o mesmo RH em dias novos.
+//     3.º Por fim, MENOS entrevistas totais atribuídas (`rhLoadCount`),
+//         como antes — para o total ficar aproximadamente equivalente.
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
@@ -2689,6 +2704,30 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     if (b.rhId) rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) + 1;
   });
 
+  // Quantas entrevistas cada RH já tem, POR DIA (rhId -> { dia -> nº
+  // entrevistas nesse dia }) — usada para saber se um RH já está "cá" num
+  // dado dia (nem que seja com outro Diretor), o critério nº 1 na escolha
+  // de um bloco novo (ver acima). Tal como `rhLoadCount`, é descontada da
+  // contribuição própria de cada grupo antes de o reprocessar, e voltada
+  // a somar conforme as atribuições vão sendo decididas.
+  const rhDayCount = {};
+  function addRHDay(rid, day) {
+    if (!rid) return;
+    rhDayCount[rid] = rhDayCount[rid] || {};
+    rhDayCount[rid][day] = (rhDayCount[rid][day] || 0) + 1;
+  }
+  function removeRHDay(rid, day) {
+    if (!rid || !rhDayCount[rid]) return;
+    rhDayCount[rid][day] = (rhDayCount[rid][day] || 0) - 1;
+  }
+  function daysUsedBy(rid) {
+    if (!rhDayCount[rid]) return 0;
+    return Object.values(rhDayCount[rid]).filter((n) => n > 0).length;
+  }
+  [...kept, ...newBookings].forEach((b) => {
+    if (b.rhId && b.slot) addRHDay(b.rhId, b.slot.split(" ")[0]);
+  });
+
   // Agrupa os agendamentos (só os novos — os manuais ficam sempre no
   // sítio, e continuam a "ocupar" a agenda via `occupied` acima) por
   // (Diretor, dia).
@@ -2705,9 +2744,9 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     const [diretorId, day] = key.split("|");
     const daySlots = slotSequenceForDay(day);
 
-    // Ordem cronológica original — só usada para (a) calcular a quota-
-    // alvo de cada RH e (b) desempatar de forma estável quando mais do
-    // que uma entrevista pendente cabe no mesmo slot.
+    // Ordem cronológica original — só usada para desempatar de forma
+    // estável quando mais do que uma entrevista pendente cabe no mesmo
+    // slot (ver varrimento abaixo).
     const chronological = [...group].sort((a, b) => (SLOT_INFO[a.slot]?.startMin ?? 0) - (SLOT_INFO[b.slot]?.startMin ?? 0));
 
     // Liberta TEMPORARIAMENTE todos os slots deste grupo — vão ser
@@ -2720,14 +2759,19 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
       unmarkOccupied(diretorId, b.slot);
       unmarkOccupied(b.supervisorId, b.slot);
       unmarkOccupied(b.rhId, b.slot);
-      if (b.rhId) rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) - 1;
+      if (b.rhId) {
+        rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) - 1;
+        removeRHDay(b.rhId, day);
+      }
     });
 
     const pending = new Set(group);
-    // RH usado no slot IMEDIATAMENTE ANTERIOR deste Diretor/dia — null
-    // sempre que o bloco anterior tiver terminado (slot vazio ou início do
-    // dia). Enquanto não for null, o varrimento tenta SEMPRE continuar com
-    // este RH antes de considerar trocar.
+    // RH usado no slot ANTERIOR (com entrevista) deste Diretor/dia — só
+    // fica null no INÍCIO do dia, nunca é reposto a null por um slot vazio
+    // a meio (ver nota grande acima): mantém-se de pé até ao fim do dia,
+    // para que um buraco pontual (Diretor indisponível nesse slot, ou
+    // nenhum candidato a calhar ali) não "passe a vez" ao outro RH sem
+    // necessidade.
     let lastRH = null;
 
     // VARRIMENTO PRINCIPAL: percorre a grelha oficial do dia do início ao
@@ -2738,7 +2782,7 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     // real) e passa-se ao seguinte.
     daySlots.forEach((slot) => {
       if (pending.size === 0) return;
-      if (!hasSlot(evalMinutes(diretorId), slot) || isOccupied(diretorId, slot)) { lastRH = null; return; }
+      if (!hasSlot(evalMinutes(diretorId), slot) || isOccupied(diretorId, slot)) return;
 
       let chosen = null;
       let chosenRH = null;
@@ -2765,11 +2809,13 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
 
       // 2.ª tentativa: o bloco anterior não dá para continuar aqui — abre-
       // se um NOVO bloco. Entre todos os pares (pendente, RH do seu pool)
-      // que conseguem mesmo ocupar este slot, escolhe-se o RH com MENOS
-      // entrevistas atribuídas até agora (`rhLoadCount`), para equilibrar
-      // o total ao longo do dia — desempate estável pelo id do membro.
+      // que conseguem mesmo ocupar este slot, escolhe-se o "melhor" por
+      // esta ordem de critérios (ver nota grande acima): (1) já estar a
+      // trabalhar neste MESMO DIA nalgum outro bloco/Diretor, (2) menos
+      // dias distintos usados até agora, (3) menos entrevistas totais —
+      // desempate final estável pelo id do membro.
       if (!chosen) {
-        let bestLoad = Infinity;
+        let bestScore = null;
         for (const b of chronological) {
           if (!pending.has(b)) continue;
           if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
@@ -2779,9 +2825,15 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
           const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
           for (const rid of rhPool) {
             if (!hasSlot(evalMinutes(rid), slot) || isOccupied(rid, slot)) continue;
-            const load = rhLoadCount[rid] || 0;
-            if (load < bestLoad || (load === bestLoad && (!chosenRH || rid < chosenRH))) {
-              bestLoad = load;
+            const alreadyToday = (rhDayCount[rid]?.[day] || 0) > 0 ? 0 : 1;
+            const score = [alreadyToday, daysUsedBy(rid), rhLoadCount[rid] || 0];
+            const better = !bestScore
+              || score[0] < bestScore[0]
+              || (score[0] === bestScore[0] && score[1] < bestScore[1])
+              || (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] < bestScore[2])
+              || (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] === bestScore[2] && (!chosenRH || rid < chosenRH));
+            if (better) {
+              bestScore = score;
               chosenRH = rid;
               chosen = b;
             }
@@ -2789,7 +2841,7 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
         }
       }
 
-      if (!chosen) { lastRH = null; return; } // ninguém pendente cabe aqui — buraco legítimo (sem disponibilidade real)
+      if (!chosen) return; // ninguém pendente cabe aqui — buraco legítimo (sem disponibilidade real)
 
       chosen.slot = slot;
       chosen.rhId = chosenRH;
@@ -2797,6 +2849,7 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
       markOccupied(chosen.supervisorId, slot);
       markOccupied(chosenRH, slot);
       rhLoadCount[chosenRH] = (rhLoadCount[chosenRH] || 0) + 1;
+      addRHDay(chosenRH, day);
       pending.delete(chosen);
       lastRH = chosenRH;
     });
@@ -2806,12 +2859,16 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     // varrimento o único RH livre no único slot onde esta ainda cabia),
     // devolve-a ao seu slot/RH originais — que continuam garantidamente
     // válidos, porque foi ali que o emparelhamento máximo a colocou antes
-    // desta função correr. Repõe também a contribuição em `rhLoadCount`.
+    // desta função correr. Repõe também a contribuição em `rhLoadCount`/
+    // `rhDayCount`.
     pending.forEach((b) => {
       markOccupied(diretorId, b.slot);
       markOccupied(b.supervisorId, b.slot);
       markOccupied(b.rhId, b.slot);
-      if (b.rhId) rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) + 1;
+      if (b.rhId) {
+        rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) + 1;
+        addRHDay(b.rhId, day);
+      }
     });
   });
 }
