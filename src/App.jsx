@@ -2631,10 +2631,28 @@ function slotSequenceForDay(day) {
 // ali (candidato + Diretor + Supervisor + RH todos disponíveis nesse
 // exato slot). Um slot só fica por preencher quando NENHUMA entrevista
 // pendente consegue mesmo ocupá-lo — nunca por limitação do próprio
-// algoritmo. O agrupamento por RH em bloco contínuo mantém-se: a cada
-// slot dá-se prioridade ao RH "alvo" do bloco atual (mesma lógica de
-// quota de antes) e só se recorre a outro RH do pool se o alvo não
-// couber ali, para nunca desperdiçar um slot só para preservar a ordem.
+// algoritmo.
+//
+// ATUALIZAÇÃO (prioridade a blocos contínuos por RH, sem "vai e vem"):
+// a versão anterior decidia, LOGO NO INÍCIO do dia, uma "quota" fixa por
+// RH (quantas entrevistas cada um já tinha, vindo do round-robin do
+// emparelhamento) e só trocava de RH quando essa quota se esgotava — o
+// que podia partir um bloco perfeitamente possível ao meio só para
+// respeitar uma divisão decidida às cegas antes de se saber quem
+// realmente encaixava em sequência. Agora a prioridade inverte-se:
+//   1.º CONTINUAR com o MESMO RH do slot imediatamente anterior deste
+//       Diretor/dia, sempre que esse RH consiga cobrir alguma entrevista
+//       pendente neste slot — nunca se troca de RH só por equilíbrio
+//       enquanto o bloco atual ainda for possível.
+//   2.º Só quando o bloco tem mesmo de terminar (o RH em curso fica
+//       indisponível, ocupado, ou não sobra nenhum candidato que ele
+//       possa atender neste slot) é que se abre um NOVO bloco — e aí,
+//       entre os RH do pool que conseguem atender algum pendente agora,
+//       escolhe-se o que tem MENOS entrevistas atribuídas até ao momento
+//       (contagem `rhLoadCount`, global a toda a geração desta fase —
+//       todos os Diretores/dias já processados contam), para o total de
+//       cada RH ir ficando aproximadamente equivalente ao longo do dia
+//       todo, sem nunca sacrificar um bloco em curso para isso.
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
@@ -2657,6 +2675,18 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     markOccupied(b.diretorId, b.slot);
     markOccupied(b.supervisorId, b.slot);
     markOccupied(b.rhId, b.slot);
+  });
+
+  // Carga TOTAL já atribuída a cada RH, a partir do estado atual de TODOS
+  // os agendamentos (mantidos + novos, de TODOS os Diretores/dias) — usada
+  // só para decidir com QUEM abrir um bloco NOVO (ver acima). É atualizada
+  // à medida que cada grupo Diretor/dia é reprocessado abaixo: primeiro
+  // desconta-se a contribuição própria desse grupo (para não contar 2x
+  // aquilo que vai ser reatribuído), e volta a somar-se conforme as novas
+  // atribuições vão sendo decididas.
+  const rhLoadCount = {};
+  [...kept, ...newBookings].forEach((b) => {
+    if (b.rhId) rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) + 1;
   });
 
   // Agrupa os agendamentos (só os novos — os manuais ficam sempre no
@@ -2682,28 +2712,23 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
 
     // Liberta TEMPORARIAMENTE todos os slots deste grupo — vão ser
     // reatribuídos do zero pelo varrimento abaixo, em vez de cada um só
-    // poder mover-se para a sua própria posição original.
+    // poder mover-se para a sua própria posição original. Descontar
+    // também a contribuição própria do grupo em `rhLoadCount`, para que a
+    // escolha de "quem tem menos entrevistas" abaixo não conte 2x aquilo
+    // que estamos prestes a reatribuir.
     group.forEach((b) => {
       unmarkOccupied(diretorId, b.slot);
       unmarkOccupied(b.supervisorId, b.slot);
       unmarkOccupied(b.rhId, b.slot);
+      if (b.rhId) rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) - 1;
     });
-
-    // "Bloco alvo" de cada RH — mesma ideia de antes: quantas entrevistas
-    // cada RH já tinha neste Diretor/dia (decidido pelo emparelhamento +
-    // round-robin) e a ordem em que apareceram pela primeira vez. Serve
-    // só para PRIORIZAR o RH a manter durante o varrimento — nunca força
-    // um slot a ficar vazio para respeitar a quota à risca.
-    const rhOrder = [];
-    const remainingForRH = {};
-    chronological.forEach((b) => {
-      if (!b.rhId) return;
-      remainingForRH[b.rhId] = (remainingForRH[b.rhId] || 0) + 1;
-      if (!rhOrder.includes(b.rhId)) rhOrder.push(b.rhId);
-    });
-    let rhOrderIdx = 0;
 
     const pending = new Set(group);
+    // RH usado no slot IMEDIATAMENTE ANTERIOR deste Diretor/dia — null
+    // sempre que o bloco anterior tiver terminado (slot vazio ou início do
+    // dia). Enquanto não for null, o varrimento tenta SEMPRE continuar com
+    // este RH antes de considerar trocar.
+    let lastRH = null;
 
     // VARRIMENTO PRINCIPAL: percorre a grelha oficial do dia do início ao
     // fim (09:00 → ... → 18:30, já sem nenhum slot a meio do almoço — por
@@ -2713,19 +2738,16 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     // real) e passa-se ao seguinte.
     daySlots.forEach((slot) => {
       if (pending.size === 0) return;
-      if (!hasSlot(evalMinutes(diretorId), slot) || isOccupied(diretorId, slot)) return;
-
-      while (rhOrderIdx < rhOrder.length && (remainingForRH[rhOrder[rhOrderIdx]] || 0) <= 0) rhOrderIdx++;
-      const targetRH = rhOrderIdx < rhOrder.length ? rhOrder[rhOrderIdx] : null;
+      if (!hasSlot(evalMinutes(diretorId), slot) || isOccupied(diretorId, slot)) { lastRH = null; return; }
 
       let chosen = null;
       let chosenRH = null;
-      // 1.ª passagem: só aceita entrevistas cujo RH-alvo do bloco atual
-      // consiga este slot (mantém o agrupamento contínuo por RH). Se
-      // nenhuma servir, 2.ª passagem: aceita qualquer pendente que caiba,
-      // com qualquer RH livre do seu pool — nunca se desperdiça um slot
-      // só para preservar a ordem dos RH.
-      for (const preferTarget of [true, false]) {
+
+      // 1.ª tentativa: CONTINUAR o bloco em curso com `lastRH` — só
+      // avança para a 2.ª tentativa se este RH não conseguir cobrir
+      // NENHUM pendente neste slot (ficou indisponível, ocupado, ou
+      // nenhum candidato pendente o tem no seu pool/disponibilidade).
+      if (lastRH) {
         for (const b of chronological) {
           if (!pending.has(b)) continue;
           if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
@@ -2733,32 +2755,50 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
           const candAvail = cand?.availability?.[b.__availField] || [];
           if (!candAvail.includes(slot)) continue;
           const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
-          let pickedRH = null;
-          if (preferTarget) {
-            if (targetRH && rhPool.includes(targetRH) && hasSlot(evalMinutes(targetRH), slot) && !isOccupied(targetRH, slot)) {
-              pickedRH = targetRH;
-            }
-          } else {
-            pickedRH = rhPool.find((rid) => hasSlot(evalMinutes(rid), slot) && !isOccupied(rid, slot)) || null;
+          if (rhPool.includes(lastRH) && hasSlot(evalMinutes(lastRH), slot) && !isOccupied(lastRH, slot)) {
+            chosen = b;
+            chosenRH = lastRH;
+            break;
           }
-          if (!pickedRH) continue;
-          chosen = b;
-          chosenRH = pickedRH;
-          break;
         }
-        if (chosen) break;
       }
 
-      if (!chosen) return; // ninguém pendente cabe aqui — buraco legítimo (sem disponibilidade real)
+      // 2.ª tentativa: o bloco anterior não dá para continuar aqui — abre-
+      // se um NOVO bloco. Entre todos os pares (pendente, RH do seu pool)
+      // que conseguem mesmo ocupar este slot, escolhe-se o RH com MENOS
+      // entrevistas atribuídas até agora (`rhLoadCount`), para equilibrar
+      // o total ao longo do dia — desempate estável pelo id do membro.
+      if (!chosen) {
+        let bestLoad = Infinity;
+        for (const b of chronological) {
+          if (!pending.has(b)) continue;
+          if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
+          const cand = candidateById.get(b.candidateId);
+          const candAvail = cand?.availability?.[b.__availField] || [];
+          if (!candAvail.includes(slot)) continue;
+          const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
+          for (const rid of rhPool) {
+            if (!hasSlot(evalMinutes(rid), slot) || isOccupied(rid, slot)) continue;
+            const load = rhLoadCount[rid] || 0;
+            if (load < bestLoad || (load === bestLoad && (!chosenRH || rid < chosenRH))) {
+              bestLoad = load;
+              chosenRH = rid;
+              chosen = b;
+            }
+          }
+        }
+      }
+
+      if (!chosen) { lastRH = null; return; } // ninguém pendente cabe aqui — buraco legítimo (sem disponibilidade real)
 
       chosen.slot = slot;
       chosen.rhId = chosenRH;
       markOccupied(diretorId, slot);
       markOccupied(chosen.supervisorId, slot);
       markOccupied(chosenRH, slot);
-      if (remainingForRH[chosenRH] !== undefined) remainingForRH[chosenRH]--;
-      else remainingForRH[chosenRH] = 0; // RH usado que não estava na quota original (fallback de disponibilidade)
+      rhLoadCount[chosenRH] = (rhLoadCount[chosenRH] || 0) + 1;
       pending.delete(chosen);
+      lastRH = chosenRH;
     });
 
     // Salvaguarda: nenhuma entrevista deste grupo pode desaparecer. Se
@@ -2766,11 +2806,12 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
     // varrimento o único RH livre no único slot onde esta ainda cabia),
     // devolve-a ao seu slot/RH originais — que continuam garantidamente
     // válidos, porque foi ali que o emparelhamento máximo a colocou antes
-    // desta função correr.
+    // desta função correr. Repõe também a contribuição em `rhLoadCount`.
     pending.forEach((b) => {
       markOccupied(diretorId, b.slot);
       markOccupied(b.supervisorId, b.slot);
       markOccupied(b.rhId, b.slot);
+      if (b.rhId) rhLoadCount[b.rhId] = (rhLoadCount[b.rhId] || 0) + 1;
     });
   });
 }
