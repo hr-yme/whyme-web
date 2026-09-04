@@ -2633,41 +2633,36 @@ function slotSequenceForDay(day) {
 // pendente consegue mesmo ocupá-lo — nunca por limitação do próprio
 // algoritmo.
 //
-// ATUALIZAÇÃO (prioridade a blocos contínuos por RH, sem "vai e vem"):
-// a versão anterior decidia, LOGO NO INÍCIO do dia, uma "quota" fixa por
-// RH (quantas entrevistas cada um já tinha, vindo do round-robin do
-// emparelhamento) e só trocava de RH quando essa quota se esgotava — o
-// que podia partir um bloco perfeitamente possível ao meio só para
-// respeitar uma divisão decidida às cegas antes de se saber quem
-// realmente encaixava em sequência. Agora a prioridade inverte-se:
-//   1.º CONTINUAR com o MESMO RH do slot imediatamente anterior deste
-//       Diretor/dia, sempre que esse RH consiga cobrir alguma entrevista
-//       pendente neste slot — nunca se troca de RH só por equilíbrio
-//       enquanto o bloco atual ainda for possível.
-//   2.º Só quando o bloco tem mesmo de terminar (o RH em curso fica
-//       indisponível, ocupado, ou não sobra nenhum candidato que ele
-//       possa atender neste slot) é que se abre um NOVO bloco.
+// ATUALIZAÇÃO 2 (equilíbrio real, não só desempate): a versão anterior
+// dava prioridade ABSOLUTA a "continuar com o mesmo RH"/"RH já a
+// trabalhar hoje" — o equilíbrio de carga só entrava como último critério
+// de desempate, o que na prática nunca chegava a pesar: quem apanhava o
+// 1.º candidato do dia acabava por ficar com o dia inteiro (mesmo depois
+// de um buraco grande, tipo almoço), porque "já estar a trabalhar hoje"
+// continuava sempre a vencer, por maior que fosse a diferença acumulada
+// para o outro RH (ex.: 6 entrevistas para um, 2 para o outro).
 //
-//   Além disso, "continuar com o mesmo RH" (ponto 1.º) NUNCA é
-//   interrompido só porque um slot a meio ficou vazio (ex. o Diretor
-//   ficou indisponível ali, ou nenhum candidato pendente calhava nesse
-//   slot em concreto) — `lastRH` mantém-se de pé até ao fim do dia desse
-//   Diretor, para que, por ex., um RH que fez 10h30 e 11h continue
-//   preferido às 12h mesmo que as 11h30 tenham ficado vazias no meio,
-//   em vez de "passar a vez" ao outro RH só por causa desse buraco.
+// Substitui-se a comparação por níveis (que nunca deixava o equilíbrio
+// competir a sério) por uma PONTUAÇÃO ÚNICA por RH em cada slot:
 //
-//   Só quando o bloco tem MESMO de abrir de novo com outra pessoa
-//   (`lastRH` não consegue) é que se escolhe entre os RH do pool — e essa
-//   escolha passa a ter 3 critérios, por esta ordem:
-//     1.º Preferir um RH que já esteja a trabalhar NESSE MESMO DIA (nem
-//         que seja com outro Diretor/bloco já processado) — reduz o nº de
-//         dias diferentes em que cada RH tem de vir só por 1-2
-//         entrevistas soltas, que é o que mais importa evitar.
-//     2.º Entre os que ainda não têm nada nesse dia, preferir quem tem
-//         MENOS dias distintos usados até agora (`rhDayCount`) — para não
-//         ir sempre "estrear" o mesmo RH em dias novos.
-//     3.º Por fim, MENOS entrevistas totais atribuídas (`rhLoadCount`),
-//         como antes — para o total ficar aproximadamente equivalente.
+//     pontuação(RH) = nº de entrevistas já atribuídas a esse RH
+//                     − bónus de continuidade
+//
+// onde o bónus é CONTINUE_BONUS se este RH fez o slot IMEDIATAMENTE
+// anterior deste Diretor/dia (mantém blocos colados), ou SAME_DAY_BONUS
+// (mais pequeno) se já tem outra entrevista nesse mesmo dia mas não foi
+// o último slot (ex.: a retomar depois do almoço) — 0 se ainda não
+// trabalhou neste dia. Escolhe-se sempre o RH com a pontuação mais
+// baixa (desempate: menos dias distintos usados até agora, depois id).
+//
+// Isto mantém os blocos colados sempre que a diferença de carga ainda
+// for pequena (o bónus "paga" essa diferença), mas deixa de proteger um
+// RH que já ficou muito à frente — a partir de aí, o candidato seguinte
+// passa mesmo para quem tem menos entrevistas, mesmo que isso signifique
+// abrir um novo bloco/dia para esse RH. Os valores dos bónus são
+// facilmente ajustáveis conforme o que parecer mais justo na prática.
+const CONTINUE_BONUS = 3; // "vale a pena" continuar com o mesmo RH até ~3 entrevistas de diferença
+const SAME_DAY_BONUS = 1; // retomar o mesmo RH depois de um buraco grande (ex. almoço) pesa menos
 function compactContinuousSchedule(newBookings, kept, members, pool) {
   const candidateById = new Map(pool.map((c) => [c.id, c]));
   const memberById = new Map(members.map((m) => [m.id, m]));
@@ -2784,59 +2779,37 @@ function compactContinuousSchedule(newBookings, kept, members, pool) {
       if (pending.size === 0) return;
       if (!hasSlot(evalMinutes(diretorId), slot) || isOccupied(diretorId, slot)) return;
 
+      // Entre todos os pares (pendente, RH do seu pool) que conseguem
+      // mesmo ocupar este slot, escolhe-se o de MENOR pontuação (ver nota
+      // grande acima: nº de entrevistas já atribuídas, com um desconto se
+      // este RH já trabalha hoje — maior desconto se foi mesmo o slot
+      // anterior). Desempate: menos dias distintos usados até agora,
+      // depois id do membro, para resultado estável.
       let chosen = null;
       let chosenRH = null;
-
-      // 1.ª tentativa: CONTINUAR o bloco em curso com `lastRH` — só
-      // avança para a 2.ª tentativa se este RH não conseguir cobrir
-      // NENHUM pendente neste slot (ficou indisponível, ocupado, ou
-      // nenhum candidato pendente o tem no seu pool/disponibilidade).
-      if (lastRH) {
-        for (const b of chronological) {
-          if (!pending.has(b)) continue;
-          if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
-          const cand = candidateById.get(b.candidateId);
-          const candAvail = cand?.availability?.[b.__availField] || [];
-          if (!candAvail.includes(slot)) continue;
-          const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
-          if (rhPool.includes(lastRH) && hasSlot(evalMinutes(lastRH), slot) && !isOccupied(lastRH, slot)) {
+      let bestScore = null;
+      let bestDays = null;
+      for (const b of chronological) {
+        if (!pending.has(b)) continue;
+        if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
+        const cand = candidateById.get(b.candidateId);
+        const candAvail = cand?.availability?.[b.__availField] || [];
+        if (!candAvail.includes(slot)) continue;
+        const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
+        for (const rid of rhPool) {
+          if (!hasSlot(evalMinutes(rid), slot) || isOccupied(rid, slot)) continue;
+          const bonus = rid === lastRH ? CONTINUE_BONUS : ((rhDayCount[rid]?.[day] || 0) > 0 ? SAME_DAY_BONUS : 0);
+          const score = (rhLoadCount[rid] || 0) - bonus;
+          const days = daysUsedBy(rid);
+          const better = bestScore === null
+            || score < bestScore
+            || (score === bestScore && days < bestDays)
+            || (score === bestScore && days === bestDays && (!chosenRH || rid < chosenRH));
+          if (better) {
+            bestScore = score;
+            bestDays = days;
+            chosenRH = rid;
             chosen = b;
-            chosenRH = lastRH;
-            break;
-          }
-        }
-      }
-
-      // 2.ª tentativa: o bloco anterior não dá para continuar aqui — abre-
-      // se um NOVO bloco. Entre todos os pares (pendente, RH do seu pool)
-      // que conseguem mesmo ocupar este slot, escolhe-se o "melhor" por
-      // esta ordem de critérios (ver nota grande acima): (1) já estar a
-      // trabalhar neste MESMO DIA nalgum outro bloco/Diretor, (2) menos
-      // dias distintos usados até agora, (3) menos entrevistas totais —
-      // desempate final estável pelo id do membro.
-      if (!chosen) {
-        let bestScore = null;
-        for (const b of chronological) {
-          if (!pending.has(b)) continue;
-          if (b.supervisorId && (!hasSlot(evalMinutes(b.supervisorId), slot) || isOccupied(b.supervisorId, slot))) continue;
-          const cand = candidateById.get(b.candidateId);
-          const candAvail = cand?.availability?.[b.__availField] || [];
-          if (!candAvail.includes(slot)) continue;
-          const rhPool = (b.__rhPool && b.__rhPool.length) ? b.__rhPool : [b.rhId].filter(Boolean);
-          for (const rid of rhPool) {
-            if (!hasSlot(evalMinutes(rid), slot) || isOccupied(rid, slot)) continue;
-            const alreadyToday = (rhDayCount[rid]?.[day] || 0) > 0 ? 0 : 1;
-            const score = [alreadyToday, daysUsedBy(rid), rhLoadCount[rid] || 0];
-            const better = !bestScore
-              || score[0] < bestScore[0]
-              || (score[0] === bestScore[0] && score[1] < bestScore[1])
-              || (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] < bestScore[2])
-              || (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] === bestScore[2] && (!chosenRH || rid < chosenRH));
-            if (better) {
-              bestScore = score;
-              chosenRH = rid;
-              chosen = b;
-            }
           }
         }
       }
