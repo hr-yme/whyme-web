@@ -249,6 +249,16 @@ function pickAvailability(seedName, ratio = 0.5) {
 function uid(prefix) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}`;
 }
+// Reduz um nome completo a "Primeiro Último" para APRESENTAÇÃO (ecrã) —
+// nunca é usado para guardar, comparar (findMemberIndex/matchCandidateIndex
+// continuam a usar o nome completo) ou exportar (CSV/Google Sheets), só
+// para exibir de forma mais compacta nas tabelas/listas de candidatos.
+// Nomes com um único termo (ou vazios) ficam tal como estão.
+function shortName(fullName) {
+  const parts = String(fullName || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length <= 1) return fullName || "";
+  return `${parts[0]} ${parts[parts.length - 1]}`;
+}
 function slugify(s) {
   return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, "");
 }
@@ -4066,7 +4076,7 @@ function DashboardPage({ candidates, setCandidates, onAddCandidate, goToImport }
             {pageItems.map((c) => (
               <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
                 <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
-                  {c.name}
+                  {shortName(c.name)}
                   {c.veioTalentPool && (
                     <span className="ml-1.5 text-[10px] font-normal align-middle px-1.5 py-0.5 rounded" title="Entrou via Talent Pool — salta CV e Entrevista Soft Skills" style={{ color: COLORS.navy, backgroundColor: hexToRgba(COLORS.pink, 0.18) }}>Talent Pool</span>
                   )}
@@ -4461,7 +4471,7 @@ function InterviewPhasePage({
             {eligible.map((c) => (
               <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
                 <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
-                  {c.name}
+                  {shortName(c.name)}
                   {c.veioTalentPool && (
                     <span className="ml-1.5 text-[10px] font-normal align-middle px-1.5 py-0.5 rounded" style={{ color: COLORS.navy, backgroundColor: hexToRgba(COLORS.pink, 0.18) }}>Talent Pool</span>
                   )}
@@ -4504,7 +4514,7 @@ function InterviewPhasePage({
                 if (!cand) return null;
                 return (
                   <tr key={b.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
-                    <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>{cand.name}{b.manual && <span className="ml-1.5 text-[10px] font-normal" style={{ color: COLORS.pink }}>(manual)</span>}</td>
+                    <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>{shortName(cand.name)}{b.manual && <span className="ml-1.5 text-[10px] font-normal" style={{ color: COLORS.pink }}>(manual)</span>}</td>
                     <td className="px-4 py-3"><DeptBadge dept={cand.department} /></td>
                     {columns.map((c) => <td key={c.key} className="px-4 py-3" style={{ color: hexToRgba(COLORS.navy, 0.75) }}>{byId(b[c.key])?.name || <span className="text-xs" style={{ color: "#c0227a" }}>Sem alocação</span>}</td>)}
                     <td className="px-4 py-3 font-mono text-xs" style={{ color: hexToRgba(COLORS.navy, 0.6) }}>{b.slot || "—"}</td>
@@ -4560,7 +4570,7 @@ function CalendarView({ bookings, candById, byId, columns }) {
                       const cand = candById(b.candidateId);
                       return (
                         <div key={b.id} className="mb-1 last:mb-0 rounded-md px-2 py-1 border" style={{ backgroundColor: COLORS.white, borderColor: hexToRgba(COLORS.navy, 0.12) }}>
-                          <p className="font-medium" style={{ color: COLORS.navy }}>{cand?.name}</p>
+                          <p className="font-medium" style={{ color: COLORS.navy }}>{shortName(cand?.name)}</p>
                           <p style={{ color: hexToRgba(COLORS.navy, 0.55) }}>{columns.map((c) => byId(b[c.key])?.name).filter(Boolean).join(" · ")}</p>
                         </div>
                       );
@@ -4586,7 +4596,7 @@ function EditBookingModal({ booking, columns, candidate, members, onClose, onSav
   };
   const save = () => onSave({ ...form, manual: true, status: form.slot ? "Agendado" : "Sem Horário Comum" });
   return (
-    <Modal title={`Editar agendamento — ${candidate?.name}`} onClose={onClose} wide>
+    <Modal title={`Editar agendamento — ${shortName(candidate?.name)}`} onClose={onClose} wide>
       <div className="grid grid-cols-2 gap-3">
         {columns.map((c) => (
           <Field key={c.key} label={c.label}>
@@ -4719,7 +4729,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
             {eligible.map((c) => (
               <tr key={c.id} className="yme-table-row" style={{ borderTop: `1px solid ${hexToRgba(COLORS.navy, 0.1)}` }}>
                 <td className="px-4 py-3 font-medium" style={{ color: COLORS.navy }}>
-                  {c.name}
+                  {shortName(c.name)}
                   {c.veioTalentPool && (
                     <span className="ml-1.5 text-[10px] font-normal align-middle px-1.5 py-0.5 rounded" style={{ color: COLORS.navy, backgroundColor: hexToRgba(COLORS.pink, 0.18) }}>Talent Pool</span>
                   )}
@@ -4761,7 +4771,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
                 return (
                   <div key={id} className="flex items-center justify-between text-sm rounded-lg px-2.5 py-1.5 border" style={{ backgroundColor: COLORS.white, borderColor: hexToRgba(COLORS.navy, 0.08) }}>
                     <div className="flex items-center gap-2">
-                      <span style={{ color: COLORS.navy }}>{c.name}</span>
+                      <span style={{ color: COLORS.navy }}>{shortName(c.name)}</span>
                       <DeptBadge dept={c.department} />
                       {c.veioTalentPool && (
                         <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ backgroundColor: hexToRgba(COLORS.pink, 0.18), color: COLORS.navy }}>Talent Pool</span>
