@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-08-30-v6-continuity-audit";
+const APP_BUILD = "build-2026-09-08-v7-dinamicas-scheduling-fix";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -3199,86 +3199,171 @@ function regenerateForDepartment(pool, members, existingBookings, availField, st
   return [...untouched, ...regenerated];
 }
 
+// Nº máximo de candidatos por grupo de Dinâmica.
+const PHASE2_GROUP_SIZE = 6;
+// Regra dura: no máximo 2 candidatos do mesmo departamento por grupo
+// (o ideal é 1 por departamento — ver lógica de preferência abaixo).
+const PHASE2_MAX_SAME_DEPT = 2;
+// RH: 3 a 4 membros por sessão, distribuídos de forma justa entre todas
+// as sessões (ver rhLoad em generatePhase2).
+const PHASE2_RH_MIN = 3;
+const PHASE2_RH_MAX = 4;
+
+// Diretores + Supervisores que TÊM de estar presentes em TODAS as
+// Dinâmicas de Grupo, sem exceção. Os Supervisores (CEO/COO/CMO) cobrem
+// vários departamentos cada, por isso são deduplicados por nome — a
+// Beatriz Garcia, por ex., não conta duas vezes só porque é supervisora
+// de dois departamentos.
+function getMandatoryStaff(members) {
+  const directors = members.filter((m) => m.role === "Diretor");
+  const supervisors = [];
+  const seen = new Set();
+  members.filter((m) => m.role === "Supervisor").forEach((m) => {
+    const k = normKey(m.name);
+    if (!seen.has(k)) { seen.add(k); supervisors.push(m); }
+  });
+  return { directors, supervisors, mandatory: [...directors, ...supervisors] };
+}
+
+// PASSO 1 do enunciado: definir PRIMEIRO os horários possíveis para uma
+// Dinâmica — só é viável marcar uma sessão num horário em que TODOS os
+// Diretores e TODOS os Supervisores estejam disponíveis, já que a sua
+// presença é obrigatória em qualquer grupo que corra nesse horário.
+function computeViableSlots(members) {
+  const { mandatory } = getMandatoryStaff(members);
+  if (mandatory.length === 0) return SLOTS.slice();
+  return SLOTS.filter((slot) => mandatory.every((m) => (m.availability || []).includes(slot)));
+}
+
 function generatePhase2(pool, members) {
-  const buckets = {};
-  DEPARTMENTS.forEach((d) => (buckets[d] = pool.filter((c) => c.department === d).slice()));
-  const groupsOfCandidates = [];
-  let current = [];
-  let remaining = true;
-  while (remaining) {
-    remaining = false;
-    for (const d of DEPARTMENTS) {
-      if (buckets[d].length) {
-        current.push(buckets[d].shift());
-        remaining = true;
-        if (current.length === 6) { groupsOfCandidates.push(current); current = []; }
-      }
-    }
-  }
-  if (current.length) groupsOfCandidates.push(current);
+  const { directors, supervisors } = getMandatoryStaff(members);
+  const viableSlots = computeViableSlots(members);
 
-  const busy = {};
-  return groupsOfCandidates.map((group, idx) => {
-    const freq = {};
-    group.forEach((c) => c.availability.fase2.forEach((s) => (freq[s] = (freq[s] || 0) + 1)));
-    let bestSlot = null, bestCount = -1;
-    SLOTS.forEach((s) => {
-      const cnt = freq[s] || 0;
-      if (cnt > bestCount) { bestCount = cnt; bestSlot = cnt > 0 ? s : bestSlot; }
+  // Para cada candidato, cruzamos a sua disponibilidade com os horários
+  // viáveis (com direção completa presente) — só esses horários podem
+  // realmente vir a ser usados para o colocar num grupo.
+  const withSlots = pool.map((c) => ({
+    candidate: c,
+    slots: viableSlots.filter((s) => (c.availability?.fase2 || []).includes(s)),
+  }));
+
+  const unscheduled = withSlots.filter((x) => x.slots.length === 0).map((x) => x.candidate);
+  const queue = withSlots.filter((x) => x.slots.length > 0);
+
+  // PASSO 2 do enunciado: começar pelos candidatos com disponibilidade
+  // mais restrita (menos horários viáveis em comum com a Direção) — são
+  // os mais difíceis de encaixar, por isso têm de ser posicionados antes
+  // que as vagas nesses horários se esgotem com candidatos mais
+  // flexíveis. Em empate, ordena por nome para o resultado ser estável.
+  queue.sort((a, b) => a.slots.length - b.slots.length || a.candidate.name.localeCompare(b.candidate.name));
+
+  const groups = []; // { slot, members: [candidato, ...] }
+  const groupHasRoom = (g) => g.members.length < PHASE2_GROUP_SIZE;
+  const deptCountIn = (g, dept) => g.members.filter((c) => c.department === dept).length;
+
+  queue.forEach(({ candidate, slots }) => {
+    const slotSet = new Set(slots);
+
+    // 1) Tenta encaixar num grupo já aberto que partilhe um horário com o
+    // candidato, respeitando SEMPRE o limite de 2 por departamento (regra
+    // dura) e com preferência por grupos onde o departamento do candidato
+    // ainda não esteja representado (regra "idealmente 1 por
+    // departamento").
+    const fit = groups
+      .filter((g) => slotSet.has(g.slot) && groupHasRoom(g) && deptCountIn(g, candidate.department) < PHASE2_MAX_SAME_DEPT)
+      .sort((a, b) => {
+        const da = deptCountIn(a, candidate.department), db = deptCountIn(b, candidate.department);
+        if (da !== db) return da - db; // prefere 0 repetições do departamento antes de 1
+        return b.members.length - a.members.length; // depois, prefere consolidar grupos mais cheios
+      });
+
+    if (fit.length > 0) { fit[0].members.push(candidate); return; }
+
+    // 2) Nenhum grupo aberto serve — abre um grupo novo. Escolhe, de
+    // entre os horários viáveis do candidato, aquele em que o maior
+    // número de candidatos AINDA por colocar também está disponível —
+    // maximiza a hipótese de conseguir fechar mais grupos completos
+    // nesse horário em vez de espalhar candidatos por horários isolados.
+    let bestSlot = slots[0], bestScore = -1;
+    slots.forEach((s) => {
+      const score = queue.reduce((acc, x) => acc + (x.candidate !== candidate && x.slots.includes(s) ? 1 : 0), 0);
+      if (score > bestScore) { bestScore = score; bestSlot = s; }
     });
+    groups.push({ slot: bestSlot, members: [candidate] });
+  });
 
+  // Ordena os grupos cronologicamente para apresentação.
+  groups.sort((a, b) => SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot));
+
+  // PASSO 3: agora que os horários e a composição de cada grupo estão
+  // fechados, atribui os avaliadores. Diretores e Supervisores marcam
+  // sempre presença (garantido por construção — só usámos horários em
+  // que estavam todos livres); RH é distribuído de forma justa (3 a 4
+  // por sessão), dando prioridade a quem ainda tem menos sessões
+  // atribuídas no total.
+  const rhLoad = {};
+  members.filter((m) => m.role === "RH").forEach((m) => (rhLoad[m.id] = 0));
+
+  const finalGroups = groups.map((g, idx) => {
     const warnings = [];
-    const missingCandidates = bestSlot ? group.filter((c) => !c.availability.fase2.includes(bestSlot)) : group;
-    if (!bestSlot) warnings.push("Nenhum horário comum encontrado entre os candidatos do grupo.");
-    else if (missingCandidates.length) warnings.push(`${missingCandidates.length} candidato(s) indisponível(eis) no horário escolhido: ${missingCandidates.map((c) => c.name).join(", ")}.`);
 
     const deptCounts = {};
-    group.forEach((c) => (deptCounts[c.department] = (deptCounts[c.department] || 0) + 1));
-    Object.entries(deptCounts).forEach(([d, n]) => { if (n > 2) warnings.push(`${n} candidatos do mesmo departamento (${d}) na mesma sessão — máximo recomendado: 2.`); });
+    g.members.forEach((c) => (deptCounts[c.department] = (deptCounts[c.department] || 0) + 1));
+    Object.entries(deptCounts).forEach(([d, n]) => {
+      if (n > PHASE2_MAX_SAME_DEPT) warnings.push(`${n} candidatos do mesmo departamento (${d}) na mesma sessão — máximo permitido: ${PHASE2_MAX_SAME_DEPT}.`);
+    });
 
-    let supervisor = null;
-    if (bestSlot) {
-      supervisor = members.find((m) => m.role === "Supervisor" && m.availability.includes(bestSlot) && !busy[m.id]?.has(bestSlot));
-      if (supervisor) { busy[supervisor.id] = busy[supervisor.id] || new Set(); busy[supervisor.id].add(bestSlot); }
-      else warnings.push("Nenhum Supervisor (CEO/COO/CMO) disponível neste horário.");
-    }
+    // Confirmação defensiva (não deve disparar nunca, dado como os
+    // horários viáveis foram calculados — mas fica como rede de
+    // segurança caso a disponibilidade de algum Diretor/Supervisor mude
+    // depois de os grupos já terem sido fechados).
+    directors.forEach((d) => { if (!(d.availability || []).includes(g.slot)) warnings.push(`Diretor(a) ${d.name} indisponível neste horário — presença obrigatória em todas as Dinâmicas.`); });
+    supervisors.forEach((s) => { if (!(s.availability || []).includes(g.slot)) warnings.push(`Supervisor(a) ${s.name} indisponível neste horário — presença obrigatória em todas as Dinâmicas.`); });
 
-    const depts = [...new Set(group.map((c) => c.department))];
-    const directorIds = [];
-    if (bestSlot) {
-      depts.forEach((d) => {
-        const dir = members.find((m) => m.role === "Diretor" && memberHasDept(m, d));
-        if (dir && dir.availability.includes(bestSlot) && !busy[dir.id]?.has(bestSlot)) {
-          directorIds.push(dir.id); busy[dir.id] = busy[dir.id] || new Set(); busy[dir.id].add(bestSlot);
-        } else {
-          warnings.push(`Diretor(a) de ${d} indisponível — presença prioritária, mas não bloqueante.`);
-        }
+    const freeRH = members
+      .filter((m) => m.role === "RH" && (m.availability || []).includes(g.slot))
+      .sort((a, b) => {
+        if (rhLoad[a.id] !== rhLoad[b.id]) return rhLoad[a.id] - rhLoad[b.id]; // equilíbrio primeiro
+        const depts = Object.keys(deptCounts);
+        const am = depts.some((d) => memberHasDept(a, d)) ? 0 : 1;
+        const bm = depts.some((d) => memberHasDept(b, d)) ? 0 : 1;
+        return am - bm; // depois, afinidade com os departamentos do grupo
       });
-    }
 
-    let rhIds = [];
-    if (bestSlot) {
-      const freeRH = members
-        .filter((m) => m.role === "RH" && m.availability.includes(bestSlot) && !busy[m.id]?.has(bestSlot))
-        .sort((a, b) => {
-          const am = depts.some((d) => memberHasDept(a, d)) ? 1 : 0;
-          const bm = depts.some((d) => memberHasDept(b, d)) ? 1 : 0;
-          return bm - am;
-        });
-      rhIds = freeRH.slice(0, 3).map((r) => r.id);
-      rhIds.forEach((id) => { busy[id] = busy[id] || new Set(); busy[id].add(bestSlot); });
-      if (rhIds.length < 2) warnings.push("Menos de 2 membros de RH disponíveis para esta sessão.");
-    }
+    const rhIds = freeRH.slice(0, PHASE2_RH_MAX).map((r) => r.id);
+    rhIds.forEach((id) => { rhLoad[id] += 1; });
+    if (rhIds.length < PHASE2_RH_MIN) warnings.push(`Apenas ${rhIds.length} membro(s) de RH disponível(eis) — mínimo desejado: ${PHASE2_RH_MIN}.`);
 
     return {
       id: uid("p2"),
       name: `Grupo ${String.fromCharCode(65 + idx)}`,
-      candidateIds: group.map((c) => c.id),
-      slot: bestSlot,
-      supervisorId: supervisor?.id || null,
-      directorIds, rhIds, warnings,
+      candidateIds: g.members.map((c) => c.id),
+      slot: g.slot,
+      supervisorIds: supervisors.map((s) => s.id),
+      directorIds: directors.map((d) => d.id),
+      rhIds,
+      warnings,
     };
   });
+
+  // Candidatos sem NENHUM horário em comum com a Direção completa nunca
+  // poderiam ser colocados em grupo nenhum — aparecem à parte, para
+  // ação manual (renegociar disponibilidade, rever a agenda da Direção,
+  // etc.), em vez de serem silenciosamente omitidos.
+  if (unscheduled.length) {
+    finalGroups.push({
+      id: uid("p2"),
+      name: "Sem Horário Comum",
+      candidateIds: unscheduled.map((c) => c.id),
+      slot: null,
+      supervisorIds: [],
+      directorIds: [],
+      rhIds: [],
+      warnings: [`${unscheduled.length} candidato(s) sem nenhum horário em comum com a Direção (todos os Diretores + Supervisores): ${unscheduled.map((c) => c.name).join(", ")}.`],
+    });
+  }
+
+  return finalGroups;
 }
 
 const LOGO_DARK_DATA_URI = "data:image/png;base64,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";
@@ -4649,7 +4734,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
     const rows = groups.map((g) => [
       g.name, g.slot || "—",
       g.candidateIds.map((id) => candById(id)?.name).join(" | "),
-      byId(g.supervisorId)?.name || "—",
+      (g.supervisorIds || []).map((id) => byId(id)?.name).join(" | ") || "—",
       g.directorIds.map((id) => byId(id)?.name).join(" | ") || "—",
       g.rhIds.map((id) => byId(id)?.name).join(" | ") || "—",
       g.warnings.join(" | ") || "Sem avisos",
@@ -4672,7 +4757,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
         const warnings = [];
         const missing = g.slot ? groupCands.filter((c) => !c.availability.fase2.includes(g.slot)) : [];
         if (missing.length) warnings.push(`${missing.length} candidato(s) indisponível(eis) no horário escolhido: ${missing.map((c) => c.name).join(", ")}.`);
-        Object.entries(deptCounts).forEach(([d, n]) => { if (n > 2) warnings.push(`${n} candidatos do mesmo departamento (${d}) na mesma sessão — máximo recomendado: 2.`); });
+        Object.entries(deptCounts).forEach(([d, n]) => { if (n > PHASE2_MAX_SAME_DEPT) warnings.push(`${n} candidatos do mesmo departamento (${d}) na mesma sessão — máximo permitido: ${PHASE2_MAX_SAME_DEPT}.`); });
         g.warnings = warnings;
       });
       return next;
@@ -4686,7 +4771,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
       <div className="flex items-start justify-between mb-6">
         <div>
           <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Fase 3 — Dinâmicas de Grupo</h1>
-          <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de ~6 candidatos, máx. 2 por departamento, com Supervisor, Diretores e 2-3 RH.</p>
+          <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de até 6 candidatos, máx. 2 por departamento, com TODOS os Diretores e Supervisores + 3-4 RH.</p>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={exportCSV} className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2">
@@ -4792,8 +4877,8 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
 
             <div className="grid grid-cols-3 gap-2 text-xs mb-3">
               <div>
-                <p className="mb-1" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Supervisor</p>
-                <p className="font-medium" style={{ color: COLORS.navy }}>{byId(g.supervisorId)?.name || "—"}</p>
+                <p className="mb-1" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Supervisores</p>
+                <p className="font-medium" style={{ color: COLORS.navy }}>{(g.supervisorIds || []).map((id) => byId(id)?.name).join(", ") || "—"}</p>
               </div>
               <div>
                 <p className="mb-1" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Diretores</p>
