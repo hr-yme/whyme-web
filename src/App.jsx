@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v7-dinamicas-otimizadas";
+const APP_BUILD = "build-2026-09-13-v9-identidade-candidato";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -398,21 +398,32 @@ function findMemberIndex(members, name) {
   return members.findIndex((m) => normKey(m.name) === n);
 }
 
-// Encontra o índice de um candidato existente. Chave primária: email
-// (normalizado). Só recorre ao nome, via normKey(), quando o email está em
-// branco ou não casa — substitui a comparação antiga (toLowerCase() direto),
-// que falhava com pequenas diferenças de grafia e impedia aprovações de
-// chegarem a candidatos de vários departamentos.
-function matchCandidateIndex(candidates, name, email) {
+// Identidade estável de candidatos em TODAS as importações/fases: primeiro
+// nome + último nome + departamento. Os nomes intermédios podem variar entre
+// o Excel Mestre e o Forms ("Renato Alves" / "Renato Silva Alves") sem criar
+// uma segunda pessoa. O departamento impede misturar homónimos.
+function candidateFirstLastKey(name) {
+  const parts = normKey(name).split(" ").filter(Boolean);
+  return parts.length >= 2 ? `${parts[0]} ${parts[parts.length - 1]}` : "";
+}
+function matchCandidateIndex(candidates, name, email, department = "") {
+  const nDepartment = normKey(department);
+  const inDepartment = (candidate) => !nDepartment || normKey(candidate.department) === nDepartment;
   const nEmail = normKey(email);
   if (nEmail) {
-    const i = candidates.findIndex((c) => c.email && normKey(c.email) === nEmail);
+    const i = candidates.findIndex((c) => inDepartment(c) && c.email && normKey(c.email) === nEmail);
     if (i >= 0) return i;
   }
   const nName = normKey(name); // sanitizado: trim + lowercase + sem acentos
   if (nName) {
-    const i = candidates.findIndex((c) => normKey(c.name) === nName);
+    const i = candidates.findIndex((c) => inDepartment(c) && normKey(c.name) === nName);
     if (i >= 0) return i;
+    const compactName = candidateFirstLastKey(name);
+    if (compactName) {
+      const matches = candidates.map((c, index) => ({ c, index }))
+        .filter(({ c }) => inDepartment(c) && candidateFirstLastKey(c.name) === compactName);
+      if (matches.length === 1) return matches[0].index;
+    }
   }
   return -1;
 }
@@ -1893,7 +1904,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   /* ---- A2. Base Dados Candidatos -> dados base de cada candidato ---- */
   let candidates = prevCandidates.map((c) => ({ ...c }));
   const upsertCandidate = (patch) => {
-    const idx = matchCandidateIndex(candidates, patch.name, patch.email);
+    const idx = matchCandidateIndex(candidates, patch.name, patch.email, patch.department);
     if (idx >= 0) candidates[idx] = { ...candidates[idx], ...patch };
     else candidates.push({
       id: uid("sync"), phase0Status: "Pendente", phase1Status: "—", phase2Status: "—",
@@ -1998,7 +2009,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     if (CV_INVALID_NAME_MARKERS.some((marker) => normKey(name).includes(marker))) return;
     const rawDept = row.raw[colLetterToIndex(SYNC_CV_DEPT_COLUMN)];
     const dept = isErrorOrEmptyValue(rawDept) ? null : matchDept(rawDept);
-    const idxExisting = matchCandidateIndex(candidates, name, "");
+    const idxExisting = matchCandidateIndex(candidates, name, "", dept || "");
     // Prioridade 1 (Fast-Track Talent Pool) já decidiu o estado deste
     // candidato em A2 — as Colunas Q/R (fluxo regular) nunca a sobrepõem.
     if (idxExisting >= 0 && candidates[idxExisting].veioTalentPool) return;
@@ -2059,7 +2070,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       const name = isErrorOrEmptyValue(rawName) ? "" : String(rawName).trim();
       if (!name) return;
       const email = isErrorOrEmptyValue(rawEmail) ? "" : String(rawEmail).trim();
-      const idx = matchCandidateIndex(candidates, name, email);
+      const idx = matchCandidateIndex(candidates, name, email, dept);
       if (idx < 0) {
         unmatchedDept.push(`${email ? `${name} (${email})` : name} — aba "${dept}"`);
         return; // candidato tem de constar em "Base Dados Candidatos"
@@ -2883,24 +2894,25 @@ function generatePhase2(pool, members) {
     const options = SLOTS.map((slot) => {
       const candidateGroup = makeGroupForSlot(slot);
       const depts = [...new Set(candidateGroup.map((c) => c.department))];
-      return { slot, candidateGroup, depts, rhCount: staffFor(slot, depts, "RH").length, supervisorCount: staffFor(slot, depts, "Supervisor").length };
+      return { slot, candidateGroup, depts, rhCount: staffFor(slot, depts, "RH").length };
     }).filter((o) => o.candidateGroup.length);
     if (!options.length) break;
     options.sort((a, b) =>
-      (b.rhCount >= 3) - (a.rhCount >= 3) || b.candidateGroup.length - a.candidateGroup.length || b.supervisorCount - a.supervisorCount || b.rhCount - a.rhCount || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot)
+      (b.rhCount >= 3) - (a.rhCount >= 3) || b.candidateGroup.length - a.candidateGroup.length || b.rhCount - a.rhCount || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot)
     );
     const best = options[0];
     const warnings = [];
     const rh = rankStaff(staffFor(best.slot, best.depts, "RH"), best.depts).slice(0, 3);
-    const supervisor = rankStaff(staffFor(best.slot, best.depts, "Supervisor"), best.depts)[0] || null;
+    // Nas Dinâmicas, a equipa de Supervisão é comum a todas as sessões;
+    // não se escolhe um único representante por grupo. Mantemos todos os
+    // supervisores no registo para a agenda e exportação refletirem isso.
+    const supervisors = members.filter((m) => m.role === "Supervisor");
     const directors = best.depts.map((dept) => rankStaff(staffFor(best.slot, [dept], "Diretor").filter((m) => memberHasDept(m, dept)), [dept])[0]).filter(Boolean);
     rh.forEach((m) => reserve(m, best.slot));
-    if (supervisor) reserve(supervisor, best.slot);
     directors.forEach((m) => reserve(m, best.slot));
     if (rh.length < 3) warnings.push(`Só foi possível atribuir ${rh.length} de 3 membros de RH a esta sessão.`);
-    if (!supervisor) warnings.push("Nenhum Supervisor (CEO/COO/CMO) disponível neste horário.");
     best.depts.filter((dept) => !directors.some((m) => memberHasDept(m, dept))).forEach((dept) => warnings.push(`Diretor(a) de ${dept} indisponível — presença prioritária, mas não bloqueante.`));
-    groups.push({ id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`, candidateIds: best.candidateGroup.map((c) => c.id), slot: best.slot, supervisorId: supervisor?.id || null, directorIds: directors.map((m) => m.id), rhIds: rh.map((m) => m.id), warnings });
+    groups.push({ id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`, candidateIds: best.candidateGroup.map((c) => c.id), slot: best.slot, supervisorId: supervisors[0]?.id || null, supervisorIds: supervisors.map((m) => m.id), directorIds: directors.map((m) => m.id), rhIds: rh.map((m) => m.id), warnings });
     const chosen = new Set(best.candidateGroup.map((c) => c.id));
     for (let i = remaining.length - 1; i >= 0; i--) if (chosen.has(remaining[i].id)) remaining.splice(i, 1);
   }
@@ -2909,7 +2921,7 @@ function generatePhase2(pool, members) {
   // não os coloca arbitrariamente numa sessão incompatível.
   remaining.forEach((candidate) => groups.push({
     id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`, candidateIds: [candidate.id], slot: null,
-    supervisorId: null, directorIds: [], rhIds: [], warnings: ["Candidato sem disponibilidade válida de 1h30 para as Dinâmicas de Grupo."],
+    supervisorId: null, supervisorIds: [], directorIds: [], rhIds: [], warnings: ["Candidato sem disponibilidade válida de 1h30 para as Dinâmicas de Grupo."],
   }));
   return groups;
 }
@@ -3295,7 +3307,7 @@ function extractDynamicsCandidatesFromMaster(wb, previous) {
     for (let rowIndex = headerRow + 1; rowIndex < grid.length; rowIndex++) {
       const name = cleanCellText(grid[rowIndex]?.[15]);
       if (isErrorOrEmptyValue(name) || normKey(name) === "nome") continue;
-      const idx = matchCandidateIndex(next, name, "");
+      const idx = matchCandidateIndex(next, name, "", department);
       const patch = { name, department, phase0Status: "Aprovado", phase1Status: "Aprovado" };
       if (idx >= 0) next[idx] = { ...next[idx], ...patch };
       else next.push({
@@ -3411,7 +3423,10 @@ function ImportHubPage({
         // pareça diferente de uma sem ela.
         const name = cleanCellText(get(row, "nome", "name"));
         if (!name) return;
-        const department = matchDept(get(row, "departamento", "department"));
+        const department = matchDept(get(
+          row, "departamento", "department", "1ª opção de departamento", "1a opcao de departamento",
+          "primeira opção de departamento", "primeira opcao de departamento"
+        ));
         const email = cleanCellText(get(row, "email"));
         // Exports reais do Forms costumam vir em formato de GRELHA (uma
         // coluna por slot), não só numa coluna de texto livre —
@@ -3427,7 +3442,7 @@ function ImportHubPage({
         } else if (!availability.length) {
           noAvailabilityNames.push(name);
         }
-        const idx = matchCandidateIndex(next, name, email);
+        const idx = matchCandidateIndex(next, name, email, department || "");
         count++;
         if (idx >= 0) {
           next[idx] = {
@@ -4301,11 +4316,11 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
   };
 
   const exportCSV = () => {
-    const header = ["Grupo", "Horário", "Candidatos", "Supervisor", "Diretores presentes", "RH presentes", "Avisos"];
+    const header = ["Grupo", "Horário", "Candidatos", "Supervisores", "Diretores presentes", "RH presentes", "Avisos"];
     const rows = groups.map((g) => [
       g.name, g.slot || "—",
       g.candidateIds.map((id) => candById(id)?.name).join(" | "),
-      byId(g.supervisorId)?.name || "—",
+      (g.supervisorIds || [g.supervisorId]).map((id) => byId(id)?.name).filter(Boolean).join(" | ") || "—",
       g.directorIds.map((id) => byId(id)?.name).join(" | ") || "—",
       g.rhIds.map((id) => byId(id)?.name).join(" | ") || "—",
       g.warnings.join(" | ") || "Sem avisos",
@@ -4342,7 +4357,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
       <div className="flex items-start justify-between mb-6">
         <div>
           <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Fase 3 — Dinâmicas de Grupo</h1>
-          <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de ~6 candidatos, máx. 2 por departamento, com Supervisor, Diretores e 2-3 RH.</p>
+          <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de ~6 candidatos, máx. 2 por departamento, com todos os Supervisores, Diretores e idealmente 3 RH.</p>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={exportCSV} className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2">
@@ -4448,8 +4463,8 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
 
             <div className="grid grid-cols-3 gap-2 text-xs mb-3">
               <div>
-                <p className="mb-1" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Supervisor</p>
-                <p className="font-medium" style={{ color: COLORS.navy }}>{byId(g.supervisorId)?.name || "—"}</p>
+                <p className="mb-1" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Supervisores</p>
+                <p className="font-medium" style={{ color: COLORS.navy }}>{(g.supervisorIds || [g.supervisorId]).map((id) => byId(id)?.name).filter(Boolean).join(", ") || "—"}</p>
               </div>
               <div>
                 <p className="mb-1" style={{ color: hexToRgba(COLORS.navy, 0.5) }}>Diretores</p>
