@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v9-identidade-candidato";
+const APP_BUILD = "build-2026-09-13-v8-dinamicas-supervisao-nomes";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -1904,7 +1904,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
   /* ---- A2. Base Dados Candidatos -> dados base de cada candidato ---- */
   let candidates = prevCandidates.map((c) => ({ ...c }));
   const upsertCandidate = (patch) => {
-    const idx = matchCandidateIndex(candidates, patch.name, patch.email, patch.department);
+    const idx = matchCandidateIndex(candidates, patch.name, patch.email);
     if (idx >= 0) candidates[idx] = { ...candidates[idx], ...patch };
     else candidates.push({
       id: uid("sync"), phase0Status: "Pendente", phase1Status: "—", phase2Status: "—",
@@ -2009,7 +2009,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     if (CV_INVALID_NAME_MARKERS.some((marker) => normKey(name).includes(marker))) return;
     const rawDept = row.raw[colLetterToIndex(SYNC_CV_DEPT_COLUMN)];
     const dept = isErrorOrEmptyValue(rawDept) ? null : matchDept(rawDept);
-    const idxExisting = matchCandidateIndex(candidates, name, "", dept || "");
+    const idxExisting = matchCandidateIndex(candidates, name, "");
     // Prioridade 1 (Fast-Track Talent Pool) já decidiu o estado deste
     // candidato em A2 — as Colunas Q/R (fluxo regular) nunca a sobrepõem.
     if (idxExisting >= 0 && candidates[idxExisting].veioTalentPool) return;
@@ -2070,7 +2070,7 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
       const name = isErrorOrEmptyValue(rawName) ? "" : String(rawName).trim();
       if (!name) return;
       const email = isErrorOrEmptyValue(rawEmail) ? "" : String(rawEmail).trim();
-      const idx = matchCandidateIndex(candidates, name, email, dept);
+      const idx = matchCandidateIndex(candidates, name, email);
       if (idx < 0) {
         unmatchedDept.push(`${email ? `${name} (${email})` : name} — aba "${dept}"`);
         return; // candidato tem de constar em "Base Dados Candidatos"
@@ -3307,7 +3307,7 @@ function extractDynamicsCandidatesFromMaster(wb, previous) {
     for (let rowIndex = headerRow + 1; rowIndex < grid.length; rowIndex++) {
       const name = cleanCellText(grid[rowIndex]?.[15]);
       if (isErrorOrEmptyValue(name) || normKey(name) === "nome") continue;
-      const idx = matchCandidateIndex(next, name, "", department);
+      const idx = matchCandidateIndex(next, name, "");
       const patch = { name, department, phase0Status: "Aprovado", phase1Status: "Aprovado" };
       if (idx >= 0) next[idx] = { ...next[idx], ...patch };
       else next.push({
@@ -3423,10 +3423,7 @@ function ImportHubPage({
         // pareça diferente de uma sem ela.
         const name = cleanCellText(get(row, "nome", "name"));
         if (!name) return;
-        const department = matchDept(get(
-          row, "departamento", "department", "1ª opção de departamento", "1a opcao de departamento",
-          "primeira opção de departamento", "primeira opcao de departamento"
-        ));
+        const department = matchDept(get(row, "departamento", "department"));
         const email = cleanCellText(get(row, "email"));
         // Exports reais do Forms costumam vir em formato de GRELHA (uma
         // coluna por slot), não só numa coluna de texto livre —
@@ -3442,7 +3439,7 @@ function ImportHubPage({
         } else if (!availability.length) {
           noAvailabilityNames.push(name);
         }
-        const idx = matchCandidateIndex(next, name, email, department || "");
+        const idx = matchCandidateIndex(next, name, email);
         count++;
         if (idx >= 0) {
           next[idx] = {
