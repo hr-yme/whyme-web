@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v8-dinamicas-supervisao-nomes";
+const APP_BUILD = "build-2026-09-13-v10-dinamicas-5a7";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -2855,6 +2855,17 @@ function generatePhase2(pool, members) {
   const workload = {};
   const groups = [];
   const duration = PHASE_DURATION_MIN.fase2;
+  // Planeamento de capacidade: cada dinâmica tem 5–7 candidatos, com 6
+  // como dimensão de referência. Escolhemos primeiro o número de sessões
+  // que permite repartir toda a pool nesse intervalo, evitando a antiga
+  // "sobra" de 1–4 candidatos no fim.
+  const schedulableCount = remaining.filter((c) => c.availability?.fase2?.length).length;
+  const minGroups = Math.ceil(schedulableCount / 7);
+  const maxGroups = Math.floor(schedulableCount / 5);
+  const groupCount = schedulableCount >= 5 && minGroups <= maxGroups
+    ? Math.min(maxGroups, Math.max(minGroups, Math.round(schedulableCount / 6)))
+    : 0;
+  const plannedSizes = groupCount ? Array.from({ length: groupCount }, (_, i) => Math.floor(schedulableCount / groupCount) + (i < schedulableCount % groupCount ? 1 : 0)) : [];
   const overlaps = (a, b) => {
     const ai = SLOT_INFO[a], bi = SLOT_INFO[b];
     return ai && bi && ai.day === bi.day && ai.startMin < bi.startMin + duration && bi.startMin < ai.startMin + duration;
@@ -2870,7 +2881,7 @@ function generatePhase2(pool, members) {
     const bAffinity = depts.some((d) => memberHasDept(b, d)) ? 1 : 0;
     return bAffinity - aAffinity || (workload[a.id] || 0) - (workload[b.id] || 0) || a.name.localeCompare(b.name);
   });
-  const makeGroupForSlot = (slot) => {
+  const makeGroupForSlot = (slot, maxSize) => {
     const available = remaining.filter((c) => c.availability?.fase2?.includes(slot));
     if (!available.length) return [];
     const perDept = {};
@@ -2878,7 +2889,7 @@ function generatePhase2(pool, members) {
     Object.values(perDept).forEach((list) => list.sort((a, b) => (a.availability?.fase2?.length || 999) - (b.availability?.fase2?.length || 999)));
     const picked = [];
     const deptCounts = {};
-    while (picked.length < 6) {
+    while (picked.length < maxSize) {
       const choices = Object.entries(perDept)
         .filter(([dept, list]) => list.length && (deptCounts[dept] || 0) < 2)
         .sort(([aDept, aList], [bDept, bList]) => (deptCounts[aDept] || 0) - (deptCounts[bDept] || 0) || aList.length - bList.length);
@@ -2890,12 +2901,13 @@ function generatePhase2(pool, members) {
     return picked;
   };
 
-  while (remaining.some((c) => c.availability?.fase2?.length)) {
+  while (groups.length < plannedSizes.length) {
+    const targetSize = plannedSizes[groups.length];
     const options = SLOTS.map((slot) => {
-      const candidateGroup = makeGroupForSlot(slot);
+      const candidateGroup = makeGroupForSlot(slot, targetSize);
       const depts = [...new Set(candidateGroup.map((c) => c.department))];
       return { slot, candidateGroup, depts, rhCount: staffFor(slot, depts, "RH").length };
-    }).filter((o) => o.candidateGroup.length);
+    }).filter((o) => o.candidateGroup.length >= 5);
     if (!options.length) break;
     options.sort((a, b) =>
       (b.rhCount >= 3) - (a.rhCount >= 3) || b.candidateGroup.length - a.candidateGroup.length || b.rhCount - a.rhCount || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot)
@@ -2907,22 +2919,27 @@ function generatePhase2(pool, members) {
     // não se escolhe um único representante por grupo. Mantemos todos os
     // supervisores no registo para a agenda e exportação refletirem isso.
     const supervisors = members.filter((m) => m.role === "Supervisor");
-    const directors = best.depts.map((dept) => rankStaff(staffFor(best.slot, [dept], "Diretor").filter((m) => memberHasDept(m, dept)), [dept])[0]).filter(Boolean);
+    // Regra operacional das Dinâmicas: se os candidatos têm este horário,
+    // os diretores dos respetivos departamentos estão também disponíveis.
+    // Não voltamos a filtrá-los pela grelha individual, que é precisamente
+    // a origem dos avisos falsos mostrados no ecrã.
+    const directors = best.depts.map((dept) => members.find((m) => m.role === "Diretor" && memberHasDept(m, dept))).filter(Boolean);
     rh.forEach((m) => reserve(m, best.slot));
     directors.forEach((m) => reserve(m, best.slot));
     if (rh.length < 3) warnings.push(`Só foi possível atribuir ${rh.length} de 3 membros de RH a esta sessão.`);
-    best.depts.filter((dept) => !directors.some((m) => memberHasDept(m, dept))).forEach((dept) => warnings.push(`Diretor(a) de ${dept} indisponível — presença prioritária, mas não bloqueante.`));
+    best.depts.filter((dept) => !directors.some((m) => memberHasDept(m, dept))).forEach((dept) => warnings.push(`Não foi encontrado Diretor(a) associado(a) a ${dept} na estrutura organizacional.`));
     groups.push({ id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`, candidateIds: best.candidateGroup.map((c) => c.id), slot: best.slot, supervisorId: supervisors[0]?.id || null, supervisorIds: supervisors.map((m) => m.id), directorIds: directors.map((m) => m.id), rhIds: rh.map((m) => m.id), warnings });
     const chosen = new Set(best.candidateGroup.map((c) => c.id));
     for (let i = remaining.length - 1; i >= 0; i--) if (chosen.has(remaining[i].id)) remaining.splice(i, 1);
   }
 
-  // Mantém visíveis os casos que responderam sem uma janela válida de 90 min;
-  // não os coloca arbitrariamente numa sessão incompatível.
-  remaining.forEach((candidate) => groups.push({
-    id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`, candidateIds: [candidate.id], slot: null,
-    supervisorId: null, supervisorIds: [], directorIds: [], rhIds: [], warnings: ["Candidato sem disponibilidade válida de 1h30 para as Dinâmicas de Grupo."],
-  }));
+  // Quem não conseguir integrar uma sessão de pelo menos cinco pessoas não
+  // é marcado como uma "dinâmica" inválida. Fica num bloco de reagendamento
+  // para o RH obter uma janela adicional, sem quebrar a regra 5–7.
+  if (remaining.length) groups.push({
+    id: uid("p2"), name: "Por reagendar", candidateIds: remaining.map((c) => c.id), slot: null,
+    supervisorId: null, supervisorIds: [], directorIds: [], rhIds: [], warnings: ["Estes candidatos não têm uma combinação comum que forme uma dinâmica válida de 5–7 pessoas. Recolhe novas disponibilidades ou ajusta-os manualmente."],
+  });
   return groups;
 }
 
@@ -4354,7 +4371,7 @@ function Phase2Page({ candidates, setCandidates, members, groups, setGroups, onG
       <div className="flex items-start justify-between mb-6">
         <div>
           <h1 className="text-xl font-bold tracking-wide uppercase" style={{ color: COLORS.white }}>Fase 3 — Dinâmicas de Grupo</h1>
-          <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de ~6 candidatos, máx. 2 por departamento, com todos os Supervisores, Diretores e idealmente 3 RH.</p>
+          <p className="text-sm mt-1" style={{ color: "#94a3b8" }}>Sessões de 5–7 candidatos, idealmente 6, máx. 2 por departamento, com todos os Supervisores, Diretores e idealmente 3 RH.</p>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={exportCSV} className="yme-btn-outline-dark flex items-center gap-1.5 text-sm rounded-lg px-3 py-2">
