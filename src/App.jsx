@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v11-rh-dinamicas";
+const APP_BUILD = "build-2026-09-13-v12-rh-multisessao";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -2882,7 +2882,13 @@ function generatePhase2(pool, members) {
     (busy[member.id] || (busy[member.id] = [])).push(slot);
     workload[member.id] = (workload[member.id] || 0) + 1;
   };
-  const staffFor = (slot, depts, role) => members.filter((m) => m.role === role && isFree(m, slot));
+  const staffFor = (slot, depts, role) => members.filter((m) => {
+    if (m.role !== role) return false;
+    // Regra específica das Dinâmicas: membros de RH podem acompanhar mais
+    // de uma sessão em simultâneo. A carga acumulada continua a ordenar a
+    // escolha, para repartir esta presença da forma mais justa possível.
+    return role === "RH" ? true : isFree(m, slot);
+  });
   const rankStaff = (list, depts) => list.slice().sort((a, b) => {
     const aAffinity = depts.some((d) => memberHasDept(a, d)) ? 1 : 0;
     const bAffinity = depts.some((d) => memberHasDept(b, d)) ? 1 : 0;
