@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-14-v15-prioridade-disponibilidade";
+const APP_BUILD = "build-2026-09-14-v17-resgate-quarta";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -2903,14 +2903,11 @@ function generatePhase2(pool, members) {
     const picked = [];
     const deptCounts = {};
     while (picked.length < maxSize) {
-      // Dois por departamento continua a ser a escolha preferida. Não é,
-      // porém, uma regra que possa deixar um candidato com disponibilidade
-      // válida sem dinâmica: se necessário, aceita um terceiro para formar
-      // um grupo útil de 5–7 pessoas.
+      // Máximo rígido de dois candidatos por departamento em cada dinâmica.
+      // A flexibilidade é dada pelo tamanho 5–7 e pela troca de candidatos
+      // mais flexíveis entre grupos, nunca por violar esta regra.
       let choices = Object.entries(perDept)
         .filter(([dept, list]) => list.length && (deptCounts[dept] || 0) < 2);
-      if (!choices.length) choices = Object.entries(perDept)
-        .filter(([dept, list]) => list.length && (deptCounts[dept] || 0) < 3);
       choices = choices
         .sort(([aDept, aList], [bDept, bList]) => (deptCounts[aDept] || 0) - (deptCounts[bDept] || 0) || aList.length - bList.length);
       if (!choices.length) break;
@@ -2926,11 +2923,22 @@ function generatePhase2(pool, members) {
     const options = SLOTS.map((slot) => {
       const candidateGroup = makeGroupForSlot(slot, targetSize);
       const depts = [...new Set(candidateGroup.map((c) => c.department))];
-      return { slot, candidateGroup, depts, rhCount: staffFor(slot, depts, "RH").length };
+      const flexibilities = candidateGroup.map((candidate) => candidate.availability?.fase2?.length || 0);
+      return {
+        slot, candidateGroup, depts, rhCount: staffFor(slot, depts, "RH").length,
+        // Menor valor = candidato com menos alternativas. Esta métrica vem
+        // antes do horário cronológico, para que uma sessão de quarta-feira
+        // necessária para a Patrícia não seja sacrificada por candidatos que
+        // também podiam ficar terça ou quinta.
+        rarestAvailability: flexibilities.length ? Math.min(...flexibilities) : Infinity,
+        scarcityScore: flexibilities.reduce((total, count) => total + 1 / Math.max(count, 1), 0),
+      };
     }).filter((o) => o.candidateGroup.length >= 5);
     if (!options.length) break;
     options.sort((a, b) =>
-      (b.rhCount >= 3) - (a.rhCount >= 3) || b.candidateGroup.length - a.candidateGroup.length || b.rhCount - a.rhCount || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot)
+      a.rarestAvailability - b.rarestAvailability || b.scarcityScore - a.scarcityScore
+        || (b.rhCount >= 3) - (a.rhCount >= 3) || b.candidateGroup.length - a.candidateGroup.length
+        || b.rhCount - a.rhCount || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot)
     );
     const best = options[0];
     const warnings = [];
@@ -3007,15 +3015,59 @@ function generatePhase2(pool, members) {
       }
     }
 
-    // Último recurso: mantém a pessoa numa sessão válida, aceitando um
-    // terceiro colega do mesmo departamento, nunca mais de sete pessoas.
-    if (!target) target = availableGroups
-      .filter((group) => group.candidateIds.length < 7 && departmentCount(group, candidate.department) < 3)
-      .sort((a, b) => a.candidateIds.length - b.candidateIds.length || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot))[0];
     if (!target) return;
     addCandidateToGroup(target, candidate);
     remaining.splice(remaining.indexOf(candidate), 1);
   });
+
+  // Recuperação final para candidatos de disponibilidade limitada: se não
+  // houver lugar nos grupos existentes, abre uma nova sessão num dos seus
+  // horários e transfere quatro candidatos mais flexíveis de grupos com 6
+  // ou 7 pessoas. Nenhum grupo de origem fica com menos de cinco pessoas.
+  // Isto impede que uma janela exclusiva, como a quarta-feira da Patrícia,
+  // desapareça só porque os candidatos flexíveis foram alocados primeiro.
+  for (let i = remaining.length - 1; i >= 0; i--) {
+    const candidate = remaining[i];
+    let rescue = null;
+    for (const slot of candidate.availability?.fase2 || []) {
+      const sourceCapacity = new Map(groups.map((group) => [group.id, Math.max(0, group.candidateIds.length - 5)]));
+      const departmentCounts = { [candidate.department]: 1 };
+      const donors = [];
+      const movable = groups.flatMap((source) => source.slot && source.candidateIds.length > 5
+        ? source.candidateIds.map((id) => ({ source, candidate: candidateById.get(id) }))
+        : [])
+        .filter(({ candidate: donor }) => donor?.availability?.fase2?.includes(slot))
+        .sort((a, b) => (b.candidate.availability?.fase2?.length || 0) - (a.candidate.availability?.fase2?.length || 0));
+      for (const item of movable) {
+        if (donors.length === 4) break;
+        if ((sourceCapacity.get(item.source.id) || 0) <= 0) continue;
+        const count = departmentCounts[item.candidate.department] || 0;
+        if (count >= 2) continue;
+        donors.push(item);
+        sourceCapacity.set(item.source.id, sourceCapacity.get(item.source.id) - 1);
+        departmentCounts[item.candidate.department] = count + 1;
+      }
+      if (donors.length === 4) { rescue = { slot, donors }; break; }
+    }
+    if (!rescue) continue;
+    rescue.donors.forEach(({ source, candidate: donor }) => {
+      source.candidateIds = source.candidateIds.filter((id) => id !== donor.id);
+    });
+    const rescueCandidates = [candidate, ...rescue.donors.map(({ candidate: donor }) => donor)];
+    const depts = [...new Set(rescueCandidates.map((item) => item.department))];
+    const rh = rankStaff(staffFor(rescue.slot, depts, "RH"), depts).slice(0, 3);
+    rh.forEach((member) => reserve(member, rescue.slot));
+    const directors = depts.map((dept) => members.find((member) => member.role === "Diretor" && memberHasDept(member, dept))).filter(Boolean);
+    const supervisors = members.filter((member) => member.role === "Supervisor");
+    groups.push({
+      id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`,
+      candidateIds: rescueCandidates.map((item) => item.id), slot: rescue.slot,
+      supervisorId: supervisors[0]?.id || null,
+      supervisorIds: supervisors.map((member) => member.id),
+      directorIds: directors.map((member) => member.id), rhIds: rh.map((member) => member.id), warnings: [],
+    });
+    remaining.splice(i, 1);
+  }
 
   // Quem não conseguir integrar uma sessão de pelo menos cinco pessoas não
   // é marcado como uma "dinâmica" inválida. Fica num bloco de reagendamento
