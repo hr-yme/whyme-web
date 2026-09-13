@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v13-encaixe-final";
+const APP_BUILD = "build-2026-09-14-v15-prioridade-disponibilidade";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -2903,8 +2903,15 @@ function generatePhase2(pool, members) {
     const picked = [];
     const deptCounts = {};
     while (picked.length < maxSize) {
-      const choices = Object.entries(perDept)
-        .filter(([dept, list]) => list.length && (deptCounts[dept] || 0) < 2)
+      // Dois por departamento continua a ser a escolha preferida. Não é,
+      // porém, uma regra que possa deixar um candidato com disponibilidade
+      // válida sem dinâmica: se necessário, aceita um terceiro para formar
+      // um grupo útil de 5–7 pessoas.
+      let choices = Object.entries(perDept)
+        .filter(([dept, list]) => list.length && (deptCounts[dept] || 0) < 2);
+      if (!choices.length) choices = Object.entries(perDept)
+        .filter(([dept, list]) => list.length && (deptCounts[dept] || 0) < 3);
+      choices = choices
         .sort(([aDept, aList], [bDept, bList]) => (deptCounts[aDept] || 0) - (deptCounts[bDept] || 0) || aList.length - bList.length);
       if (!choices.length) break;
       const [dept, list] = choices[0];
@@ -2953,22 +2960,62 @@ function generatePhase2(pool, members) {
   // departamento. É o caso típico de uma Patrícia poder completar um grupo
   // de seis na quarta-feira às 14:30.
   const candidateById = new Map(pool.map((candidate) => [candidate.id, candidate]));
-  for (let i = remaining.length - 1; i >= 0; i--) {
-    const candidate = remaining[i];
-    const compatible = groups.filter((group) => {
-      if (!group.slot || group.candidateIds.length >= 7 || !candidate.availability?.fase2?.includes(group.slot)) return false;
-      const sameDepartment = group.candidateIds
-        .map((id) => candidateById.get(id))
-        .filter((other) => other?.department === candidate.department).length;
-      return sameDepartment < 2;
-    }).sort((a, b) => a.candidateIds.length - b.candidateIds.length || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot));
-    const target = compatible[0];
-    if (!target) continue;
-    target.candidateIds.push(candidate.id);
+  const departmentCount = (group, department) => group.candidateIds
+    .map((id) => candidateById.get(id))
+    .filter((other) => other?.department === department).length;
+  const addCandidateToGroup = (group, candidate) => {
+    group.candidateIds.push(candidate.id);
     const director = members.find((member) => member.role === "Diretor" && memberHasDept(member, candidate.department));
-    if (director && !target.directorIds.includes(director.id)) target.directorIds.push(director.id);
-    remaining.splice(i, 1);
-  }
+    if (director && !group.directorIds.includes(director.id)) group.directorIds.push(director.id);
+  };
+  // Processa primeiro quem tem MENOS horários: é este critério que torna
+  // candidatos como a Patrícia prioritários, em vez de os deixar para uma
+  // sobra depois de alocar colegas muito mais flexíveis.
+  const priorityCandidates = remaining.slice().sort((a, b) =>
+    (a.availability?.fase2?.length || 0) - (b.availability?.fase2?.length || 0)
+  );
+  priorityCandidates.forEach((candidate) => {
+    if (!remaining.includes(candidate)) return;
+    const availableGroups = groups.filter((group) => group.slot && candidate.availability?.fase2?.includes(group.slot));
+    // Primeiro, tenta encaixar sem ultrapassar a distribuição preferida de
+    // dois candidatos do mesmo departamento.
+    let target = availableGroups
+      .filter((group) => group.candidateIds.length < 7 && departmentCount(group, candidate.department) < 2)
+      .sort((a, b) => a.candidateIds.length - b.candidateIds.length || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot))[0];
+
+    // Se o único bloqueio forem dois colegas do mesmo departamento, troca
+    // um colega mais flexível para outro grupo onde também caiba. Mantém as
+    // duas sessões entre 5–7 pessoas e dá prioridade real a quem tem menos
+    // janelas de disponibilidade.
+    if (!target) {
+      const swap = availableGroups.flatMap((source) => source.candidateIds
+        .map((id) => candidateById.get(id))
+        .filter((other) => other?.department === candidate.department)
+        .sort((a, b) => (b.availability?.fase2?.length || 0) - (a.availability?.fase2?.length || 0))
+        .flatMap((displaced) => groups
+          .filter((destination) => destination !== source && destination.slot && destination.candidateIds.length < 7
+            && displaced.availability?.fase2?.includes(destination.slot) && departmentCount(destination, displaced.department) < 2)
+          .map((destination) => ({ source, displaced, destination }))))
+        .sort((a, b) => a.destination.candidateIds.length - b.destination.candidateIds.length
+          || (b.displaced.availability?.fase2?.length || 0) - (a.displaced.availability?.fase2?.length || 0))[0];
+      if (swap) {
+        swap.source.candidateIds = swap.source.candidateIds.filter((id) => id !== swap.displaced.id);
+        addCandidateToGroup(swap.source, candidate);
+        addCandidateToGroup(swap.destination, swap.displaced);
+        remaining.splice(remaining.indexOf(candidate), 1);
+        return;
+      }
+    }
+
+    // Último recurso: mantém a pessoa numa sessão válida, aceitando um
+    // terceiro colega do mesmo departamento, nunca mais de sete pessoas.
+    if (!target) target = availableGroups
+      .filter((group) => group.candidateIds.length < 7 && departmentCount(group, candidate.department) < 3)
+      .sort((a, b) => a.candidateIds.length - b.candidateIds.length || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot))[0];
+    if (!target) return;
+    addCandidateToGroup(target, candidate);
+    remaining.splice(remaining.indexOf(candidate), 1);
+  });
 
   // Quem não conseguir integrar uma sessão de pelo menos cinco pessoas não
   // é marcado como uma "dinâmica" inválida. Fica num bloco de reagendamento
