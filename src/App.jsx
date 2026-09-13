@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v12-rh-multisessao";
+const APP_BUILD = "build-2026-09-13-v13-encaixe-final";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -2944,6 +2944,30 @@ function generatePhase2(pool, members) {
     groups.push({ id: uid("p2"), name: `Grupo ${String.fromCharCode(65 + groups.length)}`, candidateIds: best.candidateGroup.map((c) => c.id), slot: best.slot, supervisorId: supervisors[0]?.id || null, supervisorIds: supervisors.map((m) => m.id), directorIds: directors.map((m) => m.id), rhIds: rh.map((m) => m.id), warnings });
     const chosen = new Set(best.candidateGroup.map((c) => c.id));
     for (let i = remaining.length - 1; i >= 0; i--) if (chosen.has(remaining[i].id)) remaining.splice(i, 1);
+  }
+
+  // Segunda passagem: o primeiro varrimento privilegia grupos equilibrados
+  // de seis, mas pode deixar um candidato com janela compatível de fora. Antes
+  // de o mandar para reagendamento, encaixa-o num grupo existente de 5 ou 6
+  // pessoas que aceite o seu horário, até ao máximo de 7 e de 2 do mesmo
+  // departamento. É o caso típico de uma Patrícia poder completar um grupo
+  // de seis na quarta-feira às 14:30.
+  const candidateById = new Map(pool.map((candidate) => [candidate.id, candidate]));
+  for (let i = remaining.length - 1; i >= 0; i--) {
+    const candidate = remaining[i];
+    const compatible = groups.filter((group) => {
+      if (!group.slot || group.candidateIds.length >= 7 || !candidate.availability?.fase2?.includes(group.slot)) return false;
+      const sameDepartment = group.candidateIds
+        .map((id) => candidateById.get(id))
+        .filter((other) => other?.department === candidate.department).length;
+      return sameDepartment < 2;
+    }).sort((a, b) => a.candidateIds.length - b.candidateIds.length || SLOTS.indexOf(a.slot) - SLOTS.indexOf(b.slot));
+    const target = compatible[0];
+    if (!target) continue;
+    target.candidateIds.push(candidate.id);
+    const director = members.find((member) => member.role === "Diretor" && memberHasDept(member, candidate.department));
+    if (director && !target.directorIds.includes(director.id)) target.directorIds.push(director.id);
+    remaining.splice(i, 1);
   }
 
   // Quem não conseguir integrar uma sessão de pelo menos cinco pessoas não
