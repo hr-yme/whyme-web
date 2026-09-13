@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-13-v10-dinamicas-5a7";
+const APP_BUILD = "build-2026-09-13-v11-rh-dinamicas";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -2870,7 +2870,14 @@ function generatePhase2(pool, members) {
     const ai = SLOT_INFO[a], bi = SLOT_INFO[b];
     return ai && bi && ai.day === bi.day && ai.startMin < bi.startMin + duration && bi.startMin < ai.startMin + duration;
   };
-  const isFree = (member, slot) => member.availability?.includes(slot) && !(busy[member.id] || []).some((used) => overlaps(used, slot));
+  // A grelha de Dinâmicas é construída a partir da janela aprovada para a
+  // equipa organizadora. Não voltamos a excluir RH/Diretores por uma falha
+  // de leitura da disponibilidade individual já sincronizada. Ainda assim,
+  // uma pessoa nunca é atribuída a duas sessões sobrepostas de 1h30.
+  const isFree = (member, slot) => {
+    const hasOperationalAvailability = ["RH", "Diretor", "Supervisor"].includes(member.role) || member.availability?.includes(slot);
+    return hasOperationalAvailability && !(busy[member.id] || []).some((used) => overlaps(used, slot));
+  };
   const reserve = (member, slot) => {
     (busy[member.id] || (busy[member.id] = [])).push(slot);
     workload[member.id] = (workload[member.id] || 0) + 1;
