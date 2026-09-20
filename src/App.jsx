@@ -64,7 +64,7 @@ const ACCESS_KEY = "YME2026";
 // que foi a causa real da última ronda de "os bugs persistem": as
 // correções já estavam no ficheiro entregue, mas a app em ecrã ainda
 // estava a correr uma versão anterior.
-const APP_BUILD = "build-2026-09-14-v17-resgate-quarta";
+const APP_BUILD = "build-2026-09-20-v18-fase4-desafio-final";
 
 const DAYS = ["Seg", "Ter", "Qua", "Qui", "Sex"];
 const TIMES = [
@@ -379,11 +379,22 @@ function isErrorOrEmptyValue(v) {
   if (s === "") return true;
   return SHEET_ERROR_VALUES.has(s.toUpperCase());
 }
-function matchDept(raw) {
-  const norm = normKey(raw).replace(/[^a-z0-9]+/g, " ").trim();
-  if (!norm) return null;
-  return DEPARTMENTS.find((d) => normKey(d).replace(/[^a-z0-9]+/g, " ").trim() === norm) || null;
+function normDept(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\b(and|e)\b/g, " ")
+    .replace(/&/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
+function matchDept(raw) {
+  const norm = normDept(raw);
+  if (!norm) return null;
+  return DEPARTMENTS.find((d) => normDept(d) === norm) || null;
+}
+
 
 
 // Encontra o índice de um membro existente pelo nome, usando normKey() em
@@ -497,6 +508,28 @@ const SYNC_DEPT_COLUMNS = {
   final: "AZ",       // Passou Desafio Final/Hard Skills -> SELECIONADO / ENTROU NA YME
   talentPoolA: "AB", // Selecionado para Talent Pool (variante de coluna 1)
   talentPoolB: "BA", // Selecionado para Talent Pool (variante de coluna 2)
+};
+
+// FASE FINAL / HARD SKILLS (4ª FASE):
+// A elegibilidade para os agendamentos da Fase 4 NÃO é inferida de fases
+// anteriores nem de Base Dados Candidatos. É lida estritamente das 6 abas
+// de departamento:
+//   AA = estado de aprovação nesta fase (Coluna AA, índice 26)
+//   AD = nome do candidato no Desafio Final a partir da linha 15 (AD15 em diante, índice 29)
+// Só os candidatos com aprovação na Coluna AA e nome na Coluna AD entram na Fase 4.
+// Os restantes candidatos de fases anteriores não aparecem nesta fase.
+const FINAL_CHALLENGE_START_ROW = 15; // Linha 15 do Excel (índice 0-based: 14)
+const FINAL_CHALLENGE_PASS_COLUMN = "AA";
+const FINAL_CHALLENGE_NAME_COLUMN = "AD";
+
+// Mapeamento dos nomes de folha/aba dos 6 departamentos (suporta "and" e "&", com e sem aspas):
+const SYNC_DEPARTMENT_SHEET_NAMES = {
+  "Sales & Commercial": ["'Sales and Commercial'", "'Sales & Commercial'", "Sales and Commercial", "Sales & Commercial"],
+  "Legal & Finance": ["'Legal and Finance'", "'Legal & Finance'", "Legal and Finance", "Legal & Finance"],
+  "Brand Strategy": ["'Brand Strategy'", "Brand Strategy"],
+  "Digital Development": ["'Digital Development'", "Digital Development"],
+  "Human Resources": ["'Human Resources'", "Human Resources"],
+  "Quality Management": ["'Quality Management'", "Quality Management"],
 };
 // Coluna Q da Avaliação de CV (Fase 1): candidato passou para a Fase 2 (Entrevista Soft Skills/RH).
 const SYNC_CV_PASS_COLUMN = "Q";
@@ -710,11 +743,21 @@ function colIndexToLetter(index) {
   return s;
 }
 
-function isPositiveMark(val) {
-  if (val === true) return true;
+function isApprovedMark(val) {
+  if (val === true || val === 1) return true;
   const v = String(val ?? "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   if (!v) return false;
-  return ["x", "sim", "true", "verdadeiro", "1", "aprovado", "selecionado", "apto", "avanca", "yes", "✓", "v", "☑", "☒"].includes(v);
+  if (["x", "sim", "true", "verdadeiro", "1", "aprovado", "aprovada", "passou", "passa", "selecionado", "selecionada", "apto", "apta", "avanca", "yes", "y", "s", "v", "✓", "✔", "☑", "☒"].includes(v)) {
+    return true;
+  }
+  if (v.startsWith("aprov") || v.startsWith("pass") || v.startsWith("selec") || v.startsWith("apt")) {
+    return true;
+  }
+  return false;
+}
+
+function isPositiveMark(val) {
+  return isApprovedMark(val);
 }
 // Extensão de isPositiveMark() para colunas-grelha de disponibilidade (uma
 // coluna = um slot exato): além dos valores positivos globais (x, sim,
@@ -797,13 +840,14 @@ function parseApiValues(values, headerHints = [], fixedHeaderIdx = null) {
   }
   const rows = grid
     .slice(dataStartIdx)
-    .filter((r) => r.some((c) => String(c ?? "").trim() !== ""))
-    .map((raw) => {
+    .map((raw, offset) => ({ raw, rowIndex: dataStartIdx + offset }))
+    .filter(({ raw }) => raw.some((c) => String(c ?? "").trim() !== ""))
+    .map(({ raw, rowIndex }) => {
       const obj = {};
       header.forEach((h, i) => { if (h) obj[h] = raw[i] ?? ""; });
-      return { obj, raw };
+      return { obj, raw, rowIndex };
     });
-  return { header, rows, headerIdx };
+  return { header, rows, headerIdx, rawGrid: grid };
 }
 
 // Lê uma aba da folha privada via Google Sheets API v4 (values.get),
@@ -2050,21 +2094,87 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
     warnings.push(`${unmatchedCV.length} candidato(s) da aba "Avaliação CV e Questões Abertas" não corresponderam a nenhum candidato de "Base Dados Candidatos" por nome: ${unmatchedCV.join("; ")} — foram criados marcados como "por confirmar". Confirma se o nome está escrito de forma idêntica nas duas abas.`);
   }
 
-  /* ---- B. Abas por Departamento -> progresso por fase + lógica de rejeição ---- */
+  /* ---- B. Abas por Departamento -> progresso por fase + elegibilidade estrita da Fase 4 ---- */
+  // A pool da Fase 4 é recalculada a cada sincronização. Candidatos que não
+  // cumpram o critério estrito (aprovação na Coluna AA e nome na Coluna AD15+)
+  // são excluídos da Fase 4.
+  candidates = candidates.map((c) => ({
+    ...c,
+    finalChallengeEligible: false,
+    finalChallengeName: null,
+  }));
+
   const unmatchedDept = [];
+
   DEPARTMENTS.forEach((dept) => {
     const tab = raw.deptTabs?.[dept];
     if (!tab) return;
+
+    // -------------------------------------------------------------------
+    // 1) REGRA ESTRITA DA FASE 4 / DESAFIO FINAL (Colunas AA e AD a partir da linha 15)
+    // -------------------------------------------------------------------
+    const grid = tab.rawGrid || (tab.rows ? tab.rows.map((r) => r.raw) : []);
+    const passColIdx = colLetterToIndex(FINAL_CHALLENGE_PASS_COLUMN); // AA (26)
+    const nameColIdx = colLetterToIndex(FINAL_CHALLENGE_NAME_COLUMN); // AD (29)
+
+    for (let r = FINAL_CHALLENGE_START_ROW - 1; r < grid.length; r++) {
+      const rowData = grid[r];
+      if (!rowData || !Array.isArray(rowData)) continue;
+      const rawAA = rowData[passColIdx];
+      const rawAD = rowData[nameColIdx];
+
+      // Só candidatos com validação positiva de aprovação na Coluna AA
+      if (!isApprovedMark(rawAA)) continue;
+
+      const finalName = cleanCellText(rawAD);
+      if (!finalName || isErrorOrEmptyValue(finalName)) continue;
+      if (["nome", "nome completo", "candidato", "desafio final", "desafio", "hard skills"].includes(normKey(finalName))) continue;
+      if (finalName.length < 2) continue;
+
+      let finalIdx = matchCandidateIndex(candidates, finalName, "", dept);
+      if (finalIdx < 0) finalIdx = matchCandidateIndex(candidates, finalName, "");
+
+      if (finalIdx >= 0) {
+        candidates[finalIdx] = {
+          ...candidates[finalIdx],
+          department: dept,
+          finalChallengeEligible: true,
+          finalChallengeName: finalName,
+          phase2Status: "Aprovado",
+        };
+      } else {
+        candidates.push({
+          id: uid("final"),
+          name: finalName,
+          department: dept,
+          email: "",
+          telefone: "",
+          cvLink: "",
+          phase0Status: "Aprovado",
+          phase1Status: "Aprovado",
+          phase2Status: "Aprovado",
+          finalChallengeEligible: true,
+          finalChallengeName: finalName,
+          formsSubmitted: { fase1: false, fase2: false, fase3: false },
+          availabilityStatus: { fase1: "nao_enviada", fase2: "nao_enviada", fase3: "nao_enviada" },
+          availability: { fase1: [], fase2: [], fase3: [] },
+        });
+      }
+    }
+
+    // -------------------------------------------------------------------
+    // 2) Lógica existente para fases anteriores (Soft Skills / Dinâmicas)
+    // -------------------------------------------------------------------
     tab.rows.forEach((row) => {
       // Nesta estrutura há vários cabeçalhos "Nome" na mesma linha. A
       // lista de aprovados para Dinâmicas é, por definição, a coluna P;
       // lê-la diretamente por posição evita que um cabeçalho repetido faça
       // o parser associar o nome à coluna errada.
-      const rawName = row.raw[colLetterToIndex(SYNC_DEPT_COLUMNS.softSkills)] || get(row.obj, "nome", "nome completo", "name");
+      const at = (letter) => row.raw[colLetterToIndex(letter)];
+      const rawName = at(SYNC_DEPT_COLUMNS.softSkills) || get(row.obj, "nome", "nome completo", "name");
       const rawEmail = get(row.obj, "email");
       // Fórmulas dinamizadas do Sheets devolvem #N/A (ou #VALUE!/#REF!) para
-      // candidatos que ainda não chegaram a esta fase — não são candidatos
-      // desconhecidos, são simplesmente slots por preencher. Ignora-se a
+      // candidatos que ainda não chegaram a esta fase. Ignora-se a
       // linha silenciosamente, sem gerar aviso nem tentar fazer match.
       if (isErrorOrEmptyValue(rawName) && isErrorOrEmptyValue(rawEmail)) return;
       const name = isErrorOrEmptyValue(rawName) ? "" : String(rawName).trim();
@@ -2076,7 +2186,6 @@ function applySyncedSheetsToState(raw, prevMembers, prevCandidates) {
         return; // candidato tem de constar em "Base Dados Candidatos"
       }
       const cand = candidates[idx];
-      const at = (letter) => row.raw[colLetterToIndex(letter)];
 
       const passedDynamicsName = at(SYNC_DEPT_COLUMNS.softSkills);
       const softSkills = !isErrorOrEmptyValue(passedDynamicsName) ? "positive" : cellStatus(passedDynamicsName);
@@ -2157,13 +2266,29 @@ async function syncMasterSheet({ accessToken, sheetUrl, prevMembers, prevCandida
     }
   };
 
+  // Para as abas dos departamentos, tenta os nomes do template
+  // (ex: "Sales and Commercial" e "Sales & Commercial", com e sem aspas).
+  const readDepartmentTab = async (dept) => {
+    const candidateNames = SYNC_DEPARTMENT_SHEET_NAMES[dept] || [`'${dept}'`, dept];
+    let lastError = null;
+    for (const sheetName of candidateNames) {
+      const [key, data] = await readTab(dept, sheetName, SYNC_DEPT_HEADER_HINTS);
+      if (!data.error) return [key, data];
+      lastError = data;
+      if (!String(data.error).includes("Não foi encontrada nenhuma aba") && !String(data.error).includes("sheet_not_found")) {
+        return [key, data];
+      }
+    }
+    return [dept, lastError || { error: `Não foi encontrada nenhuma aba para o departamento "${dept}".` }];
+  };
+
   let generalResults, deptResults;
   try {
     [generalResults, deptResults] = await Promise.all([
       Promise.all(Object.entries(SYNC_SHEET_NAMES).map(([key, sheetName]) =>
         readTab(key, sheetName, SYNC_HEADER_HINTS[key], SYNC_FIXED_HEADER_IDX[key], MASTER_EXCEL_LAYOUT_TABS.has(key))
       )),
-      Promise.all(DEPARTMENTS.map((dept) => readTab(dept, `'${dept}'`, SYNC_DEPT_HEADER_HINTS))),
+      Promise.all(DEPARTMENTS.map((dept) => readDepartmentTab(dept))),
     ]);
   } catch (fatalErr) {
     // Salvaguarda: qualquer falha inesperada (ex. fetch() indisponível no
@@ -3452,7 +3577,11 @@ function extractDynamicsCandidatesFromMaster(wb, previous) {
   const next = previous.map((c) => ({ ...c }));
   let count = 0;
   DEPARTMENTS.forEach((department) => {
-    const sheet = wb.Sheets[department];
+    let sheet = wb.Sheets[department];
+    if (!sheet) {
+      const altName = wb.SheetNames.find((sn) => matchDept(sn) === department);
+      if (altName) sheet = wb.Sheets[altName];
+    }
     if (!sheet) return;
     const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
     const headerRow = grid.findIndex((row) => normKey(row?.[15]) === "nome");
@@ -3475,6 +3604,77 @@ function extractDynamicsCandidatesFromMaster(wb, previous) {
   return { candidates: next, count };
 }
 
+// Extrai candidatos da Fase 4 / Desafio Final do ficheiro Excel Mestre:
+// Percorre as 6 abas de departamento, valida a aprovação na Coluna AA
+// e lê o nome do Desafio Final na Coluna AD a partir da linha 15 (AD15+).
+function extractFinalChallengeCandidatesFromMaster(wb, previous) {
+  let next = previous.map((c) => ({
+    ...c,
+    finalChallengeEligible: false,
+    finalChallengeName: null,
+  }));
+  let count = 0;
+
+  DEPARTMENTS.forEach((canonicalDept) => {
+    let sheet = wb.Sheets[canonicalDept];
+    if (!sheet) {
+      const sheetName = wb.SheetNames.find((sn) => matchDept(sn) === canonicalDept);
+      if (sheetName) sheet = wb.Sheets[sheetName];
+    }
+    if (!sheet) return;
+
+    const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+    const passColIdx = colLetterToIndex(FINAL_CHALLENGE_PASS_COLUMN); // Coluna AA (26)
+    const nameColIdx = colLetterToIndex(FINAL_CHALLENGE_NAME_COLUMN); // Coluna AD (29)
+
+    for (let r = FINAL_CHALLENGE_START_ROW - 1; r < grid.length; r++) {
+      const row = grid[r];
+      if (!row || !Array.isArray(row)) continue;
+      const rawAA = row[passColIdx];
+      const rawAD = row[nameColIdx];
+
+      if (!isApprovedMark(rawAA)) continue;
+      const candidateName = cleanCellText(rawAD);
+      if (!candidateName || isErrorOrEmptyValue(candidateName)) continue;
+      if (["nome", "nome completo", "candidato", "desafio final", "desafio", "hard skills"].includes(normKey(candidateName))) continue;
+      if (candidateName.length < 2) continue;
+
+      let idx = matchCandidateIndex(next, candidateName, "", canonicalDept);
+      if (idx < 0) idx = matchCandidateIndex(next, candidateName, "");
+
+      if (idx >= 0) {
+        next[idx] = {
+          ...next[idx],
+          department: canonicalDept,
+          finalChallengeEligible: true,
+          finalChallengeName: candidateName,
+          phase2Status: "Aprovado",
+        };
+      } else {
+        next.push({
+          id: uid("final"),
+          name: candidateName,
+          department: canonicalDept,
+          email: "",
+          telefone: "",
+          cvLink: "",
+          phase0Status: "Aprovado",
+          phase1Status: "Aprovado",
+          phase2Status: "Aprovado",
+          finalChallengeEligible: true,
+          finalChallengeName: candidateName,
+          formsSubmitted: { fase1: false, fase2: false, fase3: false },
+          availabilityStatus: { fase1: "nao_enviada", fase2: "nao_enviada", fase3: "nao_enviada" },
+          availability: { fase1: [], fase2: [], fase3: [] },
+        });
+      }
+      count++;
+    }
+  });
+
+  return { candidates: next, count };
+}
+
 function ImportHubPage({
   members, setMembers, candidates, setCandidates, importStatus, setImportStatus,
   syncUrl, syncState, auth, onSaveSyncUrl, onSyncNow, onAuthenticate, onSignOut,
@@ -3483,7 +3683,11 @@ function ImportHubPage({
     const wb = await readWorkbook(file);
     let count = 0;
     const dynamicsImport = extractDynamicsCandidatesFromMaster(wb, candidates);
-    if (dynamicsImport.count) setCandidates(dynamicsImport.candidates);
+    let currentCandidates = dynamicsImport.count ? dynamicsImport.candidates : candidates;
+    const finalImport = extractFinalChallengeCandidatesFromMaster(wb, currentCandidates);
+    if (finalImport.count || dynamicsImport.count) {
+      setCandidates(finalImport.candidates);
+    }
     setMembers((prev) => {
       const next = [...prev];
       const memberSheets = new Set([
@@ -4010,6 +4214,10 @@ function InterviewPhasePage({
   const eligible = candidates.filter((c) =>
     (!excludeTalentPool || !c.veioTalentPool) &&
     c[prevStatusField] !== "Rejeitado" &&
+    // Fase 4 / Hard Skills: a elegibilidade vem EXCLUSIVAMENTE da
+    // validação AA + nome AD da respetiva aba de departamento.
+    // Candidatos eliminados em fases anteriores não aparecem de todo na 4ª Fase.
+    (phaseKey !== "fase3" || c.finalChallengeEligible === true) &&
     (departmentFilter === ALL_DEPARTMENTS_OPTION || c.department === departmentFilter)
   );
   // "À espera do Forms" só faz sentido dentro do próprio conjunto de
@@ -4816,11 +5024,30 @@ export default function App() {
     [candidates]
   );
   const phase2Pool = useMemo(() => candidates.filter((c) => c.phase1Status === "Aprovado"), [candidates]);
-  const phase3Pool = useMemo(() => candidates, [candidates]);
+  // Fase 4 / Hard Skills: APENAS candidatos aprovados na Coluna AA e com nome
+  // na Coluna AD a partir da linha 15 (AD15 em diante) de uma das 6 abas de
+  // departamento. Candidatos eliminados em fases anteriores são ignorados.
+  const phase3Pool = useMemo(
+    () => candidates.filter((c) => c.finalChallengeEligible === true),
+    [candidates]
+  );
 
   const [phase1Bookings, setPhase1Bookings] = useState(() => generateInterviewPhase(phase1Pool, members, [], "fase1", ["diretorId", "rhId"]));
   const [phase2Groups, setPhase2Groups] = useState(() => generatePhase2(phase2Pool, members));
   const [phase3Bookings, setPhase3Bookings] = useState(() => generateInterviewPhase(phase3Pool, members, [], "fase3", ["diretorId", "rhId", "supervisorId"]));
+
+  // Atualização reativa dos agendamentos quando as pools de candidatos ou membros mudam
+  useEffect(() => {
+    setPhase1Bookings((prev) => generateInterviewPhase(phase1Pool, members, prev, "fase1", ["diretorId", "rhId"]));
+  }, [phase1Pool, members]);
+
+  useEffect(() => {
+    setPhase2Groups(() => generatePhase2(phase2Pool, members));
+  }, [phase2Pool, members]);
+
+  useEffect(() => {
+    setPhase3Bookings((prev) => generateInterviewPhase(phase3Pool, members, prev, "fase3", ["diretorId", "rhId", "supervisorId"]));
+  }, [phase3Pool, members]);
 
   if (!authed) return <LoginScreen onSuccess={() => setAuthed(true)} />;
 
@@ -4872,7 +5099,7 @@ export default function App() {
             title="Fase 4 — Entrevista de Hard Skills"
             subtitle="Candidato + Diretor + 1 Membro RH + Supervisor do Departamento — cruzamento exato entre 4 intervenientes (Forms Fase 4 ∩ Excel Mestre)."
             phaseKey="fase3" availField="fase3" formsField="fase3" prevStatusField="phase2Status"
-            candidates={candidates} setCandidates={setCandidates} members={members}
+            candidates={phase3Pool} setCandidates={setCandidates} members={members}
             bookings={phase3Bookings} setBookings={setPhase3Bookings}
             onGenerate={(dept) => setPhase3Bookings(regenerateForDepartment(phase3Pool, members, phase3Bookings, "fase3", ["diretorId", "rhId", "supervisorId"], dept))}
             columns={[{ key: "diretorId", label: "Diretor(a)" }, { key: "rhId", label: "RH" }, { key: "supervisorId", label: "Supervisor" }]}
